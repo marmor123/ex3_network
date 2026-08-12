@@ -1,0 +1,30 @@
+# C/C++ / RDMA
+*.o
+*.so
+*.a
+*.out
+*.exe
+test
+bw
+*.d
+
+# Build dirs
+build/
+bin/
+obj/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Scratch (local issue tracker if used)
+.scratch/
+
+# Secrets / env
+.env
