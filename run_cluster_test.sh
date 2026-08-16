@@ -14,6 +14,7 @@ set -e
 MODE="${1:-local}"
 NUM_NODES="${2:-2}"
 CLUSTER_DIR="${CLUSTER_DIR:-/cs/usr/ateret.tabib/Downloads/ex3_network}"
+SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
 
 if [ "$MODE" = "2" ] || [ "$MODE" = "4" ]; then
     NUM_NODES="$MODE"
@@ -52,7 +53,7 @@ for i in "${!HOSTS[@]}"; do
     HOST="${HOSTS[$i]}"
     
     echo "Starting Rank $RANK (index $INDEX) on host $HOST..."
-    ssh "$HOST" "cd $CLUSTER_DIR && ./test -myindex $INDEX -list ${HOSTS[*]}" &
+    ssh $SSH_OPTS "$HOST" "cd $CLUSTER_DIR && ./test -myindex $INDEX -list ${HOSTS[*]}" &
     PIDS+=($!)
 done
 
