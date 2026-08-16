@@ -5,14 +5,15 @@
 # Usage:
 #   ./run_cluster_test.sh 2              # Runs 2-node ring: mlx-stud-03 mlx-stud-04
 #   ./run_cluster_test.sh 4              # Runs 4-node ring: mlx-stud-01..04
-#   ./run_cluster_test.sh local 2        # Runs 2 ranks on current host
-#   ./run_cluster_test.sh local 4        # Runs 4 ranks on current host
+#   ./run_cluster_test.sh local 2        # Runs 2 ranks locally on localhost
+#   ./run_cluster_test.sh local 4        # Runs 4 ranks locally on localhost
 # ==============================================================================
 
 set -e
 
 MODE="${1:-local}"
 NUM_NODES="${2:-2}"
+CLUSTER_DIR="${CLUSTER_DIR:-/cs/usr/ateret.tabib/Downloads/ex3_network}"
 
 if [ "$MODE" = "2" ] || [ "$MODE" = "4" ]; then
     NUM_NODES="$MODE"
@@ -23,10 +24,9 @@ echo "=================================================================="
 echo "  RDMA Collective Library — Multi-Node Test Runner (V1)           "
 echo "=================================================================="
 
-# Ensure binary is compiled
-make all
-
 if [ "$MODE" = "local" ]; then
+    # Ensure binary is compiled locally
+    make all
     echo "Running local $NUM_NODES-rank loopback test..."
     python3 test_v1_local.py
     exit 0
@@ -43,6 +43,7 @@ else
 fi
 
 echo "Launching ring across: ${HOSTS[*]}"
+echo "Remote working directory: $CLUSTER_DIR"
 
 PIDS=()
 for i in "${!HOSTS[@]}"; do
@@ -51,7 +52,7 @@ for i in "${!HOSTS[@]}"; do
     HOST="${HOSTS[$i]}"
     
     echo "Starting Rank $RANK (index $INDEX) on host $HOST..."
-    ssh "$HOST" "cd $(pwd) && ./test -myindex $INDEX -list ${HOSTS[*]}" &
+    ssh "$HOST" "cd $CLUSTER_DIR && ./test -myindex $INDEX -list ${HOSTS[*]}" &
     PIDS+=($!)
 done
 
