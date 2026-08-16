@@ -3,8 +3,8 @@
 # Multi-Node Cluster Test Runner for RDMA Collective Library (V1 TCP Bootstrap)
 # ==============================================================================
 # Usage:
-#   ./run_cluster_test.sh 2              # Runs 2-node ring: mlxstud01 mlxstud02
-#   ./run_cluster_test.sh 4              # Runs 4-node ring: mlxstud01..04
+#   ./run_cluster_test.sh 2              # Runs 2-node ring: mlx-stud-03 mlx-stud-04
+#   ./run_cluster_test.sh 4              # Runs 4-node ring: mlx-stud-01..04
 #   ./run_cluster_test.sh local 2        # Runs 2 ranks on current host
 #   ./run_cluster_test.sh local 4        # Runs 4 ranks on current host
 # ==============================================================================
@@ -34,9 +34,9 @@ fi
 
 # Cluster multi-node mode
 if [ "$NUM_NODES" -eq 2 ]; then
-    HOSTS=("mlxstud01" "mlxstud02")
+    HOSTS=("mlx-stud-03" "mlx-stud-04")
 elif [ "$NUM_NODES" -eq 4 ]; then
-    HOSTS=("mlxstud01" "mlxstud02" "mlxstud03" "mlxstud04")
+    HOSTS=("mlx-stud-01" "mlx-stud-02" "mlx-stud-03" "mlx-stud-04")
 else
     echo "Error: Only 2 or 4 nodes supported (got $NUM_NODES)"
     exit 1
