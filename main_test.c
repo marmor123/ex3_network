@@ -77,6 +77,31 @@ static int compare_doubles(const void *a, const void *b) {
     return 0;
 }
 
+static int check_collective_alloc(void *pg_handle, void *buf1, void *buf2, size_t sz, int count) {
+    int rank = pg_get_rank(pg_handle);
+    int size = pg_get_size(pg_handle);
+    int local_ok = (buf1 != NULL && buf2 != NULL) ? 1 : 0;
+    int local_status[PG_MAX_RANKS];
+    int global_status[PG_MAX_RANKS];
+    for (int i = 0; i < size; i++) {
+        local_status[i] = local_ok;
+        global_status[i] = 0;
+    }
+
+    int rc = pg_all_reduce(local_status, global_status, size, PG_INT, PG_SUM, pg_handle);
+    if (rc != PG_SUCCESS || global_status[0] != size) {
+        if (rank == 0) {
+            if (count > 0) {
+                printf("%-12zu | %-12d | %-48s\n", sz, count, "[SKIP] Allocation failed on one or more ranks");
+            } else {
+                printf("  [SKIP] Size %10zu B -> Allocation failed on one or more ranks (insufficient memory)\n", sz);
+            }
+        }
+        return 0;
+    }
+    return 1;
+}
+
 static int run_benchmark_harness(void *pg_handle) {
     int rank = pg_get_rank(pg_handle);
     int size = pg_get_size(pg_handle);
@@ -103,11 +128,7 @@ static int run_benchmark_harness(void *pg_handle) {
         void *sendbuf = malloc(sz);
         void *recvbuf = malloc(sz);
 
-        int alloc_ok = (sendbuf != NULL && recvbuf != NULL);
-        if (!alloc_ok) {
-            if (rank == 0) {
-                printf("%-12zu | %-12d | %-48s\n", sz, count, "[SKIP] Allocation failed (insufficient memory)");
-            }
+        if (!check_collective_alloc(pg_handle, sendbuf, recvbuf, sz, count)) {
             if (sendbuf) free(sendbuf);
             if (recvbuf) free(recvbuf);
             continue;
@@ -269,8 +290,7 @@ int main(int argc, char **argv) {
 
         void *sendbuf = malloc(sz);
         void *recvbuf = calloc(1, sz);
-        if (!sendbuf || !recvbuf) {
-            printf("  [SKIP] Size %10zu B -> Could not allocate %zu B (insufficient memory)\n", sz, sz);
+        if (!check_collective_alloc(pg_handle, sendbuf, recvbuf, sz, 0)) {
             if (sendbuf) free(sendbuf);
             if (recvbuf) free(recvbuf);
             continue;
@@ -334,8 +354,7 @@ int main(int argc, char **argv) {
 
         void *sendbuf = malloc(sz);
         void *recvbuf = calloc(1, segment_bytes);
-        if (!sendbuf || !recvbuf) {
-            printf("  [SKIP] Size %10zu B -> Could not allocate %zu B\n", sz, sz);
+        if (!check_collective_alloc(pg_handle, sendbuf, recvbuf, sz, 0)) {
             if (sendbuf) free(sendbuf);
             if (recvbuf) free(recvbuf);
             continue;
@@ -430,8 +449,7 @@ int main(int argc, char **argv) {
 
         void *sendbuf = malloc(sz);
         void *recvbuf = calloc(1, total_gather_bytes);
-        if (!sendbuf || !recvbuf) {
-            printf("  [SKIP] Size %10zu B -> Could not allocate %zu B\n", sz, total_gather_bytes);
+        if (!check_collective_alloc(pg_handle, sendbuf, recvbuf, total_gather_bytes, 0)) {
             if (sendbuf) free(sendbuf);
             if (recvbuf) free(recvbuf);
             continue;
@@ -526,8 +544,7 @@ int main(int argc, char **argv) {
 
         void *sendbuf = malloc(sz);
         void *recvbuf = calloc(1, sz);
-        if (!sendbuf || !recvbuf) {
-            printf("  [SKIP] Size %10zu B -> Could not allocate %zu B\n", sz, sz);
+        if (!check_collective_alloc(pg_handle, sendbuf, recvbuf, sz, 0)) {
             if (sendbuf) free(sendbuf);
             if (recvbuf) free(recvbuf);
             continue;
