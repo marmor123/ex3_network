@@ -22,7 +22,7 @@ if [ "$MODE" = "2" ] || [ "$MODE" = "4" ]; then
 fi
 
 echo "=================================================================="
-echo "  RDMA Collective Library — Multi-Node Test Runner (V2)           "
+echo "  RDMA Collective Library — Multi-Node Test Runner (V4 RS)        "
 echo "=================================================================="
 
 if [ "$MODE" = "local" ]; then
@@ -65,7 +65,7 @@ done
 
 if [ "$FAIL" -eq 0 ]; then
     echo "=================================================================="
-    echo "  CLUSTER TEST SUCCESS: All $NUM_NODES nodes completed V2 RDMA control ring exchange! "
+    echo "  CLUSTER TEST SUCCESS: All $NUM_NODES nodes completed V4 Reduce-Scatter & V3 Rendezvous! "
     echo "=================================================================="
 else
     echo "=================================================================="
