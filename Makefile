@@ -16,7 +16,10 @@ $(TARGET): $(OBJS)
 %.o: %.c $(HEADERS)
 	$(CC) $(CFLAGS) -c $< -o $@
 
+check: $(TARGET)
+	python3 test_v1_local.py
+
 clean:
 	rm -f $(OBJS) $(TARGET)
 
-.PHONY: all clean
+.PHONY: all clean check

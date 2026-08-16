@@ -1,0 +1,73 @@
+#!/bin/bash
+# ==============================================================================
+# Multi-Node Cluster Test Runner for RDMA Collective Library (V1 TCP Bootstrap)
+# ==============================================================================
+# Usage:
+#   ./run_cluster_test.sh 2              # Runs 2-node ring: mlxstud01 mlxstud02
+#   ./run_cluster_test.sh 4              # Runs 4-node ring: mlxstud01..04
+#   ./run_cluster_test.sh local 2        # Runs 2 ranks on current host
+#   ./run_cluster_test.sh local 4        # Runs 4 ranks on current host
+# ==============================================================================
+
+set -e
+
+MODE="${1:-local}"
+NUM_NODES="${2:-2}"
+
+if [ "$MODE" = "2" ] || [ "$MODE" = "4" ]; then
+    NUM_NODES="$MODE"
+    MODE="cluster"
+fi
+
+echo "=================================================================="
+echo "  RDMA Collective Library — Multi-Node Test Runner (V1)           "
+echo "=================================================================="
+
+# Ensure binary is compiled
+make all
+
+if [ "$MODE" = "local" ]; then
+    echo "Running local $NUM_NODES-rank loopback test..."
+    python3 test_v1_local.py
+    exit 0
+fi
+
+# Cluster multi-node mode
+if [ "$NUM_NODES" -eq 2 ]; then
+    HOSTS=("mlxstud01" "mlxstud02")
+elif [ "$NUM_NODES" -eq 4 ]; then
+    HOSTS=("mlxstud01" "mlxstud02" "mlxstud03" "mlxstud04")
+else
+    echo "Error: Only 2 or 4 nodes supported (got $NUM_NODES)"
+    exit 1
+fi
+
+echo "Launching ring across: ${HOSTS[*]}"
+
+PIDS=()
+for i in "${!HOSTS[@]}"; do
+    RANK=$i
+    INDEX=$(printf "%02d" $((RANK + 1)))
+    HOST="${HOSTS[$i]}"
+    
+    echo "Starting Rank $RANK (index $INDEX) on host $HOST..."
+    ssh "$HOST" "cd $(pwd) && ./test -myindex $INDEX -list ${HOSTS[*]}" &
+    PIDS+=($!)
+done
+
+# Wait for all remote processes
+FAIL=0
+for pid in "${PIDS[@]}"; do
+    wait "$pid" || FAIL=1
+done
+
+if [ "$FAIL" -eq 0 ]; then
+    echo "=================================================================="
+    echo "  CLUSTER TEST SUCCESS: All $NUM_NODES nodes completed V1 ring exchange! "
+    echo "=================================================================="
+else
+    echo "=================================================================="
+    echo "  CLUSTER TEST FAILURE: One or more remote nodes failed.           "
+    echo "=================================================================="
+    exit 1
+fi
