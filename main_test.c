@@ -106,9 +106,17 @@ static int run_benchmark_harness(void *pg_handle) {
     int rank = pg_get_rank(pg_handle);
     int size = pg_get_size(pg_handle);
 
+    const char *mode_str = "RENDEZVOUS";
+#if (PG_ACTIVE_MODE == PG_MODE_TYPE_EAGER)
+    mode_str = "EAGER";
+#elif (PG_ACTIVE_MODE == PG_MODE_TYPE_AUTO)
+    mode_str = "AUTO (Threshold <= 8 KiB Eager, > 8 KiB Rendezvous)";
+#endif
+
     if (rank == 0) {
         printf("========================================================================================================\n");
-        printf("[PG V8 Benchmark Harness] Running All-Reduce Sweep (Warmup + %d Timed Iterations)\n", PG_BENCH_ITER);
+        printf("[PG V9 Benchmark Harness] Running All-Reduce Sweep (Mode: %s, Warmup + %d Timed Iterations)\n",
+               mode_str, PG_BENCH_ITER);
         printf("========================================================================================================\n");
         printf("%-12s | %-12s | %-12s | %-12s | %-12s | %-16s\n",
                "Size (Bytes)", "Count (ints)", "Min (us)", "Median (us)", "Avg (us)", "Effective BW");
@@ -255,6 +263,25 @@ int main(int argc, char **argv) {
            rank, g_pg_args.myindex_raw, local_server);
     printf("  RDMA Device : Port=%d, LID=0x%04x, MTU=%d\n",
            PG_IB_PORT, ctx->local_lid, ctx->active_mtu);
+    printf("  Config Mode : %s | %s | %s\n",
+#if (PG_ACTIVE_MODE == PG_MODE_TYPE_EAGER)
+           "MODE=EAGER",
+#elif (PG_ACTIVE_MODE == PG_MODE_TYPE_AUTO)
+           "MODE=AUTO (<=8KiB eager, >8KiB rdv)",
+#else
+           "MODE=RENDEZVOUS",
+#endif
+#ifdef PROFILE_PERF
+           "PROFILE=PERF (256 KiB)",
+#else
+           "PROFILE=BRINGUP (64 KiB)",
+#endif
+#ifdef PG_WORKBUFFER_INPLACE
+           "WORKBUFFER=INPLACE"
+#else
+           "WORKBUFFER=SAFE"
+#endif
+    );
     printf("  Ring Edge IN (prev %d -> me %d):\n", prev_rank, rank);
     printf("    Peer sender QP   : QPN=0x%x PSN=0x%x LID=0x%04x\n",
            ctx->remote_from_prev.qpn, ctx->remote_from_prev.psn, ctx->remote_from_prev.lid);

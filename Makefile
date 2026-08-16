@@ -13,6 +13,15 @@ ifeq ($(WORKBUFFER),inplace)
     CFLAGS += -DPG_WORKBUFFER_INPLACE
 endif
 
+MODE ?= rendezvous
+ifeq ($(MODE),eager)
+    CFLAGS += -DPG_MODE_EAGER
+else ifeq ($(MODE),auto)
+    CFLAGS += -DPG_MODE_AUTO
+else
+    CFLAGS += -DPG_MODE_RENDEZVOUS
+endif
+
 TARGET = test
 SRCS = main_test.c pg.c
 OBJS = $(SRCS:.c=.o)

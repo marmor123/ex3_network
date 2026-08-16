@@ -51,8 +51,9 @@ echo "Syncing local workspace to ${HOSTS[0]}:$CLUSTER_DIR..."
 rsync -avz --exclude '.git' --exclude '*.o' --exclude 'test' "$SCRIPT_DIR/" "${HOSTS[0]}:$CLUSTER_DIR/"
 
 PROFILE="${PROFILE:-bringup}"
-echo "Building on ${HOSTS[0]} (PROFILE=$PROFILE)..."
-ssh $SSH_OPTS "${HOSTS[0]}" "cd $CLUSTER_DIR && make clean && make PROFILE=$PROFILE"
+MODE_BUILD="${MODE_BUILD:-${COLLECTIVE_MODE:-rendezvous}}"
+echo "Building on ${HOSTS[0]} (PROFILE=$PROFILE, MODE=$MODE_BUILD)..."
+ssh $SSH_OPTS "${HOSTS[0]}" "cd $CLUSTER_DIR && make clean && make PROFILE=$PROFILE MODE=$MODE_BUILD"
 
 PIDS=()
 for i in "${!HOSTS[@]}"; do
