@@ -37,6 +37,17 @@
 #endif
 #endif
 
+/* Benchmark Harness Constants (Summary Sec 29) */
+#ifndef PG_BENCH_MIN_BYTES
+#define PG_BENCH_MIN_BYTES       (64ULL * 1024ULL * 1024ULL)   /* 64 MiB */
+#endif
+#ifndef PG_BENCH_MAX_BYTES
+#define PG_BENCH_MAX_BYTES       (1024ULL * 1024ULL * 1024ULL) /* 1 GiB */
+#endif
+#ifndef PG_BENCH_ITER
+#define PG_BENCH_ITER            5
+#endif
+
 /* QP Directions (index into per-direction arrays) */
 #define PG_QP_DIR_TO_NEXT       0
 #define PG_QP_DIR_FROM_PREV     1

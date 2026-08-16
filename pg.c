@@ -1636,6 +1636,8 @@ int pg_ring_all_gather_core(struct pg_context *ctx, void *recvbuf, size_t segmen
                 void *local_src = (char *)recvbuf + send_origin * segment_bytes + offset;
                 uint64_t remote_addr = remote_recv_addr + offset;
 
+                int is_signaled = ((k + 1) % PG_RDMA_SIGNAL_INTERVAL == 0 || (k + 1) == num_micros);
+
                 struct ibv_sge sge = {
                     .addr   = (uintptr_t)local_src,
                     .length = (uint32_t)micro_len,
@@ -1644,7 +1646,7 @@ int pg_ring_all_gather_core(struct pg_context *ctx, void *recvbuf, size_t segmen
                 struct ibv_send_wr wr = {
                     .wr_id      = pg_make_wr_slot(PG_QP_DIR_TO_NEXT, PG_WR_TYPE_RDMA_WRITE, k),
                     .opcode     = IBV_WR_RDMA_WRITE,
-                    .send_flags = IBV_SEND_SIGNALED,
+                    .send_flags = is_signaled ? IBV_SEND_SIGNALED : 0,
                     .sg_list    = &sge,
                     .num_sge    = 1,
                     .next       = NULL,
@@ -1736,7 +1738,8 @@ int pg_ring_all_gather_core(struct pg_context *ctx, void *recvbuf, size_t segmen
 
                     case PG_WR_TYPE_RDMA_WRITE: {
                         if (qp_dir == PG_QP_DIR_TO_NEXT) {
-                            rdma_completed_micros++;
+                            uint32_t k = slot;
+                            rdma_completed_micros = k + 1;
                             if (rdma_completed_micros == num_micros) {
                                 struct pg_ctrl_msg done_msg;
                                 memset(&done_msg, 0, sizeof(done_msg));

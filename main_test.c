@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 static void print_usage(const char *prog_name) {
     fprintf(stderr, "Usage: %s -myindex <01..NN> -list <host1> <host2> [host3 ...]\n", prog_name);
@@ -66,6 +67,139 @@ static int parse_args(int argc, char **argv) {
     }
 
     return 0;
+}
+
+static int compare_doubles(const void *a, const void *b) {
+    double da = *(const double *)a;
+    double db = *(const double *)b;
+    if (da < db) return -1;
+    if (da > db) return 1;
+    return 0;
+}
+
+static int run_benchmark_harness(void *pg_handle) {
+    int rank = pg_get_rank(pg_handle);
+    int size = pg_get_size(pg_handle);
+
+    if (rank == 0) {
+        printf("========================================================================================================\n");
+        printf("[PG V8 Benchmark Harness] Running All-Reduce Sweep (Warmup + %d Timed Iterations)\n", PG_BENCH_ITER);
+        printf("========================================================================================================\n");
+        printf("%-12s | %-12s | %-12s | %-12s | %-12s | %-16s\n",
+               "Size (Bytes)", "Count (ints)", "Min (us)", "Median (us)", "Avg (us)", "Effective BW");
+        printf("--------------------------------------------------------------------------------------------------------\n");
+    }
+
+    size_t min_bytes = PG_BENCH_MIN_BYTES;
+    size_t max_bytes = PG_BENCH_MAX_BYTES;
+
+    for (size_t sz = min_bytes; sz <= max_bytes; sz *= 2) {
+        int count = (int)(sz / sizeof(int));
+        if (count % size != 0) {
+            count += (size - (count % size));
+            sz = (size_t)count * sizeof(int);
+        }
+
+        void *sendbuf = malloc(sz);
+        void *recvbuf = malloc(sz);
+
+        int alloc_ok = (sendbuf != NULL && recvbuf != NULL);
+        if (!alloc_ok) {
+            if (rank == 0) {
+                printf("%-12zu | %-12d | %-48s\n", sz, count, "[SKIP] Allocation failed (insufficient memory)");
+            }
+            if (sendbuf) free(sendbuf);
+            if (recvbuf) free(recvbuf);
+            continue;
+        }
+
+        int *sints = (int *)sendbuf;
+        for (int k = 0; k < count; k++) {
+            sints[k] = (rank + 1) * (int)((k % 1000) + 1);
+        }
+        memset(recvbuf, 0, sz);
+
+        /* Warmup collective outside timed region */
+        int rc = pg_all_reduce(sendbuf, recvbuf, count, PG_INT, PG_SUM, pg_handle);
+        if (rc != PG_SUCCESS) {
+            fprintf(stderr, "Rank %d warmup pg_all_reduce failed with code %d\n", rank, rc);
+            free(sendbuf);
+            free(recvbuf);
+            return rc;
+        }
+
+        rc = pg_barrier(pg_handle);
+        if (rc != PG_SUCCESS) {
+            fprintf(stderr, "Rank %d post-warmup barrier failed with code %d\n", rank, rc);
+            free(sendbuf);
+            free(recvbuf);
+            return rc;
+        }
+
+        /* Timed iterations */
+        double times_us[PG_BENCH_ITER];
+        double total_us = 0.0;
+
+        for (int iter = 0; iter < PG_BENCH_ITER; iter++) {
+            rc = pg_barrier(pg_handle);
+            if (rc != PG_SUCCESS) {
+                fprintf(stderr, "Rank %d pre-iteration barrier failed with code %d\n", rank, rc);
+                free(sendbuf);
+                free(recvbuf);
+                return rc;
+            }
+
+            struct timespec t_start, t_end;
+            clock_gettime(CLOCK_MONOTONIC, &t_start);
+
+            rc = pg_all_reduce(sendbuf, recvbuf, count, PG_INT, PG_SUM, pg_handle);
+            if (rc != PG_SUCCESS) {
+                fprintf(stderr, "Rank %d timed iteration %d failed with code %d\n", rank, iter, rc);
+                free(sendbuf);
+                free(recvbuf);
+                return rc;
+            }
+
+            clock_gettime(CLOCK_MONOTONIC, &t_end);
+
+            double iter_us = (double)(t_end.tv_sec - t_start.tv_sec) * 1e6 +
+                             (double)(t_end.tv_nsec - t_start.tv_nsec) / 1e3;
+            times_us[iter] = iter_us;
+            total_us += iter_us;
+
+            rc = pg_barrier(pg_handle);
+            if (rc != PG_SUCCESS) {
+                fprintf(stderr, "Rank %d post-iteration barrier failed with code %d\n", rank, rc);
+                free(sendbuf);
+                free(recvbuf);
+                return rc;
+            }
+        }
+
+        qsort(times_us, PG_BENCH_ITER, sizeof(double), compare_doubles);
+        double min_us = times_us[0];
+        double median_us = times_us[PG_BENCH_ITER / 2];
+        double avg_us = total_us / PG_BENCH_ITER;
+
+        double effective_bytes = 2.0 * (double)(size - 1) / (double)size * (double)sz;
+        double effective_gbps = (effective_bytes * 8.0) / (median_us * 1e3);
+
+        if (rank == 0) {
+            printf("%-12zu | %-12d | %12.2f | %12.2f | %12.2f | %10.2f Gbps\n",
+                   sz, count, min_us, median_us, avg_us, effective_gbps);
+        }
+
+        free(sendbuf);
+        free(recvbuf);
+    }
+
+    if (rank == 0) {
+        printf("========================================================================================================\n");
+        printf("[PG V8 Benchmark Harness] SUCCESS: Sweep completed.\n");
+        printf("========================================================================================================\n");
+    }
+
+    return PG_SUCCESS;
 }
 
 int main(int argc, char **argv) {
@@ -475,11 +609,16 @@ int main(int argc, char **argv) {
         printf("[PG V7 All-Reduce] FAILURE: One or more all-reduce tests failed.\n");
     }
 
+    int bench_rc = PG_SUCCESS;
+    if (all_passed && rs_passed && ag_passed && ar_passed) {
+        bench_rc = run_benchmark_harness(pg_handle);
+    }
+
     rc = pg_close(pg_handle);
 
-    if (rc != PG_SUCCESS || !all_passed || !rs_passed || !ag_passed || !ar_passed) {
-        fprintf(stderr, "pg_close or tests failed (rc=%d, all_passed=%d, rs_passed=%d, ag_passed=%d, ar_passed=%d)\n",
-                rc, all_passed, rs_passed, ag_passed, ar_passed);
+    if (rc != PG_SUCCESS || !all_passed || !rs_passed || !ag_passed || !ar_passed || bench_rc != PG_SUCCESS) {
+        fprintf(stderr, "pg_close or tests failed (rc=%d, all_passed=%d, rs_passed=%d, ag_passed=%d, ar_passed=%d, bench_rc=%d)\n",
+                rc, all_passed, rs_passed, ag_passed, ar_passed, bench_rc);
         return 1;
     }
 

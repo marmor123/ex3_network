@@ -22,7 +22,7 @@ if [ "$MODE" = "2" ] || [ "$MODE" = "4" ]; then
 fi
 
 echo "=================================================================="
-echo "  RDMA Collective Library — Multi-Node Test Runner (V7 Pipelining) "
+echo "  RDMA Collective Library — Multi-Node Test Runner (V8 Benchmark)  "
 echo "=================================================================="
 
 if [ "$MODE" = "local" ]; then
@@ -73,7 +73,7 @@ done
 
 if [ "$FAIL" -eq 0 ]; then
     echo "=================================================================="
-    echo "  CLUSTER TEST SUCCESS: All $NUM_NODES nodes completed V7 Pipelined All-Reduce, All-Gather, Reduce-Scatter & Rendezvous! "
+    echo "  CLUSTER TEST SUCCESS: All $NUM_NODES nodes completed V8 Performance Benchmark Suite! "
     echo "=================================================================="
 else
     echo "=================================================================="
