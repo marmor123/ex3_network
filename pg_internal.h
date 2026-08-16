@@ -190,6 +190,9 @@ int pg_post_rdma_write(struct pg_context *ctx, int qp_dir, void *local_addr, siz
 /* Distributed Ring Barrier (Summary Sec 22) */
 int pg_barrier(void *pg_handle);
 
+/* Ring All-Gather Core Engine (Zero-Copy RDMA Write) */
+int pg_ring_all_gather_core(struct pg_context *ctx, void *recvbuf, size_t segment_bytes);
+
 /* V3 Rendezvous Segment Transfer Test */
 int pg_test_v3_rendezvous(void *pg_handle, void *sendbuf, void *recvbuf, size_t size_bytes);
 

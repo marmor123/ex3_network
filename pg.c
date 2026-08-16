@@ -1481,15 +1481,262 @@ int pg_reduce_scatter(void *sendbuf, void *recvbuf, int count,
     return PG_SUCCESS;
 }
 
+/* Ring All-Gather Core Engine (Zero-Copy RDMA Write into final recvbuf) */
+int pg_ring_all_gather_core(struct pg_context *ctx, void *recvbuf, size_t segment_bytes) {
+    if (!ctx || !recvbuf || segment_bytes == 0) return PG_ERR_INVAL;
+
+    if (ctx->size == 1) {
+        return PG_SUCCESS;
+    }
+
+    size_t total_bytes = segment_bytes * (size_t)ctx->size;
+
+    /* Register full recvbuf with local and remote write access */
+    struct ibv_mr *recv_mr = pg_get_or_reg_mr(ctx, recvbuf, total_bytes,
+                                             IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
+    if (!recv_mr) {
+        fprintf(stderr, "[pg_all_gather] Rank %d failed to register recvbuf MR (%zu bytes)\n",
+                ctx->rank, total_bytes);
+        return PG_ERR_RDMA;
+    }
+
+    /* Execute size - 1 ring gathering steps */
+    for (int step = 0; step < ctx->size - 1; step++) {
+        int send_origin = (ctx->rank - step + ctx->size) % ctx->size;
+        int recv_origin = (ctx->rank - step - 1 + ctx->size) % ctx->size;
+
+        /* Post RTS to next rank on qp_to_next */
+        struct pg_ctrl_msg rts_msg;
+        memset(&rts_msg, 0, sizeof(rts_msg));
+        rts_msg.tag = PG_CTRL_TAG;
+        rts_msg.type = PG_CTRL_MSG_RTS;
+        rts_msg.sender_rank = (uint16_t)ctx->rank;
+        rts_msg.seq = (uint32_t)(step + 1);
+        rts_msg.payload.rdv.seg_idx = (uint32_t)send_origin;
+        rts_msg.payload.rdv.length = (uint32_t)segment_bytes;
+
+        int rc = pg_post_ctrl_send(ctx, PG_QP_DIR_TO_NEXT, &rts_msg);
+        if (rc != PG_SUCCESS) {
+            fprintf(stderr, "[pg_all_gather] Rank %d failed to send RTS for step %d\n", ctx->rank, step);
+            return rc;
+        }
+
+        int send_done = 0;
+        int recv_done = 0;
+        int cts_received = 0;
+        int rdma_posted = 0;
+        int rdma_completed = 0;
+        int data_done_sent = 0;
+
+        struct timespec start, now;
+        clock_gettime(CLOCK_MONOTONIC, &start);
+
+        while (!send_done || !recv_done) {
+            /* Check if we already received and buffered control messages */
+            if (ctx->has_pending_ctrl[PG_QP_DIR_FROM_PREV]) {
+                struct pg_ctrl_msg *pmsg = &ctx->pending_ctrl_msg[PG_QP_DIR_FROM_PREV];
+                if (pmsg->type == PG_CTRL_MSG_RTS && pmsg->payload.rdv.seg_idx == (uint32_t)recv_origin) {
+                    /* RTS received from prev rank. Grant CTS with our recvbuf slice for recv_origin */
+                    struct pg_ctrl_msg cts_msg;
+                    memset(&cts_msg, 0, sizeof(cts_msg));
+                    cts_msg.tag = PG_CTRL_TAG;
+                    cts_msg.type = PG_CTRL_MSG_CTS;
+                    cts_msg.sender_rank = (uint16_t)ctx->rank;
+                    cts_msg.seq = pmsg->seq;
+                    cts_msg.payload.rdv.remote_addr = (uint64_t)(uintptr_t)((char *)recvbuf + recv_origin * segment_bytes);
+                    cts_msg.payload.rdv.rkey = recv_mr->rkey;
+                    cts_msg.payload.rdv.seg_idx = pmsg->payload.rdv.seg_idx;
+                    cts_msg.payload.rdv.length = pmsg->payload.rdv.length;
+
+                    rc = pg_post_ctrl_send(ctx, PG_QP_DIR_FROM_PREV, &cts_msg);
+                    if (rc != PG_SUCCESS) {
+                        fprintf(stderr, "[pg_all_gather] Rank %d failed to send CTS\n", ctx->rank);
+                        return rc;
+                    }
+                    ctx->has_pending_ctrl[PG_QP_DIR_FROM_PREV] = 0;
+                } else if (pmsg->type == PG_CTRL_MSG_DATA_DONE && pmsg->payload.rdv.seg_idx == (uint32_t)recv_origin && !recv_done) {
+                    /* Inbound segment arrived directly in recvbuf via zero-copy RDMA Write */
+                    recv_done = 1;
+                    ctx->has_pending_ctrl[PG_QP_DIR_FROM_PREV] = 0;
+                }
+            }
+
+            if (ctx->has_pending_ctrl[PG_QP_DIR_TO_NEXT]) {
+                struct pg_ctrl_msg *pmsg = &ctx->pending_ctrl_msg[PG_QP_DIR_TO_NEXT];
+                if (pmsg->type == PG_CTRL_MSG_CTS && pmsg->payload.rdv.seg_idx == (uint32_t)send_origin && !rdma_posted) {
+                    cts_received = 1;
+                    void *local_src = (char *)recvbuf + send_origin * segment_bytes;
+                    uint64_t remote_addr = pmsg->payload.rdv.remote_addr;
+                    uint32_t rkey = pmsg->payload.rdv.rkey;
+
+                    rc = pg_post_rdma_write(ctx, PG_QP_DIR_TO_NEXT, local_src, segment_bytes,
+                                            recv_mr->lkey, remote_addr, rkey);
+                    if (rc != PG_SUCCESS) {
+                        fprintf(stderr, "[pg_all_gather] Rank %d failed to post RDMA Write\n", ctx->rank);
+                        return rc;
+                    }
+                    rdma_posted = 1;
+                    ctx->has_pending_ctrl[PG_QP_DIR_TO_NEXT] = 0;
+                }
+            }
+
+            if (send_done && recv_done) break;
+
+            struct ibv_wc wc;
+            int ne = ibv_poll_cq(ctx->cq, 1, &wc);
+            if (ne < 0) {
+                fprintf(stderr, "[pg_all_gather] Rank %d ibv_poll_cq error: %d\n", ctx->rank, ne);
+                return PG_ERR_RDMA;
+            }
+
+            if (ne == 1) {
+                if (wc.status != IBV_WC_SUCCESS) {
+                    fprintf(stderr, "[pg_all_gather] Rank %d CQ completion error: %s (%d) on wr_id 0x%lx\n",
+                            ctx->rank, ibv_wc_status_str(wc.status), wc.status, (unsigned long)wc.wr_id);
+                    return PG_ERR_RDMA;
+                }
+
+                int wr_type = pg_wr_type(wc.wr_id);
+                int qp_dir = pg_wr_qp(wc.wr_id);
+                int slot = pg_wr_slot(wc.wr_id);
+
+                switch (wr_type) {
+                    case PG_WR_TYPE_RECV_CTRL: {
+                        struct pg_ctrl_msg recv_msg;
+                        memcpy(&recv_msg, ctx->ctrl_recv_buf[qp_dir][slot], sizeof(recv_msg));
+
+                        /* Repost the receive slot buffer */
+                        if (pg_repost_ctrl_recv_slot(ctx, qp_dir, slot)) {
+                            perror("[pg_all_gather] Error reposting recv buffer slot");
+                            return PG_ERR_RDMA;
+                        }
+
+                        if (recv_msg.tag != PG_CTRL_TAG) {
+                            fprintf(stderr, "[pg_all_gather] Rank %d invalid control tag 0x%08x\n",
+                                    ctx->rank, recv_msg.tag);
+                            return PG_ERR_RDMA;
+                        }
+
+                        if (recv_msg.type == PG_CTRL_MSG_RTS && qp_dir == PG_QP_DIR_FROM_PREV &&
+                            recv_msg.payload.rdv.seg_idx == (uint32_t)recv_origin) {
+                            /* RTS received from prev rank. Grant CTS with our recvbuf slice for recv_origin */
+                            struct pg_ctrl_msg cts_msg;
+                            memset(&cts_msg, 0, sizeof(cts_msg));
+                            cts_msg.tag = PG_CTRL_TAG;
+                            cts_msg.type = PG_CTRL_MSG_CTS;
+                            cts_msg.sender_rank = (uint16_t)ctx->rank;
+                            cts_msg.seq = recv_msg.seq;
+                            cts_msg.payload.rdv.remote_addr = (uint64_t)(uintptr_t)((char *)recvbuf + recv_origin * segment_bytes);
+                            cts_msg.payload.rdv.rkey = recv_mr->rkey;
+                            cts_msg.payload.rdv.seg_idx = recv_msg.payload.rdv.seg_idx;
+                            cts_msg.payload.rdv.length = recv_msg.payload.rdv.length;
+
+                            rc = pg_post_ctrl_send(ctx, PG_QP_DIR_FROM_PREV, &cts_msg);
+                            if (rc != PG_SUCCESS) {
+                                fprintf(stderr, "[pg_all_gather] Rank %d failed to send CTS\n", ctx->rank);
+                                return rc;
+                            }
+                        } else if (recv_msg.type == PG_CTRL_MSG_CTS && qp_dir == PG_QP_DIR_TO_NEXT &&
+                                   recv_msg.payload.rdv.seg_idx == (uint32_t)send_origin && !rdma_posted) {
+                            /* CTS received from next rank. Post RDMA Write into next rank's recvbuf slice */
+                            cts_received = 1;
+                            void *local_src = (char *)recvbuf + send_origin * segment_bytes;
+                            uint64_t remote_addr = recv_msg.payload.rdv.remote_addr;
+                            uint32_t rkey = recv_msg.payload.rdv.rkey;
+
+                            rc = pg_post_rdma_write(ctx, PG_QP_DIR_TO_NEXT, local_src, segment_bytes,
+                                                    recv_mr->lkey, remote_addr, rkey);
+                            if (rc != PG_SUCCESS) {
+                                fprintf(stderr, "[pg_all_gather] Rank %d failed to post RDMA Write\n", ctx->rank);
+                                return rc;
+                            }
+                            rdma_posted = 1;
+                        } else if (recv_msg.type == PG_CTRL_MSG_DATA_DONE && qp_dir == PG_QP_DIR_FROM_PREV &&
+                                   recv_msg.payload.rdv.seg_idx == (uint32_t)recv_origin && !recv_done) {
+                            /* Inbound segment arrived directly in recvbuf via zero-copy RDMA Write */
+                            recv_done = 1;
+                        } else {
+                            /* Save unhandled message into pending buffer */
+                            ctx->pending_ctrl_msg[qp_dir] = recv_msg;
+                            ctx->has_pending_ctrl[qp_dir] = 1;
+                        }
+                        break;
+                    }
+
+                    case PG_WR_TYPE_RDMA_WRITE: {
+                        if (qp_dir == PG_QP_DIR_TO_NEXT) {
+                            rdma_completed = 1;
+                            struct pg_ctrl_msg done_msg;
+                            memset(&done_msg, 0, sizeof(done_msg));
+                            done_msg.tag = PG_CTRL_TAG;
+                            done_msg.type = PG_CTRL_MSG_DATA_DONE;
+                            done_msg.sender_rank = (uint16_t)ctx->rank;
+                            done_msg.seq = (uint32_t)(step + 1);
+                            done_msg.payload.rdv.seg_idx = (uint32_t)send_origin;
+                            done_msg.payload.rdv.length = (uint32_t)segment_bytes;
+
+                            rc = pg_post_ctrl_send(ctx, PG_QP_DIR_TO_NEXT, &done_msg);
+                            if (rc != PG_SUCCESS) {
+                                fprintf(stderr, "[pg_all_gather] Rank %d failed to send DATA_DONE\n", ctx->rank);
+                                return rc;
+                            }
+                            data_done_sent = 1;
+                            send_done = 1;
+                        }
+                        break;
+                    }
+
+                    case PG_WR_TYPE_SEND_CTRL: {
+                        /* Control SEND completed */
+                        break;
+                    }
+
+                    default:
+                        break;
+                }
+            }
+
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            double elapsed = (now.tv_sec - start.tv_sec) + (now.tv_nsec - start.tv_nsec) / 1e9;
+            if (elapsed >= (double)PG_CTRL_POLL_TIMEOUT_SEC) {
+                fprintf(stderr, "[pg_all_gather] Rank %d timed out on step %d:\n"
+                                "  send_done=%d (cts=%d, rdma_post=%d, rdma_comp=%d, done_sent=%d)\n"
+                                "  recv_done=%d\n",
+                        ctx->rank, step, send_done, cts_received, rdma_posted, rdma_completed,
+                        data_done_sent, recv_done);
+                return PG_ERR_TIMEOUT;
+            }
+        }
+    }
+
+    return PG_SUCCESS;
+}
+
 int pg_all_gather(void *sendbuf, void *recvbuf, int count,
                   DATATYPE datatype,
                   void *pg_handle) {
-    (void)sendbuf;
-    (void)recvbuf;
-    (void)count;
-    (void)datatype;
-    (void)pg_handle;
-    return PG_ERR_UNSUPPORTED;
+    if (!pg_handle || !sendbuf || !recvbuf || count <= 0) {
+        return PG_ERR_INVAL;
+    }
+    struct pg_context *ctx = (struct pg_context *)pg_handle;
+
+    if (datatype != PG_INT) {
+        return PG_ERR_UNSUPPORTED;
+    }
+
+    size_t segment_bytes = (size_t)count * sizeof(int);
+
+    /* Single rank degenerate ring: copy input directly to output */
+    if (ctx->size == 1) {
+        memcpy(recvbuf, sendbuf, segment_bytes);
+        return PG_SUCCESS;
+    }
+
+    /* Copy sendbuf into our owned slice within recvbuf (recvbuf[rank]) */
+    memcpy((char *)recvbuf + ctx->rank * segment_bytes, sendbuf, segment_bytes);
+
+    /* Run ring zero-copy RDMA all-gather */
+    return pg_ring_all_gather_core(ctx, recvbuf, segment_bytes);
 }
 
 int pg_all_reduce(void *sendbuf, void *recvbuf, int count,

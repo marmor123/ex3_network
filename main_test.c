@@ -123,9 +123,10 @@ int main(int argc, char **argv) {
     };
     int num_tests = (int)(sizeof(test_sizes) / sizeof(test_sizes[0]));
     size_t max_size = 1024 * 1024;
+    size_t max_total_size = max_size * (size_t)size;
 
-    void *sendbuf = malloc(max_size);
-    void *recvbuf = calloc(1, max_size);
+    void *sendbuf = malloc(max_total_size);
+    void *recvbuf = calloc(1, max_total_size);
     if (!sendbuf || !recvbuf) {
         fprintf(stderr, "Error allocating test buffers\n");
         if (sendbuf) free(sendbuf);
@@ -253,13 +254,89 @@ int main(int argc, char **argv) {
         printf("[PG V4 Reduce-Scatter] FAILURE: One or more reduce-scatter tests failed.\n");
     }
 
+    /* Run V5 All-Gather Tests (PG_INT for 4 KiB, 64 KiB, 1 MiB per rank) */
+    printf("=================================================================\n");
+    printf("[PG V5 All-Gather] Testing Ring All-Gather (Zero-Copy RDMA Write)\n");
+    printf("=================================================================\n");
+
+    int ag_passed = 1;
+    for (int t = 0; t < num_tests; t++) {
+        size_t sz = test_sizes[t];
+        int count = (int)(sz / sizeof(int));
+
+        /* Synchronize all ranks before starting All-Gather */
+        int brc = pg_barrier(pg_handle);
+        if (brc != PG_SUCCESS) {
+            fprintf(stderr, "Pre-AG barrier failed with code %d\n", brc);
+            ag_passed = 0;
+            break;
+        }
+
+        /* Fill sendbuf with deterministic pattern per rank: (rank + 1) * 100000 + k */
+        int *sints = (int *)sendbuf;
+        int *rints = (int *)recvbuf;
+        for (int k = 0; k < count; k++) {
+            sints[k] = (rank + 1) * 100000 + k;
+        }
+        memset(recvbuf, 0, (size_t)count * (size_t)size * sizeof(int));
+
+        int agrc = pg_all_gather(sendbuf, recvbuf, count, PG_INT, pg_handle);
+        if (agrc != PG_SUCCESS) {
+            fprintf(stderr, "  [FAIL] Size %7zu B (%6d ints/rank) -> pg_all_gather returned %d\n",
+                    sz, count, agrc);
+            ag_passed = 0;
+            break;
+        }
+
+        /* Verify every rank's gathered segment in recvbuf */
+        int errors = 0;
+        for (int s = 0; s < size; s++) {
+            for (int k = 0; k < count; k++) {
+                int expected = (s + 1) * 100000 + k;
+                int actual = rints[s * count + k];
+                if (actual != expected) {
+                    if (errors < 5) {
+                        fprintf(stderr, "  [ERROR] Rank %d at origin %d idx %d (global %d): got %d, expected %d\n",
+                                rank, s, k, s * count + k, actual, expected);
+                    }
+                    errors++;
+                }
+            }
+        }
+
+        if (errors > 0) {
+            fprintf(stderr, "  [FAIL] Size %7zu B (%6d ints/rank) -> %d data mismatches on rank %d\n",
+                    sz, count, errors, rank);
+            ag_passed = 0;
+            break;
+        } else {
+            printf("  [PASS] Size %7zu B (%6d ints/rank, total=%6d ints) -> Rank %d verified all-gather slices\n",
+                   sz, count, count * size, rank);
+        }
+
+        /* Synchronize all ranks after finishing All-Gather */
+        brc = pg_barrier(pg_handle);
+        if (brc != PG_SUCCESS) {
+            fprintf(stderr, "Post-AG barrier failed with code %d\n", brc);
+            ag_passed = 0;
+            break;
+        }
+    }
+
+    printf("=================================================================\n");
+    if (ag_passed) {
+        printf("[PG V5 All-Gather] SUCCESS: All all-gather collective tests passed.\n");
+    } else {
+        printf("[PG V5 All-Gather] FAILURE: One or more all-gather tests failed.\n");
+    }
+
     rc = pg_close(pg_handle);
     free(sendbuf);
     free(recvbuf);
 
-    if (rc != PG_SUCCESS || !all_passed || !rs_passed) {
-        fprintf(stderr, "pg_close or tests failed (rc=%d, all_passed=%d, rs_passed=%d)\n",
-                rc, all_passed, rs_passed);
+    if (rc != PG_SUCCESS || !all_passed || !rs_passed || !ag_passed) {
+        fprintf(stderr, "pg_close or tests failed (rc=%d, all_passed=%d, rs_passed=%d, ag_passed=%d)\n",
+                rc, all_passed, rs_passed, ag_passed);
         return 1;
     }
 
