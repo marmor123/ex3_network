@@ -14,7 +14,7 @@ set -e
 MODE="${1:-local}"
 NUM_NODES="${2:-2}"
 CLUSTER_DIR="${CLUSTER_DIR:-/cs/usr/ateret.tabib/Downloads/ex3_network}"
-SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
+SSH_OPTS="${SSH_OPTS:-}"
 
 if [ "$MODE" = "2" ] || [ "$MODE" = "4" ]; then
     NUM_NODES="$MODE"
@@ -22,7 +22,7 @@ if [ "$MODE" = "2" ] || [ "$MODE" = "4" ]; then
 fi
 
 echo "=================================================================="
-echo "  RDMA Collective Library — Multi-Node Test Runner (V1)           "
+echo "  RDMA Collective Library — Multi-Node Test Runner (V2)           "
 echo "=================================================================="
 
 if [ "$MODE" = "local" ]; then
@@ -65,7 +65,7 @@ done
 
 if [ "$FAIL" -eq 0 ]; then
     echo "=================================================================="
-    echo "  CLUSTER TEST SUCCESS: All $NUM_NODES nodes completed V1 ring exchange! "
+    echo "  CLUSTER TEST SUCCESS: All $NUM_NODES nodes completed V2 RDMA control ring exchange! "
     echo "=================================================================="
 else
     echo "=================================================================="

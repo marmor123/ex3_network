@@ -90,23 +90,27 @@ int main(int argc, char **argv) {
     struct pg_context *ctx = (struct pg_context *)pg_handle;
 
     printf("=================================================================\n");
-    printf("[PG V1 TCP Bootstrap] Ring Edge Exchange Verified\n");
+    printf("[PG V2 RDMA Control Ring] Ring Edge & Ping Verified\n");
     printf("=================================================================\n");
     printf("  Total Ranks : %d\n", size);
     printf("  Local Rank  : %d (1-based index: %02d, servername: %s)\n",
            rank, g_pg_args.myindex_raw, local_server);
+    printf("  RDMA Device : Port=%d, LID=0x%04x, MTU=%d\n",
+           PG_IB_PORT, ctx->local_lid, ctx->active_mtu);
     printf("  Ring Edge IN (prev %d -> me %d):\n", prev_rank, rank);
-    printf("    Peer sender QP   : QPN=0x%x PSN=0x%x LID=0x%x\n",
+    printf("    Peer sender QP   : QPN=0x%x PSN=0x%x LID=0x%04x\n",
            ctx->remote_from_prev.qpn, ctx->remote_from_prev.psn, ctx->remote_from_prev.lid);
-    printf("    Local receiver QP: QPN=0x%x PSN=0x%x LID=0x%x\n",
-           ctx->local_from_prev.qpn, ctx->local_from_prev.psn, ctx->local_from_prev.lid);
+    printf("    Local receiver QP: QPN=0x%x PSN=0x%x LID=0x%04x (inline=%u, sq_depth=%u)\n",
+           ctx->local_from_prev.qpn, ctx->local_from_prev.psn, ctx->local_from_prev.lid,
+           ctx->max_inline_data[PG_QP_DIR_FROM_PREV], ctx->sq_depth[PG_QP_DIR_FROM_PREV]);
     printf("  Ring Edge OUT (me %d -> next %d):\n", rank, next_rank);
-    printf("    Local sender QP  : QPN=0x%x PSN=0x%x LID=0x%x\n",
-           ctx->local_to_next.qpn, ctx->local_to_next.psn, ctx->local_to_next.lid);
-    printf("    Peer receiver QP : QPN=0x%x PSN=0x%x LID=0x%x\n",
+    printf("    Local sender QP  : QPN=0x%x PSN=0x%x LID=0x%04x (inline=%u, sq_depth=%u)\n",
+           ctx->local_to_next.qpn, ctx->local_to_next.psn, ctx->local_to_next.lid,
+           ctx->max_inline_data[PG_QP_DIR_TO_NEXT], ctx->sq_depth[PG_QP_DIR_TO_NEXT]);
+    printf("    Peer receiver QP : QPN=0x%x PSN=0x%x LID=0x%04x\n",
            ctx->remote_to_next.qpn, ctx->remote_to_next.psn, ctx->remote_to_next.lid);
     printf("=================================================================\n");
-    printf("[PG V1 TCP Bootstrap] SUCCESS: All ring edges established.\n");
+    printf("[PG V2 RDMA Control Ring] SUCCESS: Hardware ring established and ping verified.\n");
 
     rc = pg_close(pg_handle);
     if (rc != PG_SUCCESS) {
