@@ -115,25 +115,15 @@ int main(int argc, char **argv) {
     printf("=================================================================\n");
     printf("[PG V2 RDMA Control Ring] SUCCESS: Hardware ring established and ping verified.\n");
 
-    /* Run V3 Rendezvous Segment Transfer Tests (4 KiB, 64 KiB, 1 MiB) */
+    /* Run Pipelined Collectives Verification Suite (4 KiB, 64 KiB, 1 MiB, 4 MiB, 1 GiB) */
     size_t test_sizes[] = {
-        4 * 1024,       /* 4 KiB */
-        64 * 1024,      /* 64 KiB */
-        1024 * 1024     /* 1 MiB */
+        4 * 1024,                    /* 4 KiB (sub-chunk) */
+        64 * 1024,                   /* 64 KiB (single micro) */
+        1024 * 1024,                 /* 1 MiB (16 micro-chunks) */
+        4 * 1024 * 1024,             /* 4 MiB (64 micro-chunks) */
+        1024ULL * 1024ULL * 1024ULL  /* 1 GiB (16,384 micro-chunks) */
     };
     int num_tests = (int)(sizeof(test_sizes) / sizeof(test_sizes[0]));
-    size_t max_size = 1024 * 1024;
-    size_t max_total_size = max_size * (size_t)size;
-
-    void *sendbuf = malloc(max_total_size);
-    void *recvbuf = calloc(1, max_total_size);
-    if (!sendbuf || !recvbuf) {
-        fprintf(stderr, "Error allocating test buffers\n");
-        if (sendbuf) free(sendbuf);
-        if (recvbuf) free(recvbuf);
-        pg_close(pg_handle);
-        return 1;
-    }
 
     printf("=================================================================\n");
     printf("[PG V3 Rendezvous] Testing RTS/CTS/RDMA_WRITE/DATA_DONE Transfer\n");
@@ -143,22 +133,35 @@ int main(int argc, char **argv) {
     for (int t = 0; t < num_tests; t++) {
         size_t sz = test_sizes[t];
 
+        void *sendbuf = malloc(sz);
+        void *recvbuf = calloc(1, sz);
+        if (!sendbuf || !recvbuf) {
+            printf("  [SKIP] Size %10zu B -> Could not allocate %zu B (insufficient memory)\n", sz, sz);
+            if (sendbuf) free(sendbuf);
+            if (recvbuf) free(recvbuf);
+            continue;
+        }
+
         /* Synchronize all ranks before starting the next payload transfer */
         int brc = pg_barrier(pg_handle);
         if (brc != PG_SUCCESS) {
             fprintf(stderr, "Pre-test barrier failed with code %d\n", brc);
             all_passed = 0;
+            free(sendbuf);
+            free(recvbuf);
             break;
         }
 
         int trc = pg_test_v3_rendezvous(pg_handle, sendbuf, recvbuf, sz);
         if (trc == PG_SUCCESS) {
-            printf("  [PASS] Size %7zu B (%6zu ints) -> Verified transferred data integrity from rank %d\n",
+            printf("  [PASS] Size %10zu B (%9zu ints) -> Verified transferred data integrity from rank %d\n",
                    sz, sz / sizeof(int), prev_rank);
         } else {
-            printf("  [FAIL] Size %7zu B (%6zu ints) -> Failed with code %d\n",
+            printf("  [FAIL] Size %10zu B (%9zu ints) -> Failed with code %d\n",
                    sz, sz / sizeof(int), trc);
             all_passed = 0;
+            free(sendbuf);
+            free(recvbuf);
             break;
         }
 
@@ -167,8 +170,13 @@ int main(int argc, char **argv) {
         if (brc != PG_SUCCESS) {
             fprintf(stderr, "Post-test barrier failed with code %d\n", brc);
             all_passed = 0;
+            free(sendbuf);
+            free(recvbuf);
             break;
         }
+
+        free(sendbuf);
+        free(recvbuf);
     }
 
     printf("=================================================================\n");
@@ -178,9 +186,9 @@ int main(int argc, char **argv) {
         printf("[PG V3 Rendezvous] FAILURE: One or more rendezvous transfers failed.\n");
     }
 
-    /* Run V4 Reduce-Scatter Tests (PG_INT + PG_SUM for 4 KiB, 64 KiB, 1 MiB) */
+    /* Run V7 Pipelined Reduce-Scatter Tests (PG_INT + PG_SUM) */
     printf("=================================================================\n");
-    printf("[PG V4 Reduce-Scatter] Testing Ring Reduce-Scatter (PG_INT + PG_SUM)\n");
+    printf("[PG V7 Reduce-Scatter] Testing Pipelined Reduce-Scatter (PG_INT + PG_SUM)\n");
     printf("=================================================================\n");
 
     int rs_passed = 1;
@@ -188,37 +196,51 @@ int main(int argc, char **argv) {
         size_t sz = test_sizes[t];
         int count = (int)(sz / sizeof(int));
         int segment_count = count / size;
+        size_t segment_bytes = (size_t)segment_count * sizeof(int);
+
+        void *sendbuf = malloc(sz);
+        void *recvbuf = calloc(1, segment_bytes);
+        if (!sendbuf || !recvbuf) {
+            printf("  [SKIP] Size %10zu B -> Could not allocate %zu B\n", sz, sz);
+            if (sendbuf) free(sendbuf);
+            if (recvbuf) free(recvbuf);
+            continue;
+        }
 
         /* Synchronize all ranks before starting Reduce-Scatter */
         int brc = pg_barrier(pg_handle);
         if (brc != PG_SUCCESS) {
             fprintf(stderr, "Pre-RS barrier failed with code %d\n", brc);
             rs_passed = 0;
+            free(sendbuf);
+            free(recvbuf);
             break;
         }
 
-        /* Fill sendbuf with deterministic arithmetic pattern: sendbuf[k] = (rank + 1) * (k + 1) */
+        /* Fill sendbuf with deterministic arithmetic pattern */
         int *sints = (int *)sendbuf;
         int *rints = (int *)recvbuf;
         for (int k = 0; k < count; k++) {
-            sints[k] = (rank + 1) * (k + 1);
+            sints[k] = (rank + 1) * (int)((k % 1000) + 1);
         }
-        memset(recvbuf, 0, (size_t)segment_count * sizeof(int));
+        memset(recvbuf, 0, segment_bytes);
 
         int rrc = pg_reduce_scatter(sendbuf, recvbuf, count, PG_INT, PG_SUM, pg_handle);
         if (rrc != PG_SUCCESS) {
-            fprintf(stderr, "  [FAIL] Size %7zu B (%6d ints) -> pg_reduce_scatter returned %d\n",
+            fprintf(stderr, "  [FAIL] Size %10zu B (%9d ints) -> pg_reduce_scatter returned %d\n",
                     sz, count, rrc);
             rs_passed = 0;
+            free(sendbuf);
+            free(recvbuf);
             break;
         }
 
-        /* Verify received segment data against expected sum: ((size * (size + 1)) / 2) * (k + 1) */
+        /* Verify received segment data against expected sum */
         int expected_multiplier = (size * (size + 1)) / 2;
         int errors = 0;
         for (int j = 0; j < segment_count; j++) {
             int k = rank * segment_count + j;
-            int expected = expected_multiplier * (k + 1);
+            int expected = expected_multiplier * (int)((k % 1000) + 1);
             if (rints[j] != expected) {
                 if (errors < 5) {
                     fprintf(stderr, "  [ERROR] Rank %d at segment idx %d (global %d): got %d, expected %d\n",
@@ -229,12 +251,14 @@ int main(int argc, char **argv) {
         }
 
         if (errors > 0) {
-            fprintf(stderr, "  [FAIL] Size %7zu B (%6d ints) -> %d data mismatches on rank %d\n",
+            fprintf(stderr, "  [FAIL] Size %10zu B (%9d ints) -> %d data mismatches on rank %d\n",
                     sz, count, errors, rank);
             rs_passed = 0;
+            free(sendbuf);
+            free(recvbuf);
             break;
         } else {
-            printf("  [PASS] Size %7zu B (%6d ints, seg=%d ints) -> Rank %d verified sum arithmetic\n",
+            printf("  [PASS] Size %10zu B (%9d ints, seg=%d ints) -> Rank %d verified sum arithmetic\n",
                    sz, count, segment_count, rank);
         }
 
@@ -243,48 +267,67 @@ int main(int argc, char **argv) {
         if (brc != PG_SUCCESS) {
             fprintf(stderr, "Post-RS barrier failed with code %d\n", brc);
             rs_passed = 0;
+            free(sendbuf);
+            free(recvbuf);
             break;
         }
+
+        free(sendbuf);
+        free(recvbuf);
     }
 
     printf("=================================================================\n");
     if (rs_passed) {
-        printf("[PG V4 Reduce-Scatter] SUCCESS: All reduce-scatter collective tests passed.\n");
+        printf("[PG V7 Reduce-Scatter] SUCCESS: All reduce-scatter collective tests passed.\n");
     } else {
-        printf("[PG V4 Reduce-Scatter] FAILURE: One or more reduce-scatter tests failed.\n");
+        printf("[PG V7 Reduce-Scatter] FAILURE: One or more reduce-scatter tests failed.\n");
     }
 
-    /* Run V5 All-Gather Tests (PG_INT for 4 KiB, 64 KiB, 1 MiB per rank) */
+    /* Run V7 Pipelined All-Gather Tests (PG_INT Zero-Copy) */
     printf("=================================================================\n");
-    printf("[PG V5 All-Gather] Testing Ring All-Gather (Zero-Copy RDMA Write)\n");
+    printf("[PG V7 All-Gather] Testing Pipelined Ring All-Gather (Zero-Copy RDMA Write)\n");
     printf("=================================================================\n");
 
     int ag_passed = 1;
     for (int t = 0; t < num_tests; t++) {
         size_t sz = test_sizes[t];
         int count = (int)(sz / sizeof(int));
+        size_t total_gather_bytes = sz * (size_t)size;
+
+        void *sendbuf = malloc(sz);
+        void *recvbuf = calloc(1, total_gather_bytes);
+        if (!sendbuf || !recvbuf) {
+            printf("  [SKIP] Size %10zu B -> Could not allocate %zu B\n", sz, total_gather_bytes);
+            if (sendbuf) free(sendbuf);
+            if (recvbuf) free(recvbuf);
+            continue;
+        }
 
         /* Synchronize all ranks before starting All-Gather */
         int brc = pg_barrier(pg_handle);
         if (brc != PG_SUCCESS) {
             fprintf(stderr, "Pre-AG barrier failed with code %d\n", brc);
             ag_passed = 0;
+            free(sendbuf);
+            free(recvbuf);
             break;
         }
 
-        /* Fill sendbuf with deterministic pattern per rank: (rank + 1) * 100000 + k */
+        /* Fill sendbuf with deterministic pattern per rank */
         int *sints = (int *)sendbuf;
         int *rints = (int *)recvbuf;
         for (int k = 0; k < count; k++) {
-            sints[k] = (rank + 1) * 100000 + k;
+            sints[k] = (rank + 1) * 100000 + (int)(k % 100000);
         }
-        memset(recvbuf, 0, (size_t)count * (size_t)size * sizeof(int));
+        memset(recvbuf, 0, total_gather_bytes);
 
         int agrc = pg_all_gather(sendbuf, recvbuf, count, PG_INT, pg_handle);
         if (agrc != PG_SUCCESS) {
-            fprintf(stderr, "  [FAIL] Size %7zu B (%6d ints/rank) -> pg_all_gather returned %d\n",
+            fprintf(stderr, "  [FAIL] Size %10zu B (%9d ints/rank) -> pg_all_gather returned %d\n",
                     sz, count, agrc);
             ag_passed = 0;
+            free(sendbuf);
+            free(recvbuf);
             break;
         }
 
@@ -292,7 +335,7 @@ int main(int argc, char **argv) {
         int errors = 0;
         for (int s = 0; s < size; s++) {
             for (int k = 0; k < count; k++) {
-                int expected = (s + 1) * 100000 + k;
+                int expected = (s + 1) * 100000 + (int)(k % 100000);
                 int actual = rints[s * count + k];
                 if (actual != expected) {
                     if (errors < 5) {
@@ -305,12 +348,14 @@ int main(int argc, char **argv) {
         }
 
         if (errors > 0) {
-            fprintf(stderr, "  [FAIL] Size %7zu B (%6d ints/rank) -> %d data mismatches on rank %d\n",
+            fprintf(stderr, "  [FAIL] Size %10zu B (%9d ints/rank) -> %d data mismatches on rank %d\n",
                     sz, count, errors, rank);
             ag_passed = 0;
+            free(sendbuf);
+            free(recvbuf);
             break;
         } else {
-            printf("  [PASS] Size %7zu B (%6d ints/rank, total=%6d ints) -> Rank %d verified all-gather slices\n",
+            printf("  [PASS] Size %10zu B (%9d ints/rank, total=%9d ints) -> Rank %d verified all-gather slices\n",
                    sz, count, count * size, rank);
         }
 
@@ -319,20 +364,25 @@ int main(int argc, char **argv) {
         if (brc != PG_SUCCESS) {
             fprintf(stderr, "Post-AG barrier failed with code %d\n", brc);
             ag_passed = 0;
+            free(sendbuf);
+            free(recvbuf);
             break;
         }
+
+        free(sendbuf);
+        free(recvbuf);
     }
 
     printf("=================================================================\n");
     if (ag_passed) {
-        printf("[PG V5 All-Gather] SUCCESS: All all-gather collective tests passed.\n");
+        printf("[PG V7 All-Gather] SUCCESS: All all-gather collective tests passed.\n");
     } else {
-        printf("[PG V5 All-Gather] FAILURE: One or more all-gather tests failed.\n");
+        printf("[PG V7 All-Gather] FAILURE: One or more all-gather tests failed.\n");
     }
 
-    /* Run V6 All-Reduce Tests (PG_INT + PG_SUM for 4 KiB, 64 KiB, 1 MiB) */
+    /* Run V7 Pipelined All-Reduce Tests (PG_INT + PG_SUM) */
     printf("=================================================================\n");
-    printf("[PG V6 All-Reduce] Testing Ring All-Reduce (RS + Barrier + AG)\n");
+    printf("[PG V7 All-Reduce] Testing Pipelined Ring All-Reduce (RS + Barrier + AG)\n");
     printf("=================================================================\n");
 
     int ar_passed = 1;
@@ -340,35 +390,48 @@ int main(int argc, char **argv) {
         size_t sz = test_sizes[t];
         int count = (int)(sz / sizeof(int));
 
+        void *sendbuf = malloc(sz);
+        void *recvbuf = calloc(1, sz);
+        if (!sendbuf || !recvbuf) {
+            printf("  [SKIP] Size %10zu B -> Could not allocate %zu B\n", sz, sz);
+            if (sendbuf) free(sendbuf);
+            if (recvbuf) free(recvbuf);
+            continue;
+        }
+
         /* Synchronize all ranks before starting All-Reduce */
         int brc = pg_barrier(pg_handle);
         if (brc != PG_SUCCESS) {
             fprintf(stderr, "Pre-AR barrier failed with code %d\n", brc);
             ar_passed = 0;
+            free(sendbuf);
+            free(recvbuf);
             break;
         }
 
-        /* Fill sendbuf with deterministic arithmetic pattern: sendbuf[k] = (rank + 1) * (k + 1) */
+        /* Fill sendbuf with deterministic arithmetic pattern */
         int *sints = (int *)sendbuf;
         int *rints = (int *)recvbuf;
         for (int k = 0; k < count; k++) {
-            sints[k] = (rank + 1) * (k + 1);
+            sints[k] = (rank + 1) * (int)((k % 1000) + 1);
         }
-        memset(recvbuf, 0, (size_t)count * sizeof(int));
+        memset(recvbuf, 0, sz);
 
         int arrc = pg_all_reduce(sendbuf, recvbuf, count, PG_INT, PG_SUM, pg_handle);
         if (arrc != PG_SUCCESS) {
-            fprintf(stderr, "  [FAIL] Size %7zu B (%6d ints) -> pg_all_reduce returned %d\n",
+            fprintf(stderr, "  [FAIL] Size %10zu B (%9d ints) -> pg_all_reduce returned %d\n",
                     sz, count, arrc);
             ar_passed = 0;
+            free(sendbuf);
+            free(recvbuf);
             break;
         }
 
-        /* Verify all-reduced values against expected sum: ((size * (size + 1)) / 2) * (k + 1) */
+        /* Verify all-reduced values against expected sum */
         int expected_multiplier = (size * (size + 1)) / 2;
         int errors = 0;
         for (int k = 0; k < count; k++) {
-            int expected = expected_multiplier * (k + 1);
+            int expected = expected_multiplier * (int)((k % 1000) + 1);
             int actual = rints[k];
             if (actual != expected) {
                 if (errors < 5) {
@@ -380,12 +443,14 @@ int main(int argc, char **argv) {
         }
 
         if (errors > 0) {
-            fprintf(stderr, "  [FAIL] Size %7zu B (%6d ints) -> %d data mismatches on rank %d\n",
+            fprintf(stderr, "  [FAIL] Size %10zu B (%9d ints) -> %d data mismatches on rank %d\n",
                     sz, count, errors, rank);
             ar_passed = 0;
+            free(sendbuf);
+            free(recvbuf);
             break;
         } else {
-            printf("  [PASS] Size %7zu B (%6d ints) -> Rank %d verified all-reduce sum\n",
+            printf("  [PASS] Size %10zu B (%9d ints) -> Rank %d verified all-reduce sum\n",
                    sz, count, rank);
         }
 
@@ -394,20 +459,23 @@ int main(int argc, char **argv) {
         if (brc != PG_SUCCESS) {
             fprintf(stderr, "Post-AR barrier failed with code %d\n", brc);
             ar_passed = 0;
+            free(sendbuf);
+            free(recvbuf);
             break;
         }
+
+        free(sendbuf);
+        free(recvbuf);
     }
 
     printf("=================================================================\n");
     if (ar_passed) {
-        printf("[PG V6 All-Reduce] SUCCESS: All all-reduce collective tests passed.\n");
+        printf("[PG V7 All-Reduce] SUCCESS: All all-reduce collective tests passed.\n");
     } else {
-        printf("[PG V6 All-Reduce] FAILURE: One or more all-reduce tests failed.\n");
+        printf("[PG V7 All-Reduce] FAILURE: One or more all-reduce tests failed.\n");
     }
 
     rc = pg_close(pg_handle);
-    free(sendbuf);
-    free(recvbuf);
 
     if (rc != PG_SUCCESS || !all_passed || !rs_passed || !ag_passed || !ar_passed) {
         fprintf(stderr, "pg_close or tests failed (rc=%d, all_passed=%d, rs_passed=%d, ag_passed=%d, ar_passed=%d)\n",

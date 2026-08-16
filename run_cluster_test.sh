@@ -22,7 +22,7 @@ if [ "$MODE" = "2" ] || [ "$MODE" = "4" ]; then
 fi
 
 echo "=================================================================="
-echo "  RDMA Collective Library — Multi-Node Test Runner (V6 AR)        "
+echo "  RDMA Collective Library — Multi-Node Test Runner (V7 Pipelining) "
 echo "=================================================================="
 
 if [ "$MODE" = "local" ]; then
@@ -50,8 +50,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 echo "Syncing local workspace to ${HOSTS[0]}:$CLUSTER_DIR..."
 rsync -avz --exclude '.git' --exclude '*.o' --exclude 'test' "$SCRIPT_DIR/" "${HOSTS[0]}:$CLUSTER_DIR/"
 
-echo "Building on ${HOSTS[0]}..."
-ssh $SSH_OPTS "${HOSTS[0]}" "cd $CLUSTER_DIR && make clean && make"
+PROFILE="${PROFILE:-bringup}"
+echo "Building on ${HOSTS[0]} (PROFILE=$PROFILE)..."
+ssh $SSH_OPTS "${HOSTS[0]}" "cd $CLUSTER_DIR && make clean && make PROFILE=$PROFILE"
 
 PIDS=()
 for i in "${!HOSTS[@]}"; do
@@ -72,7 +73,7 @@ done
 
 if [ "$FAIL" -eq 0 ]; then
     echo "=================================================================="
-    echo "  CLUSTER TEST SUCCESS: All $NUM_NODES nodes completed V6 All-Reduce, V5 All-Gather, V4 Reduce-Scatter & V3 Rendezvous! "
+    echo "  CLUSTER TEST SUCCESS: All $NUM_NODES nodes completed V7 Pipelined All-Reduce, All-Gather, Reduce-Scatter & Rendezvous! "
     echo "=================================================================="
 else
     echo "=================================================================="

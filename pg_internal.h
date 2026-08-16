@@ -20,6 +20,23 @@
 #define PG_CTRL_POLL_TIMEOUT_SEC 10
 #define PG_MAX_INLINE_DECLARE   1024
 
+/* Pipelining and Profile Constants (Summary Sec 21, 24, 25) */
+#ifdef PROFILE_PERF
+#define PG_PIPELINE_CHUNK        (256 * 1024)  /* 256 KiB */
+#define PG_RDMA_WINDOW           32
+#define PG_RDMA_SIGNAL_INTERVAL  8
+#else
+#ifndef PG_PIPELINE_CHUNK
+#define PG_PIPELINE_CHUNK        (64 * 1024)   /* 64 KiB */
+#endif
+#ifndef PG_RDMA_WINDOW
+#define PG_RDMA_WINDOW           1
+#endif
+#ifndef PG_RDMA_SIGNAL_INTERVAL
+#define PG_RDMA_SIGNAL_INTERVAL  1
+#endif
+#endif
+
 /* QP Directions (index into per-direction arrays) */
 #define PG_QP_DIR_TO_NEXT       0
 #define PG_QP_DIR_FROM_PREV     1
@@ -39,8 +56,8 @@ static inline uint64_t pg_make_wr(int qp_dir, int type) {
     return ((uint64_t)(type & 0x0F)) | (((uint64_t)(qp_dir & 0x01)) << 4);
 }
 
-static inline uint64_t pg_make_wr_slot(int qp_dir, int type, int slot) {
-    return ((uint64_t)(type & 0x0F)) | (((uint64_t)(qp_dir & 0x01)) << 4) | (((uint64_t)(slot & 0xFF)) << 8);
+static inline uint64_t pg_make_wr_slot(int qp_dir, int type, uint32_t slot) {
+    return ((uint64_t)(type & 0x0F)) | (((uint64_t)(qp_dir & 0x01)) << 4) | (((uint64_t)slot) << 8);
 }
 
 static inline int pg_wr_type(uint64_t wr_id) {
@@ -51,8 +68,8 @@ static inline int pg_wr_qp(uint64_t wr_id) {
     return (int)((wr_id >> 4) & 0x01);
 }
 
-static inline int pg_wr_slot(uint64_t wr_id) {
-    return (int)((wr_id >> 8) & 0xFF);
+static inline uint32_t pg_wr_slot(uint64_t wr_id) {
+    return (uint32_t)(wr_id >> 8);
 }
 
 /* Control Message Types */

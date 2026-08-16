@@ -3,6 +3,16 @@ CFLAGS ?= -Wall -Wextra -Werror -O3 -std=gnu11
 LDFLAGS ?= 
 LDLIBS ?= -libverbs
 
+PROFILE ?= bringup
+ifeq ($(PROFILE),perf)
+    CFLAGS += -DPROFILE_PERF
+endif
+
+WORKBUFFER ?= safe
+ifeq ($(WORKBUFFER),inplace)
+    CFLAGS += -DPG_WORKBUFFER_INPLACE
+endif
+
 TARGET = test
 SRCS = main_test.c pg.c
 OBJS = $(SRCS:.c=.o)
