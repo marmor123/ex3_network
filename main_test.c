@@ -330,13 +330,88 @@ int main(int argc, char **argv) {
         printf("[PG V5 All-Gather] FAILURE: One or more all-gather tests failed.\n");
     }
 
+    /* Run V6 All-Reduce Tests (PG_INT + PG_SUM for 4 KiB, 64 KiB, 1 MiB) */
+    printf("=================================================================\n");
+    printf("[PG V6 All-Reduce] Testing Ring All-Reduce (RS + Barrier + AG)\n");
+    printf("=================================================================\n");
+
+    int ar_passed = 1;
+    for (int t = 0; t < num_tests; t++) {
+        size_t sz = test_sizes[t];
+        int count = (int)(sz / sizeof(int));
+
+        /* Synchronize all ranks before starting All-Reduce */
+        int brc = pg_barrier(pg_handle);
+        if (brc != PG_SUCCESS) {
+            fprintf(stderr, "Pre-AR barrier failed with code %d\n", brc);
+            ar_passed = 0;
+            break;
+        }
+
+        /* Fill sendbuf with deterministic arithmetic pattern: sendbuf[k] = (rank + 1) * (k + 1) */
+        int *sints = (int *)sendbuf;
+        int *rints = (int *)recvbuf;
+        for (int k = 0; k < count; k++) {
+            sints[k] = (rank + 1) * (k + 1);
+        }
+        memset(recvbuf, 0, (size_t)count * sizeof(int));
+
+        int arrc = pg_all_reduce(sendbuf, recvbuf, count, PG_INT, PG_SUM, pg_handle);
+        if (arrc != PG_SUCCESS) {
+            fprintf(stderr, "  [FAIL] Size %7zu B (%6d ints) -> pg_all_reduce returned %d\n",
+                    sz, count, arrc);
+            ar_passed = 0;
+            break;
+        }
+
+        /* Verify all-reduced values against expected sum: ((size * (size + 1)) / 2) * (k + 1) */
+        int expected_multiplier = (size * (size + 1)) / 2;
+        int errors = 0;
+        for (int k = 0; k < count; k++) {
+            int expected = expected_multiplier * (k + 1);
+            int actual = rints[k];
+            if (actual != expected) {
+                if (errors < 5) {
+                    fprintf(stderr, "  [ERROR] Rank %d at idx %d: got %d, expected %d\n",
+                            rank, k, actual, expected);
+                }
+                errors++;
+            }
+        }
+
+        if (errors > 0) {
+            fprintf(stderr, "  [FAIL] Size %7zu B (%6d ints) -> %d data mismatches on rank %d\n",
+                    sz, count, errors, rank);
+            ar_passed = 0;
+            break;
+        } else {
+            printf("  [PASS] Size %7zu B (%6d ints) -> Rank %d verified all-reduce sum\n",
+                   sz, count, rank);
+        }
+
+        /* Synchronize all ranks after finishing All-Reduce */
+        brc = pg_barrier(pg_handle);
+        if (brc != PG_SUCCESS) {
+            fprintf(stderr, "Post-AR barrier failed with code %d\n", brc);
+            ar_passed = 0;
+            break;
+        }
+    }
+
+    printf("=================================================================\n");
+    if (ar_passed) {
+        printf("[PG V6 All-Reduce] SUCCESS: All all-reduce collective tests passed.\n");
+    } else {
+        printf("[PG V6 All-Reduce] FAILURE: One or more all-reduce tests failed.\n");
+    }
+
     rc = pg_close(pg_handle);
     free(sendbuf);
     free(recvbuf);
 
-    if (rc != PG_SUCCESS || !all_passed || !rs_passed || !ag_passed) {
-        fprintf(stderr, "pg_close or tests failed (rc=%d, all_passed=%d, rs_passed=%d, ag_passed=%d)\n",
-                rc, all_passed, rs_passed, ag_passed);
+    if (rc != PG_SUCCESS || !all_passed || !rs_passed || !ag_passed || !ar_passed) {
+        fprintf(stderr, "pg_close or tests failed (rc=%d, all_passed=%d, rs_passed=%d, ag_passed=%d, ar_passed=%d)\n",
+                rc, all_passed, rs_passed, ag_passed, ar_passed);
         return 1;
     }
 

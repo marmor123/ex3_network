@@ -1742,13 +1742,56 @@ int pg_all_gather(void *sendbuf, void *recvbuf, int count,
 int pg_all_reduce(void *sendbuf, void *recvbuf, int count,
                   DATATYPE datatype, OPERATION op,
                   void *pg_handle) {
-    (void)sendbuf;
-    (void)recvbuf;
-    (void)count;
-    (void)datatype;
-    (void)op;
-    (void)pg_handle;
-    return PG_ERR_UNSUPPORTED;
+    if (!pg_handle || !sendbuf || !recvbuf || count <= 0) {
+        return PG_ERR_INVAL;
+    }
+    struct pg_context *ctx = (struct pg_context *)pg_handle;
+
+    if (datatype != PG_INT || op != PG_SUM) {
+        return PG_ERR_UNSUPPORTED;
+    }
+
+    if (count % ctx->size != 0) {
+        fprintf(stderr, "[pg_all_reduce] Error: count (%d) must be divisible by ring size (%d)\n",
+                count, ctx->size);
+        return PG_ERR_INVAL;
+    }
+
+    /* Single rank degenerate ring: copy input directly to output */
+    if (ctx->size == 1) {
+        memcpy(recvbuf, sendbuf, (size_t)count * sizeof(int));
+        return PG_SUCCESS;
+    }
+
+    int segment_count = count / ctx->size;
+    size_t segment_bytes = (size_t)segment_count * sizeof(int);
+
+    /* Phase 1: Reduce-Scatter into local owned slice recvbuf[rank] */
+    int rc = pg_reduce_scatter(sendbuf, (char *)recvbuf + ctx->rank * segment_bytes,
+                               count, datatype, op, pg_handle);
+    if (rc != PG_SUCCESS) {
+        fprintf(stderr, "[pg_all_reduce] Rank %d Reduce-Scatter phase failed with code %d\n",
+                ctx->rank, rc);
+        return rc;
+    }
+
+    /* Phase 2: Distributed barrier before All-Gather phase */
+    rc = pg_barrier(pg_handle);
+    if (rc != PG_SUCCESS) {
+        fprintf(stderr, "[pg_all_reduce] Rank %d intermediate barrier failed with code %d\n",
+                ctx->rank, rc);
+        return rc;
+    }
+
+    /* Phase 3: Zero-copy All-Gather distributing reduced segments across ring */
+    rc = pg_ring_all_gather_core(ctx, recvbuf, segment_bytes);
+    if (rc != PG_SUCCESS) {
+        fprintf(stderr, "[pg_all_reduce] Rank %d All-Gather phase failed with code %d\n",
+                ctx->rank, rc);
+        return rc;
+    }
+
+    return PG_SUCCESS;
 }
 
 /* V3: Rendezvous Segment Transfer Test (RTS -> CTS -> RDMA_WRITE -> DATA_DONE) */
