@@ -371,6 +371,148 @@ static inline int pg_repost_recv_slot(struct pg_context *ctx, int qp_dir, int sl
 #define pg_recv_slot_msg(ctx, dir, slot)          ((struct pg_ctrl_msg *)ctx->recv_slot_buf[dir][slot])
 #define pg_recv_slot_payload(ctx, dir, slot)      ((void *)((char *)ctx->recv_slot_buf[dir][slot] + PG_CTRL_MSG_LEN))
 
+/* ========================================================================= */
+/* Deep Progress Engine Module (ADR-0001, CONTEXT.md)                        */
+/* Encapsulates CQ polling, wr_id decoding, automatic receive buffer        */
+/* replenishment, and pending FIFO message queue matching.                   */
+/* ========================================================================= */
+
+struct pg_progress_event {
+    int type;                               /* PG_WR_TYPE_RECV_CTRL, PG_WR_TYPE_RDMA_WRITE, PG_WR_TYPE_SEND_CTRL, PG_WR_TYPE_EAGER_SEND */
+    int qp_dir;                             /* PG_QP_DIR_TO_NEXT (0) or PG_QP_DIR_FROM_PREV (1) */
+    uint32_t slot;                          /* Slot index or micro-chunk sequence index */
+    struct pg_ctrl_msg msg;                 /* Message content (for PG_WR_TYPE_RECV_CTRL) */
+    char eager_buf[PG_EAGER_BUF_SIZE + PG_CTRL_MSG_LEN]; /* Copy of eager payload if type is EAGER_PAYLOAD */
+    uint32_t eager_len;                     /* Length of eager payload */
+};
+
+/* Pop matching message from internal FIFO pending queue */
+static inline int pg_progress_pop_pending(struct pg_context *ctx, int qp_dir, int msg_type, uint32_t seg_idx, struct pg_progress_event *out_event) {
+    if (!ctx || qp_dir < 0 || qp_dir >= 2 || !out_event) return 0;
+    struct pg_ctrl_msg msg;
+    char slot_buf[PG_EAGER_SLOT_SIZE];
+    if (pg_pending_pop_matching(ctx, qp_dir, msg_type, seg_idx, &msg, slot_buf)) {
+        out_event->type = PG_WR_TYPE_RECV_CTRL;
+        out_event->qp_dir = qp_dir;
+        out_event->slot = 0;
+        out_event->msg = msg;
+        out_event->eager_len = 0;
+        if (msg.type == PG_CTRL_MSG_EAGER_PAYLOAD) {
+            uint32_t elen = msg.payload.rdv.length + PG_CTRL_MSG_LEN;
+            if (elen > (PG_EAGER_BUF_SIZE + PG_CTRL_MSG_LEN)) elen = PG_EAGER_BUF_SIZE + PG_CTRL_MSG_LEN;
+            memcpy(out_event->eager_buf, slot_buf, elen);
+            out_event->eager_len = elen;
+        }
+        return 1;
+    }
+    return 0;
+}
+
+/* Push unhandled or future-step message into pending queue */
+static inline void pg_progress_push_pending(struct pg_context *ctx, int qp_dir, const struct pg_ctrl_msg *msg, const void *slot_buf) {
+    pg_pending_push(ctx, qp_dir, msg, slot_buf);
+}
+
+/* Non-blocking single CQ poll and event decoder with auto receive slot replenishment */
+static inline int pg_progress_poll(struct pg_context *ctx, struct pg_progress_event *out_event) {
+    if (!ctx || !out_event) return PG_ERR_INVAL;
+
+    struct ibv_wc wc;
+    int ne = ibv_poll_cq(ctx->cq, 1, &wc);
+    if (ne < 0) {
+        fprintf(stderr, "[pg_progress] Error: ibv_poll_cq failed with code %d\n", ne);
+        return PG_ERR_RDMA;
+    }
+    if (ne == 0) {
+        return 0; /* No completion ready */
+    }
+
+    if (wc.status != IBV_WC_SUCCESS) {
+        fprintf(stderr, "[pg_progress] Error: CQ completion error %s (%d) on wr_id 0x%lx\n",
+                ibv_wc_status_str(wc.status), wc.status, (unsigned long)wc.wr_id);
+        return PG_ERR_RDMA;
+    }
+
+    out_event->type = pg_wr_type(wc.wr_id);
+    out_event->qp_dir = pg_wr_qp(wc.wr_id);
+    out_event->slot = pg_wr_slot(wc.wr_id);
+    out_event->eager_len = 0;
+
+    if (out_event->type == PG_WR_TYPE_RECV_CTRL) {
+        int dir = out_event->qp_dir;
+        int slot = (int)out_event->slot;
+        struct pg_ctrl_msg *rhdr = pg_recv_slot_msg(ctx, dir, slot);
+
+        if (rhdr->tag != PG_CTRL_TAG) {
+            fprintf(stderr, "[pg_progress] Error: Invalid tag 0x%08x on qp_dir %d slot %d\n",
+                    rhdr->tag, dir, slot);
+            return PG_ERR_RDMA;
+        }
+
+        out_event->msg = *rhdr;
+        if (rhdr->type == PG_CTRL_MSG_EAGER_PAYLOAD) {
+            uint32_t elen = rhdr->payload.rdv.length + PG_CTRL_MSG_LEN;
+            if (elen > (PG_EAGER_BUF_SIZE + PG_CTRL_MSG_LEN)) elen = PG_EAGER_BUF_SIZE + PG_CTRL_MSG_LEN;
+            memcpy(out_event->eager_buf, ctx->recv_slot_buf[dir][slot], elen);
+            out_event->eager_len = elen;
+        }
+
+        /* Automatically repost the consumed receive buffer slot */
+        if (pg_repost_recv_slot(ctx, dir, slot)) {
+            perror("[pg_progress] Error: Failed to repost receive buffer slot");
+            return PG_ERR_RDMA;
+        }
+    }
+
+    return 1;
+}
+
+/* Watchdog-timed progress event waiter (polls until completion or timeout) */
+static inline int pg_progress_wait(struct pg_context *ctx, double timeout_sec, struct pg_progress_event *out_event) {
+    struct timespec start, now;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+
+    while (1) {
+        int rc = pg_progress_poll(ctx, out_event);
+        if (rc < 0) return rc;
+        if (rc == 1) return 1;
+
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        double elapsed = (now.tv_sec - start.tv_sec) + (now.tv_nsec - start.tv_nsec) / 1e9;
+        if (elapsed >= timeout_sec) {
+            fprintf(stderr, "[pg_progress] Error: Timed out after %.2f s waiting for CQ event\n", elapsed);
+            return PG_ERR_TIMEOUT;
+        }
+    }
+}
+
+/* ============================================================================
+ * Ring Step Transfer Engine (Candidate #02: Deep Transfer Pipelining)
+ * ============================================================================ */
+
+typedef void (*pg_chunk_handler_fn)(void *dest, const void *src, size_t len, void *user_ctx);
+
+struct pg_ring_step_desc {
+    uint32_t step_idx;          /* 0-indexed ring step */
+
+    /* Outbound */
+    uint32_t send_tag;          /* Segment index or rank origin tag */
+    const void *send_buf;       /* Base memory address of outbound slice */
+    size_t send_bytes;          /* Length in bytes of outbound slice */
+    uint32_t send_lkey;         /* Local MR lkey */
+
+    /* Inbound */
+    uint32_t recv_tag;          /* Expected segment index or rank origin tag */
+    void *recv_target_addr;     /* Advertised inbound destination (e.g. staging_buf or recvbuf) */
+    uint32_t recv_rkey;         /* Advertised inbound destination rkey */
+    size_t recv_bytes;          /* Length in bytes of inbound slice */
+
+    /* Inbound micro-chunk processing */
+    pg_chunk_handler_fn on_recv_chunk; /* Callback per received micro-chunk (e.g. reduction or memcpy) */
+    void *cb_dest;                     /* Destination buffer pointer for callback */
+    void *cb_user_ctx;                 /* User context passed into callback */
+};
+
 /* Internal RDMA and TCP bootstrap helper functions */
 int pg_rdma_init_resources(struct pg_context *ctx);
 int pg_rdma_connect_qp(struct ibv_qp *qp, const struct pg_tcp_qp_info *remote,
