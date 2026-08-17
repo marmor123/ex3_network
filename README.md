@@ -2,7 +2,7 @@
 
 High-performance, single-threaded RDMA collective communication library implementing **Reduce-Scatter**, **All-Gather**, and **All-Reduce** over InfiniBand Reliable Connected (RC) Queue Pairs using the `libibverbs` API.
 
-Designed and tuned on a 4-node InfiniBand cluster (`mlx-stud-01..04`), achieving **20.93 Gbps** peak effective bandwidth (and sub-$15\,\mu\text{s}$ small-message latency) with automatic Eager/Rendezvous switching and pipelined zero-copy RDMA execution.
+Designed and tuned on a 4-node InfiniBand cluster (`mlx-stud-01..04`), achieving **20.93 Gbps** peak effective bandwidth (and sub-$45\,\mu\text{s}$ small-message 4-rank all-reduce latency) with automatic Eager/Rendezvous switching and pipelined zero-copy RDMA execution.
 
 ---
 
@@ -208,10 +208,11 @@ Data is written directly into `recvbuf + offset(s_in)` with zero memory copies. 
 ```
 .
 ├── CONTEXT.md                    # Ubiquitous language, domain concepts & architectural invariants
-├── Makefile                      # Build system with mode flags (auto default)
+├── Makefile                      # Build system with mode flags (auto & inplace defaults)
 ├── README.md                     # Top-level architectural documentation (this document)
 ├── assignment.txt                # Exercise specification and constraints
 ├── compare_protocols.py          # Automated Eager vs Rendezvous comparative runner
+├── run_all_benchmarks.py         # Full automated benchmark & sensitivity sweep runner
 ├── run_cluster_test.sh           # Multi-node cluster execution script
 ├── test_v1_local.py              # Local multi-process validation harness
 │
@@ -229,7 +230,7 @@ Data is written directly into `recvbuf + offset(s_in)` with zero memory copies. 
 │
 └── docs/
     ├── empirical_protocol_report.md  # Detailed benchmark analysis and empirical boundary matrix
-    └── adr/                          # Architectural Decision Records
+    └── adr/                          # Architectural Decision Records (0001 - 0007)
         ├── 0001-wr-id-progress-engine.md
         ├── 0002-mr-buffer-lifecycle.md
         ├── 0003-eager-threshold-and-adaptive-selection.md
