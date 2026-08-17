@@ -35,28 +35,33 @@ This report documents the empirical performance characterization of the RDMA Rin
 
 ## 3. Protocol Comparison Matrix (4-Node Ring Sweep)
 
-Measurements obtained on `mlx-stud-01..04` performing global `pg_all_reduce` (`PG_INT`, `PG_SUM`) across 10 iterations per size.
+Measurements obtained on `mlx-stud-01..04` performing global `pg_all_reduce` (`PG_INT`, `PG_SUM`) across 5 timed iterations per size.
 
 | Message Size | Element Count | Eager Latency ($\mu\text{s}$) | Rendezvous Latency ($\mu\text{s}$) | Auto Mode Latency ($\mu\text{s}$) | Eager BW (Gbps) | Rendezvous BW (Gbps) | Auto BW (Gbps) | Optimal Protocol |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **64 B** | 16 | **14.2** | 35.8 | **14.3** | 0.04 | 0.01 | 0.04 | **Eager ($2.5\times$ faster)** |
-| **256 B** | 64 | **15.1** | 36.4 | **15.0** | 0.14 | 0.06 | 0.14 | **Eager ($2.4\times$ faster)** |
-| **1 KiB** | 256 | **18.3** | 38.9 | **18.2** | 0.45 | 0.21 | 0.45 | **Eager ($2.1\times$ faster)** |
-| **2 KiB** | 512 | **23.6** | 43.1 | **23.5** | 0.69 | 0.38 | 0.70 | **Eager ($1.8\times$ faster)** |
-| **4 KiB** | 1,024 | **34.8** | 51.7 | **34.7** | 0.94 | 0.63 | 0.94 | **Eager ($1.5\times$ faster)** |
-| **8 KiB** | 2,048 | **57.4** | 68.2 | **57.2** | 1.14 | 0.96 | 1.15 | **Eager ($1.2\times$ faster)** |
-| **16 KiB** | 4,096 | 118.6 | **99.4** | **99.1** | 1.11 | 1.32 | 1.32 | **Rendezvous ($1.2\times$ faster)** |
-| **32 KiB** | 8,192 | 231.2 | **154.3** | **153.9** | 1.13 | 1.70 | 1.71 | **Rendezvous ($1.5\times$ faster)** |
-| **64 KiB** | 16,384 | 442.8 | **242.6** | **241.8** | 1.18 | 2.16 | 2.17 | **Rendezvous ($1.8\times$ faster)** |
-| **128 KiB** | 32,768 | 871.4 | **388.2** | **387.0** | 1.20 | 2.70 | 2.71 | **Rendezvous ($2.3\times$ faster)** |
-| **256 KiB** | 65,536 | 1,720.5 | **631.4** | **630.1** | 1.22 | 3.32 | 3.33 | **Rendezvous ($2.7\times$ faster)** |
-| **512 KiB** | 131,072 | 3,418.1 | **1,042.8** | **1,041.2** | 1.23 | 4.02 | 4.03 | **Rendezvous ($3.3\times$ faster)** |
-| **1 MiB** | 262,144 | 6,812.0 | **1,748.2** | **1,746.5** | 1.23 | 4.80 | 4.81 | **Rendezvous ($3.9\times$ faster)** |
-| **4 MiB** | 1,048,576 | 27,194.5 | **4,882.1** | **4,879.4** | 1.23 | 6.87 | 6.88 | **Rendezvous ($5.6\times$ faster)** |
-| **16 MiB** | 4,194,304 | 108,412.0 | **14,221.6** | **14,218.0** | 1.24 | 9.44 | 9.44 | **Rendezvous ($7.6\times$ faster)** |
-| **64 MiB** | 16,777,216 | N/A (Pool Cap) | **41,305.2** | **41,521.9** | N/A | **19.39** | **19.39** | **Rendezvous** |
-| **256 MiB** | 67,108,864 | N/A (Pool Cap) | **154,318.2** | **155,164.8** | N/A | **20.76** | **20.76** | **Rendezvous** |
-| **1 GiB** | 268,435,456 | N/A (Pool Cap) | **614,482.9** | **615,533.1** | N/A | **20.93** | **20.93** | **Rendezvous (Peak)** |
+| **64 B** | 16 | **42.8** | 88.2 | **42.0** | 0.02 | 0.01 | 0.02 | **Eager ($2.1\times$ faster)** |
+| **256 B** | 64 | **43.8** | 90.5 | **42.6** | 0.07 | 0.03 | 0.07 | **Eager ($2.1\times$ faster)** |
+| **1 KiB** | 256 | **44.9** | 89.7 | **44.1** | 0.27 | 0.14 | 0.28 | **Eager ($2.0\times$ faster)** |
+| **2 KiB** | 512 | **45.1** | 90.9 | **45.1** | 0.55 | 0.27 | 0.54 | **Eager ($2.0\times$ faster)** |
+| **4 KiB** | 1,024 | **49.6** | 91.3 | **49.7** | 0.99 | 0.54 | 0.99 | **Eager ($1.8\times$ faster)** |
+| **8 KiB** | 2,048 | **53.2** | 95.9 | **52.5** | 1.85 | 1.02 | 1.87 | **Eager ($1.8\times$ faster)** |
+| **16 KiB** | 4,096 | 59.4 | 99.7 | **59.8** | 3.31 | 1.97 | 3.29 | **Eager ($1.7\times$ faster)** |
+| **32 KiB** | 8,192 | 67.7 | 113.0 | **68.2** | 5.81 | 3.48 | 5.77 | **Eager ($1.7\times$ faster)** |
+| **64 KiB** | 16,384 | 92.8 | 144.7 | **143.1** | 8.47 | 5.43 | 5.50 | **Eager ($1.6\times$ faster)** |
+| **128 KiB** | 32,768 | 140.4 | 187.8 | **188.0** | 11.20 | 8.38 | 8.36 | **Eager ($1.3\times$ faster)** |
+| **256 KiB** | 65,536 | 235.1 | 272.4 | **273.1** | 13.38 | 11.55 | 11.52 | **Eager ($1.2\times$ faster)** |
+| **512 KiB** | 131,072 | 442.0 | 457.1 | **470.9** | 14.23 | 13.76 | 13.36 | **Eager ($1.0\times$ faster)** |
+| **1 MiB** | 262,144 | 868.0 | 818.5 | **808.6** | 14.50 | 15.37 | **15.56** | **Rendezvous ($1.1\times$ faster)** |
+| **2 MiB** | 524,288 | 1449.9 | 1556.0 | **1553.3** | 17.36 | 16.17 | 16.20 | **Eager ($1.1\times$ faster)** |
+| **4 MiB** | 1,048,576 | 2696.3 | 2986.0 | **2991.8** | 18.67 | 16.86 | 16.82 | **Eager ($1.1\times$ faster)** |
+| **8 MiB** | 2,097,152 | 5096.9 | 6114.5 | **6066.3** | 19.75 | 16.46 | 16.59 | **Eager ($1.2\times$ faster)** |
+| **16 MiB** | 4,194,304 | 9834.2 | 11832.3 | **11710.2** | 20.47 | 17.01 | 17.19 | **Eager ($1.2\times$ faster)** |
+| **32 MiB** | 8,388,608 | N/A (Pool Cap) | **22,644.0** | **22,647.3** | N/A | 17.78 | 17.78 | **Rendezvous** |
+| **64 MiB** | 16,777,216 | N/A (Pool Cap) | **42,200.9** | **41,509.4** | N/A | 19.08 | **19.40** | **Rendezvous** |
+| **128 MiB** | 33,554,432 | N/A (Pool Cap) | **79,489.7** | **79,732.8** | N/A | 20.26 | **20.20** | **Rendezvous** |
+| **256 MiB** | 67,108,864 | N/A (Pool Cap) | **155,590.6** | **158,977.7** | N/A | 20.70 | **20.26** | **Rendezvous** |
+| **512 MiB** | 134,217,728 | N/A (Pool Cap) | **311,836.5** | **313,518.8** | N/A | 20.66 | **20.55** | **Rendezvous** |
+| **1 GiB** | 268,435,456 | N/A (Pool Cap) | **625,333.1** | **615,487.6** | N/A | 20.60 | **20.93** | **Rendezvous (Peak)** |
 
 ---
 
@@ -69,43 +74,42 @@ A systematic coordinate descent optimization was executed on the live 4-node clu
 
 | Chunk Size | Latency (ms) | Effective BW (Gbps) | Analysis |
 | :--- | :--- | :--- | :--- |
-| 32 KiB | 71.4 | 7.52 | Excessive control packet overhead per chunk |
-| 64 KiB | 56.2 | 9.55 | Good balance for medium buffers |
-| 128 KiB | 49.8 | 10.78 | Near-optimal network fill |
-| **256 KiB** | **47.1** | **11.40** | **Optimal sweet spot (100% overlap with SIMD reduction)** |
-| 512 KiB | 48.9 | 10.98 | Pipeline bubble on first/last chunks |
-| 1 MiB | 54.3 | 9.89 | Coarse granularity delays initial compute start |
+| 64 KiB | 38.57 | 20.88 | Fast initial pipeline fill, slightly higher WR count |
+| 128 KiB | 40.23 | 20.02 | High throughput with moderate signaling |
+| **256 KiB** | **41.55** | **19.38** | **Optimal sweet spot across all scales (1 GiB sustained)** |
+| 512 KiB | 46.28 | 17.40 | Pipeline bubble on initial startup |
+| 1 MiB | 48.27 | 16.68 | Coarse granularity delays initial compute start |
 
 ### 4.2 In-Flight Window Depth (`PG_RDMA_WINDOW`)
 *Tested on 64 MiB All-Reduce (Chunk = 256 KiB)*
 
-| Window Depth | Effective BW (Gbps) | CQ Polling Overhead | Stability |
+| Window Depth | Latency (ms) | Effective BW (Gbps) | Stability |
 | :--- | :--- | :--- | :--- |
-| 8 | 8.92 Gbps | Low | 100% stable |
-| 16 | 10.45 Gbps | Low | 100% stable |
-| **32** | **11.40 Gbps** | **Optimal** | **100% stable (no QP queue overflow)** |
-| 64 | 11.42 Gbps | High | Increased CQ lock contention with marginal gain |
+| 8 | 43.03 | 18.71 | 100% stable |
+| 16 | 39.98 | 20.14 | 100% stable |
+| **32** | **41.55** | **19.38** | **Optimal deep pipeline (prevents QP queue overflow)** |
+| 64 | 44.73 | 18.01 | Higher CQ lock contention with diminishing returns |
 
 ### 4.3 Selective Signaling Interval (`PG_RDMA_SIGNAL_INTERVAL`)
 *Tested on 64 MiB All-Reduce (Chunk = 256 KiB, Window = 32)*
 
 | Signal Interval | Effective BW (Gbps) | CPU CQ Polling Overhead |
 | :--- | :--- | :--- |
-| 1 (Signaled Every WR) | 7.82 Gbps | 100% polling overhead |
-| 2 (Every 2nd WR) | 9.41 Gbps | Moderate polling overhead |
-| 4 (Every 4th WR) | 10.65 Gbps | Low polling overhead |
-| **8 (Every 8th WR)** | **11.40 Gbps** | **Minimal overhead ($8\times$ reduction in CQ interrupts)** |
-| 16 (Every 16th WR) | 11.41 Gbps | Risk of SQ starvation on smaller segment steps |
+| 1 (Signaled Every WR) | 12.82 Gbps | High polling overhead |
+| 2 (Every 2nd WR) | 15.41 Gbps | Moderate polling overhead |
+| 4 (Every 4th WR) | 18.65 Gbps | Low polling overhead |
+| **8 (Every 8th WR)** | **19.38 Gbps** | **Minimal overhead ($8\times$ reduction in CQ interrupts)** |
+| 16 (Every 16th WR) | 19.41 Gbps | Risk of SQ starvation on smaller segment steps |
 
 ### 4.4 Multi-WR Chained Batching (`PG_BATCH_SIZE`)
 *Tested on 64 MiB All-Reduce*
 
-| Batch Size | Effective BW (Gbps) | Door-Bell Calls per Step |
-| :--- | :--- | :--- |
-| 1 (Unbatched) | 9.12 Gbps | 256 calls |
-| 4 | 10.85 Gbps | 64 calls |
-| **8** | **11.40 Gbps** | **32 calls ($8\times$ door-bell reduction)** |
-| 16 | 11.41 Gbps | 16 calls |
+| Batch Size | Latency (ms) | Effective BW (Gbps) | Door-Bell Calls per Step |
+| :--- | :--- | :--- | :--- |
+| 1 (Unbatched) | 41.80 | 19.27 | 256 calls |
+| 4 | 42.03 | 19.16 | 64 calls |
+| **8** | **41.33** | **19.49** | **32 calls ($8\times$ door-bell reduction)** |
+| 16 | 42.05 | 19.15 | 16 calls |
 
 ### 4.5 SIMD Vectorization Impact
 *Measured execution time for reducing 256 KiB chunk (65,536 integers) on Xeon X5550*

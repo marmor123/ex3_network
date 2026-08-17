@@ -100,7 +100,7 @@ def main():
     
     # 1. Run Eager Protocol Sweep
     print("\n>>> Phase 1/2: Running Eager Protocol Sweep...")
-    sync_and_build(hosts, mode="eager", profile="perf")
+    sync_and_build(hosts, mode="eager")
     eager_env = {
         "PG_BENCH_MIN_BYTES": args.min_bytes,
         "PG_BENCH_MAX_BYTES": args.max_bytes_eager,
@@ -113,7 +113,7 @@ def main():
     
     # 2. Run Rendezvous Protocol Sweep
     print("\n>>> Phase 2/2: Running Rendezvous Protocol Sweep...")
-    sync_and_build(hosts, mode="rendezvous", profile="perf")
+    sync_and_build(hosts, mode="rendezvous")
     rdv_env = {
         "PG_BENCH_MIN_BYTES": args.min_bytes,
         "PG_BENCH_MAX_BYTES": args.max_bytes_rdv,

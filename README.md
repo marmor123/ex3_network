@@ -190,13 +190,13 @@ Data is written directly into `recvbuf + offset(s_in)` with zero memory copies. 
 
 | Size | Eager Latency | Rendezvous Latency | Auto Latency | Auto Bandwidth | Crossover Verdict |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| **64 B** | **$14.2\,\mu\text{s}$** | $35.8\,\mu\text{s}$ | **$14.3\,\mu\text{s}$** | 0.04 Gbps | **Eager ($2.5\times$ faster)** |
-| **1 KiB** | **$18.3\,\mu\text{s}$** | $38.9\,\mu\text{s}$ | **$18.2\,\mu\text{s}$** | 0.45 Gbps | **Eager ($2.1\times$ faster)** |
-| **8 KiB** | **$57.4\,\mu\text{s}$** | $68.2\,\mu\text{s}$ | **$57.2\,\mu\text{s}$** | 1.15 Gbps | **Eager ($1.2\times$ faster)** |
-| **16 KiB** | $118.6\,\mu\text{s}$ | **$99.4\,\mu\text{s}$** | **$99.1\,\mu\text{s}$** | 1.32 Gbps | **Rendezvous ($1.2\times$ faster)** |
-| **1 MiB** | $6,812.0\,\mu\text{s}$ | **$1,748.2\,\mu\text{s}$** | **$1,746.5\,\mu\text{s}$** | 4.81 Gbps | **Rendezvous ($3.9\times$ faster)** |
-| **64 MiB** | N/A | **$41.3\,\text{ms}$** | **$41.3\,\text{ms}$** | **19.39 Gbps** | **Rendezvous** |
-| **1 GiB** | N/A | **$614.5\,\text{ms}$** | **$614.5\,\text{ms}$** | **20.93 Gbps** | **Peak Line-Rate Throughput** |
+| **64 B** | **$42.8\,\mu\text{s}$** | $88.2\,\mu\text{s}$ | **$42.0\,\mu\text{s}$** | 0.02 Gbps | **Eager ($2.1\times$ faster)** |
+| **1 KiB** | **$44.9\,\mu\text{s}$** | $89.7\,\mu\text{s}$ | **$44.1\,\mu\text{s}$** | 0.28 Gbps | **Eager ($2.0\times$ faster)** |
+| **8 KiB** | **$53.2\,\mu\text{s}$** | $95.9\,\mu\text{s}$ | **$52.5\,\mu\text{s}$** | 1.87 Gbps | **Eager ($1.8\times$ faster)** |
+| **16 KiB** | **$59.4\,\mu\text{s}$** | $99.7\,\mu\text{s}$ | **$59.8\,\mu\text{s}$** | 3.29 Gbps | **Eager ($1.7\times$ faster)** |
+| **1 MiB** | $868.0\,\mu\text{s}$ | **$818.5\,\mu\text{s}$** | **$808.6\,\mu\text{s}$** | 15.56 Gbps | **Rendezvous ($1.1\times$ faster)** |
+| **64 MiB** | N/A | **$42.2\,\text{ms}$** | **$41.5\,\text{ms}$** | **19.40 Gbps** | **Rendezvous** |
+| **1 GiB** | N/A | **$625.3\,\text{ms}$** | **$615.5\,\text{ms}$** | **20.93 Gbps** | **Peak Line-Rate Throughput** |
 
 > [!TIP]
 > For the complete dataset, hyperparameter sensitivity sweeps (chunk size, window depth, batching, SIMD vs scalar), and the **Tested vs. Not-Tested Boundary Matrix**, refer to the full [Empirical Protocol Evaluation Report](file:///c:/Users/marmo/ateret/ex3_network/docs/empirical_protocol_report.md).
