@@ -44,5 +44,6 @@ Data is written zero-copy directly into the caller's `recvbuf` at offset $\text{
 - Total elements transferred equals $C \times \frac{N-1}{N}$ across both phases, matching theoretical minimum ring communication volume.
 
 ## References
-- `pg_internal.h` (`pg_calc_seg_count`, `pg_calc_seg_offset`, `pg_rs_send_seg`, `pg_ag_send_seg`).
-- `test_v1_local.py` & `main_test.c` (Remainder test suite).
+- `pg_internal.h` (`pg_get_seg_count`, `pg_get_seg_offset_elems`, `pg_get_seg_offset_bytes`).
+- `pg.c` (`pg_reduce_scatter`, `pg_ring_all_gather_generalized`).
+- `main_test.c` (Remainder test suite `run_non_divisible_counts_tests`).

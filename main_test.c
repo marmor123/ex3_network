@@ -116,7 +116,7 @@ static int run_benchmark_harness(void *pg_handle) {
 
     if (rank == 0) {
         printf("========================================================================================================\n");
-        printf("[PG V9 Benchmark Harness] Running All-Reduce Sweep (Mode: %s, Warmup + %d Timed Iterations)\n",
+        printf("[PG Benchmark Harness] Running All-Reduce Sweep (Mode: %s, Warmup + %d Timed Iterations)\n",
                mode_str, PG_BENCH_ITER);
         printf("========================================================================================================\n");
         printf("%-12s | %-12s | %-12s | %-12s | %-12s | %-16s\n",
@@ -246,21 +246,21 @@ static int run_benchmark_harness(void *pg_handle) {
 
     if (rank == 0) {
         printf("========================================================================================================\n");
-        printf("[PG V8 Benchmark Harness] SUCCESS: Sweep completed.\n");
+        printf("[PG Benchmark Harness] SUCCESS: Sweep completed.\n");
         printf("========================================================================================================\n");
     }
 
     return PG_SUCCESS;
 }
 
-static int run_v10_datatypes_and_ops_tests(void *pg_handle) {
+static int run_datatypes_and_ops_tests(void *pg_handle) {
     int rank = pg_get_rank(pg_handle);
     int size = pg_get_size(pg_handle);
     int count = 65536;
 
     if (rank == 0) {
         printf("=================================================================\n");
-        printf("[PG V10 Datatypes & Operations] Testing SIMD Vectorized Reduction\n");
+        printf("[PG Datatypes & Operations] Testing SIMD Vectorized Reduction\n");
         printf("=================================================================\n");
     }
 
@@ -381,12 +381,12 @@ static int run_v10_datatypes_and_ops_tests(void *pg_handle) {
     }
     pg_barrier(pg_handle);
     if (rank == 0) {
-        printf("[PG V10 Datatypes & Operations] SUCCESS: All 12 datatype x op combinations passed.\n");
+        printf("[PG Datatypes & Operations] SUCCESS: All 12 datatype x op combinations passed.\n");
     }
     return PG_SUCCESS;
 }
 
-static int run_v10_non_divisible_counts_tests(void *pg_handle) {
+static int run_non_divisible_counts_tests(void *pg_handle) {
     int rank = pg_get_rank(pg_handle);
     int size = pg_get_size(pg_handle);
     int counts[] = { 1001, 1003, 33333, 1000007 };
@@ -394,7 +394,7 @@ static int run_v10_non_divisible_counts_tests(void *pg_handle) {
 
     if (rank == 0) {
         printf("=================================================================\n");
-        printf("[PG V10 Non-Divisible Counts] Testing Arbitrary Remainder Slices\n");
+        printf("[PG Non-Divisible Counts] Testing Arbitrary Remainder Slices\n");
         printf("=================================================================\n");
     }
 
@@ -446,12 +446,12 @@ static int run_v10_non_divisible_counts_tests(void *pg_handle) {
 
     pg_barrier(pg_handle);
     if (rank == 0) {
-        printf("[PG V10 Non-Divisible Counts] SUCCESS: All remainder count tests passed.\n");
+        printf("[PG Non-Divisible Counts] SUCCESS: All remainder count tests passed.\n");
     }
     return PG_SUCCESS;
 }
 
-static int run_v10_barrier_free_stress_test(void *pg_handle) {
+static int run_barrier_free_stress_test(void *pg_handle) {
     int rank = pg_get_rank(pg_handle);
     int size = pg_get_size(pg_handle);
     int count = 16384;
@@ -459,7 +459,7 @@ static int run_v10_barrier_free_stress_test(void *pg_handle) {
 
     if (rank == 0) {
         printf("=================================================================\n");
-        printf("[PG V10 Barrier-Free Stress] Testing 100 Rapid Back-to-Back Iterations\n");
+        printf("[PG Barrier-Free Stress] Testing 100 Rapid Back-to-Back Iterations\n");
         printf("=================================================================\n");
     }
 
@@ -504,7 +504,7 @@ static int run_v10_barrier_free_stress_test(void *pg_handle) {
     pg_barrier(pg_handle);
 
     if (rc == PG_SUCCESS && rank == 0) {
-        printf("[PG V10 Barrier-Free Stress] SUCCESS: 100 rapid iterations completed with 0 errors.\n");
+        printf("[PG Barrier-Free Stress] SUCCESS: 100 rapid iterations completed with 0 errors.\n");
     }
     return rc;
 }
@@ -573,9 +573,9 @@ int main(int argc, char **argv) {
     };
     int num_tests = (int)(sizeof(test_sizes) / sizeof(test_sizes[0]));
 
-    /* Run V7 Pipelined Reduce-Scatter Tests (PG_INT + PG_SUM) */
+    /* Run Pipelined Reduce-Scatter Tests (PG_INT + PG_SUM) */
     printf("=================================================================\n");
-    printf("[PG V7 Reduce-Scatter] Testing Pipelined Reduce-Scatter (PG_INT + PG_SUM)\n");
+    printf("[PG Reduce-Scatter] Testing Pipelined Reduce-Scatter (PG_INT + PG_SUM)\n");
     printf("=================================================================\n");
 
     int rs_passed = 1;
@@ -664,14 +664,14 @@ int main(int argc, char **argv) {
 
     printf("=================================================================\n");
     if (rs_passed) {
-        printf("[PG V7 Reduce-Scatter] SUCCESS: All reduce-scatter collective tests passed.\n");
+        printf("[PG Reduce-Scatter] SUCCESS: All reduce-scatter collective tests passed.\n");
     } else {
-        printf("[PG V7 Reduce-Scatter] FAILURE: One or more reduce-scatter tests failed.\n");
+        printf("[PG Reduce-Scatter] FAILURE: One or more reduce-scatter tests failed.\n");
     }
 
-    /* Run V7 Pipelined All-Gather Tests (PG_INT Zero-Copy) */
+    /* Run Pipelined All-Gather Tests (PG_INT Zero-Copy) */
     printf("=================================================================\n");
-    printf("[PG V7 All-Gather] Testing Pipelined Ring All-Gather (Zero-Copy RDMA Write)\n");
+    printf("[PG All-Gather] Testing Pipelined Ring All-Gather (Zero-Copy RDMA Write)\n");
     printf("=================================================================\n");
 
     int ag_passed = 1;
@@ -760,14 +760,14 @@ int main(int argc, char **argv) {
 
     printf("=================================================================\n");
     if (ag_passed) {
-        printf("[PG V7 All-Gather] SUCCESS: All all-gather collective tests passed.\n");
+        printf("[PG All-Gather] SUCCESS: All all-gather collective tests passed.\n");
     } else {
-        printf("[PG V7 All-Gather] FAILURE: One or more all-gather tests failed.\n");
+        printf("[PG All-Gather] FAILURE: One or more all-gather tests failed.\n");
     }
 
-    /* Run V7 Pipelined All-Reduce Tests (PG_INT + PG_SUM) */
+    /* Run Pipelined All-Reduce Tests (PG_INT + PG_SUM) */
     printf("=================================================================\n");
-    printf("[PG V7 All-Reduce] Testing Pipelined Ring All-Reduce (RS + Barrier + AG)\n");
+    printf("[PG All-Reduce] Testing Pipelined Ring All-Reduce (RS + Barrier + AG)\n");
     printf("=================================================================\n");
 
     int ar_passed = 1;
@@ -854,18 +854,18 @@ int main(int argc, char **argv) {
 
     printf("=================================================================\n");
     if (ar_passed) {
-        printf("[PG V7 All-Reduce] SUCCESS: All all-reduce collective tests passed.\n");
+        printf("[PG All-Reduce] SUCCESS: All all-reduce collective tests passed.\n");
     } else {
-        printf("[PG V7 All-Reduce] FAILURE: One or more all-reduce tests failed.\n");
+        printf("[PG All-Reduce] FAILURE: One or more all-reduce tests failed.\n");
     }
 
     int dt_rc = PG_SUCCESS;
     int rem_rc = PG_SUCCESS;
     int stress_rc = PG_SUCCESS;
     if (rs_passed && ag_passed && ar_passed) {
-        dt_rc = run_v10_datatypes_and_ops_tests(pg_handle);
-        rem_rc = run_v10_non_divisible_counts_tests(pg_handle);
-        stress_rc = run_v10_barrier_free_stress_test(pg_handle);
+        dt_rc = run_datatypes_and_ops_tests(pg_handle);
+        rem_rc = run_non_divisible_counts_tests(pg_handle);
+        stress_rc = run_barrier_free_stress_test(pg_handle);
     }
 
     int bench_rc = PG_SUCCESS;

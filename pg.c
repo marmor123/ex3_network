@@ -483,7 +483,7 @@ int pg_rdma_init_resources(struct pg_context *ctx) {
     return PG_SUCCESS;
 }
 
-/* Post one 2-SGE eager payload SEND message (ADR-0002 & V9) */
+/* Post one 2-SGE eager payload SEND message (ADR-0002) */
 int pg_post_eager_send(struct pg_context *ctx, int qp_dir, const struct pg_ctrl_msg *hdr,
                        void *payload_addr, uint32_t payload_len, uint32_t lkey, int signaled, int slot) {
     if (!ctx || !hdr || (qp_dir != PG_QP_DIR_TO_NEXT && qp_dir != PG_QP_DIR_FROM_PREV)) {
@@ -659,7 +659,7 @@ struct ibv_mr *pg_get_or_reg_mr(struct pg_context *ctx, void *addr, size_t lengt
     return mr;
 }
 
-/* Ensure internal staging and safe-mode work buffers are allocated and registered (ADR-0002 & V10 64B align) */
+/* Ensure internal staging and safe-mode work buffers are allocated and registered (ADR-0002) */
 int pg_ensure_internal_buffers(struct pg_context *ctx, size_t count_bytes, size_t segment_bytes) {
     if (!ctx) return PG_ERR_INVAL;
 
@@ -726,7 +726,7 @@ int pg_ensure_internal_buffers(struct pg_context *ctx, size_t count_bytes, size_
     return PG_SUCCESS;
 }
 
-/* Initialize Runtime Hyperparameters from Environment with compile-time defaults (V10) */
+/* Initialize Runtime Hyperparameters from Environment with compile-time defaults */
 void pg_init_tuning_params(struct pg_context *ctx) {
     if (!ctx) return;
 
@@ -783,7 +783,7 @@ void pg_init_tuning_params(struct pg_context *ctx) {
 /* === MODULE 5: SSE4.2 VECTOR REDUCTION COMPUTE KERNELS                === */
 /* ========================================================================= */
 
-/* Vectorized CPU reduction engine with SSE4.2 and 4x loop unrolling (V10) */
+/* Vectorized CPU reduction engine with SSE4.2 and 4x loop unrolling */
 void pg_reduce_buffer(void *dest, const void *src, int count,
                       DATATYPE datatype, OPERATION op, int use_streaming) {
     (void)use_streaming;
@@ -1116,7 +1116,7 @@ int pg_post_rdma_write(struct pg_context *ctx, int qp_dir, void *local_addr, siz
     return PG_SUCCESS;
 }
 
-/* V2: Edge-ordered ring-only TCP bootstrap exchanging real QP metadata */
+/* Edge-ordered ring-only TCP bootstrap exchanging real QP metadata */
 int pg_tcp_bootstrap(struct pg_context *ctx) {
     if (!ctx) return PG_ERR_INVAL;
 

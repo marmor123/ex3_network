@@ -6,7 +6,7 @@ RDMA operations require memory regions (MRs) registered with `libibverbs` (`ibv_
 ## Decision
 
 ### 1. Lazy MR Registration Cache
-- We implement `pg_get_or_reg_mr(ctx, addr, length, access_flags)` with a fixed-size cache (`PG_MR_CACHE_MAX = 32`).
+- We implement `pg_get_or_reg_mr(ctx, addr, length, access_flags)` with a fixed-size cache (`PG_MR_CACHE_MAX = 1024`).
 - On collective invocation, the cache is scanned for an existing MR covering the `[addr, addr + length)` span with matching access flags.
 - On miss, `ibv_reg_mr` is invoked with required permissions (`IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE`) and added to the cache.
 - All registered MRs persist for the lifetime of the process group and are cleanly deregistered in `pg_close`.

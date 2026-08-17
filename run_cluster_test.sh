@@ -1,6 +1,6 @@
 #!/bin/bash
 # ==============================================================================
-# Multi-Node Cluster Test Runner for RDMA Collective Library (V1 TCP Bootstrap)
+# Multi-Node Cluster Test Runner for RDMA Collective Library
 # ==============================================================================
 # Usage:
 #   ./run_cluster_test.sh 2              # Runs 2-node ring: mlx-stud-03 mlx-stud-04
@@ -11,8 +11,8 @@
 
 set -e
 
-MODE="${1:-local}"
-NUM_NODES="${2:-2}"
+MODE="${1:-cluster}"
+NUM_NODES="${2:-4}"
 CLUSTER_DIR="${CLUSTER_DIR:-/cs/usr/ateret.tabib/Downloads/ex3_network}"
 SSH_OPTS="${SSH_OPTS:-}"
 
@@ -22,15 +22,34 @@ if [ "$MODE" = "2" ] || [ "$MODE" = "4" ]; then
 fi
 
 echo "=================================================================="
-echo "  RDMA Collective Library — Multi-Node Test Runner (V8 Benchmark)  "
+echo "  RDMA Collective Library — Multi-Node Test Runner               "
 echo "=================================================================="
 
 if [ "$MODE" = "local" ]; then
     # Ensure binary is compiled locally
     make all
-    echo "Running local $NUM_NODES-rank loopback test..."
-    python3 test_v1_local.py
-    exit 0
+    echo "Running local $NUM_NODES-rank test on localhost..."
+    LOCAL_HOSTS=()
+    for ((r=0; r<NUM_NODES; r++)); do
+        LOCAL_HOSTS+=("localhost")
+    done
+    PIDS=()
+    for ((r=0; r<NUM_NODES; r++)); do
+        INDEX=$(printf "%02d" $((r + 1)))
+        ./test -myindex "$INDEX" -list "${LOCAL_HOSTS[@]}" &
+        PIDS+=($!)
+    done
+    FAIL=0
+    for pid in "${PIDS[@]}"; do
+        wait "$pid" || FAIL=1
+    done
+    if [ "$FAIL" -eq 0 ]; then
+        echo "Local test completed successfully."
+        exit 0
+    else
+        echo "Local test failed."
+        exit 1
+    fi
 fi
 
 # Cluster multi-node mode
@@ -73,7 +92,7 @@ done
 
 if [ "$FAIL" -eq 0 ]; then
     echo "=================================================================="
-    echo "  CLUSTER TEST SUCCESS: All $NUM_NODES nodes completed V8 Performance Benchmark Suite! "
+    echo "  CLUSTER TEST SUCCESS: All $NUM_NODES nodes completed collective test suite! "
     echo "=================================================================="
 else
     echo "=================================================================="

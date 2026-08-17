@@ -27,7 +27,7 @@
 #define PG_CTRL_POLL_TIMEOUT_SEC 10
 #define PG_MAX_INLINE_DECLARE   1024
 
-/* Protocol Modes (Summary Sec 9) */
+/* Protocol Modes */
 #define PG_MODE_TYPE_RENDEZVOUS 1
 #define PG_MODE_TYPE_EAGER      2
 #define PG_MODE_TYPE_AUTO       3
@@ -40,7 +40,7 @@
 #define PG_ACTIVE_MODE          PG_MODE_TYPE_AUTO
 #endif
 
-/* Eager Protocol Constants (ADR-0002 & Summary Sec 10, 25) */
+/* Eager Protocol Constants (ADR-0002) */
 #define PG_EAGER_THRESHOLD      (8 * 1024)   /* 8 KiB */
 #define PG_EAGER_POOL_DEPTH     32           /* 32 pre-posted buffers per QP */
 #define PG_EAGER_WINDOW         8            /* In-flight send flow control window */
@@ -51,7 +51,7 @@
 #define PG_RDMA_WINDOW           32            /* 32 in-flight micro-chunks */
 #define PG_RDMA_SIGNAL_INTERVAL  8             /* Signal every 8 WRs (2 MiB pipeline step) */
 
-/* Multi-WR Linked-List Batching & Streaming Store Thresholds (V10) */
+/* Multi-WR Linked-List Batching & Streaming Store Thresholds */
 #ifndef PG_DEFAULT_BATCH_SIZE
 #define PG_DEFAULT_BATCH_SIZE    8             /* 8 chained WRs per ibv_post_send */
 #endif
@@ -59,7 +59,7 @@
 #define PG_STREAMING_STORE_THRESHOLD (64 * 1024) /* 64 KiB */
 #endif
 
-/* Benchmark Harness Constants (Summary Sec 29) */
+/* Benchmark Harness Constants */
 #ifndef PG_BENCH_MIN_BYTES
 #define PG_BENCH_MIN_BYTES       (64ULL * 1024ULL * 1024ULL)   /* 64 MiB */
 #endif
@@ -129,8 +129,8 @@ struct pg_ctrl_msg {
     uint32_t seq;           /* Sequence number */
     union {
         struct {
-            uint64_t remote_addr; /* Remote staging/recvbuf virtual address (V3 rendezvous) */
-            uint32_t rkey;        /* Remote memory key (V3 rendezvous) */
+            uint64_t remote_addr; /* Remote staging/recvbuf virtual address (Rendezvous protocol) */
+            uint32_t rkey;        /* Remote memory key (Rendezvous protocol) */
             uint32_t seg_idx;     /* Ring segment index */
             uint32_t micro_idx;   /* Pipelined micro-chunk index */
             uint32_t length;      /* Payload byte length */
@@ -208,7 +208,7 @@ struct pg_context {
 
 #define PG_EAGER_SLOT_SIZE      (PG_CTRL_MSG_LEN + PG_EAGER_BUF_SIZE)
 
-    /* Pre-allocated Unified Receive Buffers and MRs (ADR-0001, ADR-0002, V9) */
+    /* Pre-allocated Unified Receive Buffers and MRs (ADR-0001, ADR-0002) */
     char *recv_slot_buf[2][PG_CTRL_POOL_DEPTH];
     void *recv_slot_raw_mem[2];
     struct ibv_mr *recv_slot_mr[2];
@@ -223,7 +223,7 @@ struct pg_context {
     struct pg_mr_entry mr_cache[PG_MR_CACHE_MAX];
     int mr_cache_count;
 
-    /* Internal Staging and Working Buffers (ADR-0002 & V4 Reduce-Scatter) */
+    /* Internal Staging and Working Buffers (ADR-0002) */
     void *staging_buf;
     size_t staging_capacity;
     struct ibv_mr *staging_mr;
@@ -319,7 +319,7 @@ static inline size_t pg_get_datatype_size(DATATYPE datatype) {
     }
 }
 
-/* MPI-style Remainder Distribution Math Helpers (V10) */
+/* MPI-style Remainder Distribution Math Helpers */
 static inline int pg_get_seg_count(int rank, int count, int size) {
     int q = count / size;
     int r = count % size;
@@ -336,7 +336,7 @@ static inline size_t pg_get_seg_offset_bytes(int rank, int count, int size, size
     return pg_get_seg_offset_elems(rank, count, size) * elem_size;
 }
 
-/* Unified 1-SGE receive buffer slot repost (ADR-0001, ADR-0002, V9) */
+/* Unified 1-SGE receive buffer slot repost (ADR-0001, ADR-0002) */
 static inline int pg_repost_recv_slot(struct pg_context *ctx, int qp_dir, int slot) {
     struct ibv_sge sge = {
         .addr   = (uintptr_t)ctx->recv_slot_buf[qp_dir][slot],
@@ -475,7 +475,7 @@ static inline int pg_progress_wait(struct pg_context *ctx, double timeout_sec, s
 }
 
 /* ============================================================================
- * Ring Step Transfer Engine (Candidate #02: Deep Transfer Pipelining)
+ * Ring Step Transfer Engine (Pipelined Micro-Chunk Transfer)
  * ============================================================================ */
 
 typedef void (*pg_chunk_handler_fn)(void *dest, const void *src, size_t len, void *user_ctx);
@@ -519,7 +519,7 @@ void pg_init_tuning_params(struct pg_context *ctx);
 struct ibv_mr *pg_get_or_reg_mr(struct pg_context *ctx, void *addr, size_t length, int access_flags);
 int pg_ensure_internal_buffers(struct pg_context *ctx, size_t count_bytes, size_t segment_bytes);
 
-/* Vectorized Reduction Math Engine (V10) */
+/* Vectorized Reduction Math Engine */
 void pg_reduce_buffer(void *dest, const void *src, int count,
                       DATATYPE datatype, OPERATION op, int use_streaming);
 
@@ -527,7 +527,7 @@ void pg_reduce_buffer(void *dest, const void *src, int count,
 int pg_post_rdma_write(struct pg_context *ctx, int qp_dir, void *local_addr, size_t length,
                        uint32_t lkey, uint64_t remote_addr, uint32_t rkey);
 
-/* Distributed Ring Barrier (Summary Sec 22) */
+/* Distributed Ring Barrier */
 int pg_barrier(void *pg_handle);
 
 /* Ring All-Gather Generalized Core Engine (Zero-Copy RDMA Write) */

@@ -11,7 +11,7 @@
 This report documents the empirical performance characterization of the RDMA Ring Collective communication library across **Eager Send/Receive**, **Windowed Rendezvous RDMA Write**, and **Adaptive Auto** protocols on a physical 4-node InfiniBand cluster.
 
 ### Key Empirical Findings
-1. **Inflection Point at 8 KiB**: For message sizes $\le 8\text{ KiB}$, the Eager protocol achieves **$2.1\times$ lower latency** than Rendezvous ($18.3\,\mu\text{s}$ vs $38.9\,\mu\text{s}$ at 1 KiB) by eliminating the 4-way control handshake (`RTS` $\to$ `CTS` $\to$ `RDMA_WRITE` $\to$ `DATA_DONE`).
+1. **Inflection Point at 8 KiB**: For message sizes $\le 8\text{ KiB}$, the Eager protocol achieves **$2.1\times$ lower latency** than Rendezvous ($42.8\,\mu\text{s}$ vs $88.2\,\mu\text{s}$ at 64 B, $44.9\,\mu\text{s}$ vs $89.7\,\mu\text{s}$ at 1 KiB) by eliminating the 4-way control handshake (`RTS` $\to$ `CTS` $\to$ `RDMA_WRITE` $\to$ `DATA_DONE`).
 2. **Zero-Copy Scaling**: For message sizes $\ge 16\text{ KiB}$, Rendezvous dominates by avoiding memory copies and streaming data directly into registered destination memory.
 3. **Peak Effective Bandwidth**: Pipelined Rendezvous with 256 KiB micro-chunks, 128-bit SSE4.2 SIMD reduction, and 8-WR batching achieved **20.93 Gbps** peak effective bandwidth at 1 GiB payload on a 20 Gbps InfiniBand DDR fabric.
 4. **Adaptive Superiority**: The `MODE=auto` protocol strictly tracks the lower latency bound at small sizes and the peak bandwidth bound at large sizes, delivering the optimal Pareto frontier across all scales.
@@ -133,5 +133,5 @@ In accordance with our core engineering principle of presenting only empirical f
 | **Reduction Operations** | All 4 operations verified: `PG_SUM`, `PG_MIN`, `PG_MAX`, `PG_PROD` ($3 \times 4 = 12$ pairs). | Custom reduction user-callbacks or bitwise operations (`PG_BXOR`). |
 | **Buffer Divisibility** | Arbitrary remainder counts: 1001, 1003, 33333, 1000007 elements. | Dynamic size changes within the same collective call. |
 | **CPU Architecture** | Intel Nehalem x86_64 with SSE4.2 (128-bit). | Modern AVX-512 / AVX2 CPUs, ARM Neoverse, or POWER9 architectures. |
-| **Collective Integration** | Reduce-Scatter, All-Gather, All-Reduce, Distributed Ring Barrier. | Dual-ring bidirectional full-duplex interleaving (V11 / Issue #18). |
+| **Collective Integration** | Reduce-Scatter, All-Gather, All-Reduce, Distributed Ring Barrier. | Dual-ring bidirectional full-duplex interleaving. |
 | **Stress & Reliability** | 100 rapid back-to-back iterations with zero deadlocks and zero memory leaks. | Fault tolerance under physical link drop or node kill during collective. |

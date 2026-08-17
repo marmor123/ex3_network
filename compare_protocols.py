@@ -88,7 +88,7 @@ def main():
     parser = argparse.ArgumentParser(description="RDMA Ring Collectives: Eager vs Rendezvous Protocol Comparison")
     parser.add_argument("--ranks", type=int, default=4, choices=[2, 4], help="Number of cluster ranks (2 or 4)")
     parser.add_argument("--min-bytes", type=int, default=64, help="Minimum benchmark size in bytes")
-    parser.add_argument("--max-bytes-eager", type=int, default=268435456, help="Maximum eager benchmark size in bytes (256 MiB default)")
+    parser.add_argument("--max-bytes-eager", type=int, default=16777216, help="Maximum eager benchmark size in bytes (16 MiB default pool capacity)")
     parser.add_argument("--max-bytes-rdv", type=int, default=1073741824, help="Maximum rendezvous benchmark size in bytes (1 GiB default)")
     args = parser.parse_args()
 

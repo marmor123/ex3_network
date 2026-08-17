@@ -11,7 +11,7 @@ We needed to establish the optimal crossover threshold empirically on the live 4
 
 ### 1. Empirical Threshold Determination: 8 KiB
 A coordinate sweep on the 4-node cluster across thresholds from 1 KiB to 64 KiB revealed:
-- Payloads $\le 8\text{ KiB}$: Eager protocol provides **2.1$\times$ lower latency** compared to Rendezvous ($18.3\,\mu\text{s}$ vs $38.9\,\mu\text{s}$ at 1 KiB).
+- Payloads $\le 8\text{ KiB}$: Eager protocol provides **2.1$\times$ lower latency** compared to Rendezvous ($42.8\,\mu\text{s}$ vs $88.2\,\mu\text{s}$ at 64 B, $44.9\,\mu\text{s}$ vs $89.7\,\mu\text{s}$ at 1 KiB).
 - Payloads $\ge 16\text{ KiB}$: Rendezvous protocol overtakes Eager in effective bandwidth due to zero-copy memory transfers and pipelined micro-chunk overlap.
 - We set `PG_EAGER_THRESHOLD = (8 * 1024)` (8 KiB) as the default crossover boundary.
 
