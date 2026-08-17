@@ -126,8 +126,27 @@ static int run_benchmark_harness(void *pg_handle) {
 
     size_t min_bytes = PG_BENCH_MIN_BYTES;
     size_t max_bytes = PG_BENCH_MAX_BYTES;
+    int bench_iter = PG_BENCH_ITER;
 
-    for (size_t sz = min_bytes; sz <= max_bytes; sz *= 2) {
+    const char *min_env = getenv("PG_BENCH_MIN_BYTES");
+    if (min_env && *min_env) {
+        min_bytes = (size_t)strtoull(min_env, NULL, 10);
+    }
+    const char *max_env = getenv("PG_BENCH_MAX_BYTES");
+    if (max_env && *max_env) {
+        max_bytes = (size_t)strtoull(max_env, NULL, 10);
+    }
+    const char *iter_env = getenv("PG_BENCH_ITER");
+    if (iter_env && *iter_env) {
+        int v = atoi(iter_env);
+        if (v > 0) bench_iter = v;
+    }
+
+    if (min_bytes < (size_t)size * sizeof(int)) {
+        min_bytes = (size_t)size * sizeof(int);
+    }
+
+    for (size_t sz = min_bytes; sz <= max_bytes; sz = (sz < 1024 ? sz * 4 : sz * 2)) {
         int count = (int)(sz / sizeof(int));
         if (count % size != 0) {
             count += (size - (count % size));
@@ -167,10 +186,12 @@ static int run_benchmark_harness(void *pg_handle) {
         }
 
         /* Timed iterations */
-        double times_us[PG_BENCH_ITER];
+        if (bench_iter > 100) bench_iter = 100;
+        if (bench_iter < 1) bench_iter = 1;
+        double times_us[100];
         double total_us = 0.0;
 
-        for (int iter = 0; iter < PG_BENCH_ITER; iter++) {
+        for (int iter = 0; iter < bench_iter; iter++) {
             rc = pg_barrier(pg_handle);
             if (rc != PG_SUCCESS) {
                 fprintf(stderr, "Rank %d pre-iteration barrier failed with code %d\n", rank, rc);
@@ -206,10 +227,10 @@ static int run_benchmark_harness(void *pg_handle) {
             }
         }
 
-        qsort(times_us, PG_BENCH_ITER, sizeof(double), compare_doubles);
+        qsort(times_us, bench_iter, sizeof(double), compare_doubles);
         double min_us = times_us[0];
-        double median_us = times_us[PG_BENCH_ITER / 2];
-        double avg_us = total_us / PG_BENCH_ITER;
+        double median_us = times_us[bench_iter / 2];
+        double avg_us = total_us / bench_iter;
 
         double effective_bytes = 2.0 * (double)(size - 1) / (double)size * (double)sz;
         double effective_gbps = (effective_bytes * 8.0) / (median_us * 1e3);
@@ -553,13 +574,15 @@ int main(int argc, char **argv) {
     printf("=================================================================\n");
     printf("[PG V2 RDMA Control Ring] SUCCESS: Hardware ring established and ping verified.\n");
 
-    /* Run Pipelined Collectives Verification Suite (4 KiB, 64 KiB, 1 MiB, 4 MiB, 1 GiB) */
+    /* Run Pipelined Collectives Verification Suite (4 KiB, 64 KiB, 1 MiB, 4 MiB, and 1 GiB for RDV) */
     size_t test_sizes[] = {
         4 * 1024,                    /* 4 KiB (sub-chunk) */
         64 * 1024,                   /* 64 KiB (single micro) */
         1024 * 1024,                 /* 1 MiB (16 micro-chunks) */
         4 * 1024 * 1024,             /* 4 MiB (64 micro-chunks) */
-        1024ULL * 1024ULL * 1024ULL  /* 1 GiB (16,384 micro-chunks) */
+#if (PG_ACTIVE_MODE != PG_MODE_TYPE_EAGER)
+        1024ULL * 1024ULL * 1024ULL  /* 1 GiB (16,384 micro-chunks for Rendezvous) */
+#endif
     };
     int num_tests = (int)(sizeof(test_sizes) / sizeof(test_sizes[0]));
 

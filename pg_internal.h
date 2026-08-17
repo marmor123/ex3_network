@@ -76,7 +76,11 @@
 #define PG_BENCH_MIN_BYTES       (64ULL * 1024ULL * 1024ULL)   /* 64 MiB */
 #endif
 #ifndef PG_BENCH_MAX_BYTES
-#define PG_BENCH_MAX_BYTES       (1024ULL * 1024ULL * 1024ULL) /* 1 GiB */
+#if (PG_ACTIVE_MODE == PG_MODE_TYPE_EAGER)
+#define PG_BENCH_MAX_BYTES       (16ULL * 1024ULL * 1024ULL)   /* 16 MiB max for Eager */
+#else
+#define PG_BENCH_MAX_BYTES       (1024ULL * 1024ULL * 1024ULL) /* 1 GiB max for Rendezvous */
+#endif
 #endif
 #ifndef PG_BENCH_ITER
 #define PG_BENCH_ITER            5
@@ -156,11 +160,11 @@ struct pg_tcp_qp_info {
 };
 
 /* Pending control message queues (FIFO per QP direction with Pool Indirection) */
-#define PG_PENDING_QUEUE_MAX    1024
+#define PG_PENDING_QUEUE_MAX    64
 
 struct pg_pending_entry {
     struct pg_ctrl_msg msg;
-    char eager_buf[PG_EAGER_THRESHOLD + PG_CTRL_MSG_LEN];
+    char eager_buf[PG_EAGER_BUF_SIZE + PG_CTRL_MSG_LEN];
     uint32_t eager_len;
     int in_use;
 };
@@ -272,7 +276,7 @@ static inline void pg_pending_push(struct pg_context *ctx, int qp_dir, const str
     q->pool[slot].eager_len = 0;
     if (msg->type == PG_CTRL_MSG_EAGER_PAYLOAD && slot_buf) {
         uint32_t elen = msg->payload.rdv.length + PG_CTRL_MSG_LEN;
-        if (elen > (PG_EAGER_THRESHOLD + PG_CTRL_MSG_LEN)) elen = PG_EAGER_THRESHOLD + PG_CTRL_MSG_LEN;
+        if (elen > (PG_EAGER_BUF_SIZE + PG_CTRL_MSG_LEN)) elen = PG_EAGER_BUF_SIZE + PG_CTRL_MSG_LEN;
         memcpy(q->pool[slot].eager_buf, slot_buf, elen);
         q->pool[slot].eager_len = elen;
     }

@@ -2716,7 +2716,7 @@ int pg_all_reduce(void *sendbuf, void *recvbuf, int count,
         return rc;
     }
 
-    /* Phase 2: Distributed barrier before All-Gather phase */
+    /* Phase 2: Distributed barrier before All-Gather phase (ensures phase synchronization and minimizes CQ jitter) */
     rc = pg_barrier(pg_handle);
     if (rc != PG_SUCCESS) {
         fprintf(stderr, "[pg_all_reduce] Rank %d intermediate barrier failed with code %d\n",
