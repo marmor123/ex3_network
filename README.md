@@ -214,7 +214,6 @@ Data is written directly into `recvbuf + offset(s_in)` with zero memory copies. 
 ├── compare_protocols.py          # Automated Eager vs Rendezvous comparative runner
 ├── run_all_benchmarks.py         # Full automated benchmark & sensitivity sweep runner
 ├── run_cluster_test.sh           # Multi-node cluster execution script
-├── test_v1_local.py              # Local multi-process validation harness
 │
 ├── pg.h                          # Public C API and CLI structures
 ├── pg_internal.h                 # Internal wire protocols, SIMD dispatch & constants
@@ -260,16 +259,7 @@ make MODE=eager      # Pure Eager Send/Recv
 make WORKBUFFER=safe
 ```
 
-### 6.2 Local Verification
-Run the 4-process local loopback test suite:
-
-```bash
-python3 test_v1_local.py
-# or
-make check
-```
-
-### 6.3 Multi-Node Cluster Execution
+### 6.2 Multi-Node Cluster Execution
 Run on the physical InfiniBand cluster (`mlx-stud-01..04`):
 
 ```bash
@@ -281,4 +271,7 @@ bash run_cluster_test.sh 2
 
 # Run automated Eager vs Rendezvous comparative sweep
 python3 compare_protocols.py --ranks 4
+
+# Run full 23-size benchmark & sensitivity suite
+python3 run_all_benchmarks.py
 ```
