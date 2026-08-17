@@ -1,5 +1,5 @@
 CC ?= gcc
-CFLAGS ?= -Wall -Wextra -Werror -O3 -std=gnu11
+CFLAGS ?= -Wall -Wextra -Werror -O3 -std=gnu11 -msse4.2
 LDFLAGS ?= 
 LDLIBS ?= -libverbs
 

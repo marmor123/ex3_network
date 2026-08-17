@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <malloc.h>
 
 static void print_usage(const char *prog_name) {
     fprintf(stderr, "Usage: %s -myindex <01..NN> -list <host1> <host2> [host3 ...]\n", prog_name);
@@ -231,9 +232,264 @@ static int run_benchmark_harness(void *pg_handle) {
     return PG_SUCCESS;
 }
 
+static int run_v10_datatypes_and_ops_tests(void *pg_handle) {
+    int rank = pg_get_rank(pg_handle);
+    int size = pg_get_size(pg_handle);
+    int count = 65536;
+
+    if (rank == 0) {
+        printf("=================================================================\n");
+        printf("[PG V10 Datatypes & Operations] Testing SIMD Vectorized Reduction\n");
+        printf("=================================================================\n");
+    }
+
+    DATATYPE datatypes[] = { PG_INT, PG_FLOAT, PG_DOUBLE };
+    const char *dt_names[] = { "PG_INT", "PG_FLOAT", "PG_DOUBLE" };
+    OPERATION ops[] = { PG_SUM, PG_MIN, PG_MAX, PG_PROD };
+    const char *op_names[] = { "PG_SUM", "PG_MIN", "PG_MAX", "PG_PROD" };
+
+    for (int d = 0; d < 3; d++) {
+        DATATYPE dt = datatypes[d];
+        size_t elem_sz = (dt == PG_INT ? sizeof(int) : (dt == PG_FLOAT ? sizeof(float) : sizeof(double)));
+        size_t sz = (size_t)count * elem_sz;
+
+        for (int o = 0; o < 4; o++) {
+            OPERATION op = ops[o];
+
+            void *sendbuf = malloc(sz);
+            void *recvbuf = calloc(1, sz);
+            if (!sendbuf || !recvbuf) {
+                if (sendbuf) free(sendbuf);
+                if (recvbuf) free(recvbuf);
+                return PG_ERR_NOMEM;
+            }
+
+            if (dt == PG_INT) {
+                int *s = (int *)sendbuf;
+                for (int i = 0; i < count; i++) {
+                    if (op == PG_PROD) s[i] = (rank % 2 == 0) ? 2 : 1;
+                    else s[i] = (rank + 1) * 10 + (i % 7);
+                }
+            } else if (dt == PG_FLOAT) {
+                float *s = (float *)sendbuf;
+                for (int i = 0; i < count; i++) {
+                    if (op == PG_PROD) s[i] = (rank % 2 == 0) ? 1.5f : 1.0f;
+                    else s[i] = (float)((rank + 1) * 10) + (float)(i % 7) * 0.1f;
+                }
+            } else if (dt == PG_DOUBLE) {
+                double *s = (double *)sendbuf;
+                for (int i = 0; i < count; i++) {
+                    if (op == PG_PROD) s[i] = (rank % 2 == 0) ? 1.5 : 1.0;
+                    else s[i] = (double)((rank + 1) * 10) + (double)(i % 7) * 0.1;
+                }
+            }
+
+            pg_barrier(pg_handle);
+            int rc = pg_all_reduce(sendbuf, recvbuf, count, dt, op, pg_handle);
+            if (rc != PG_SUCCESS) {
+                fprintf(stderr, "  [FAIL] %s x %s failed with code %d\n", dt_names[d], op_names[o], rc);
+                free(sendbuf); free(recvbuf);
+                return rc;
+            }
+
+            int errors = 0;
+            if (dt == PG_INT) {
+                int *r = (int *)recvbuf;
+                for (int i = 0; i < count; i++) {
+                    int expected = 0;
+                    if (op == PG_SUM) {
+                        for (int rk = 0; rk < size; rk++) expected += (rk + 1) * 10 + (i % 7);
+                    } else if (op == PG_MIN) {
+                        expected = 1 * 10 + (i % 7);
+                    } else if (op == PG_MAX) {
+                        expected = size * 10 + (i % 7);
+                    } else if (op == PG_PROD) {
+                        expected = 1;
+                        for (int rk = 0; rk < size; rk++) expected *= (rk % 2 == 0 ? 2 : 1);
+                    }
+                    if (r[i] != expected) errors++;
+                }
+            } else if (dt == PG_FLOAT) {
+                float *r = (float *)recvbuf;
+                for (int i = 0; i < count; i++) {
+                    float expected = 0.0f;
+                    if (op == PG_SUM) {
+                        for (int rk = 0; rk < size; rk++) expected += (float)((rk + 1) * 10) + (float)(i % 7) * 0.1f;
+                    } else if (op == PG_MIN) {
+                        expected = 10.0f + (float)(i % 7) * 0.1f;
+                    } else if (op == PG_MAX) {
+                        expected = (float)(size * 10) + (float)(i % 7) * 0.1f;
+                    } else if (op == PG_PROD) {
+                        expected = 1.0f;
+                        for (int rk = 0; rk < size; rk++) expected *= (rk % 2 == 0 ? 1.5f : 1.0f);
+                    }
+                    float diff = r[i] - expected;
+                    if (diff < -1e-3f || diff > 1e-3f) errors++;
+                }
+            } else if (dt == PG_DOUBLE) {
+                double *r = (double *)recvbuf;
+                for (int i = 0; i < count; i++) {
+                    double expected = 0.0;
+                    if (op == PG_SUM) {
+                        for (int rk = 0; rk < size; rk++) expected += (double)((rk + 1) * 10) + (double)(i % 7) * 0.1;
+                    } else if (op == PG_MIN) {
+                        expected = 10.0 + (double)(i % 7) * 0.1;
+                    } else if (op == PG_MAX) {
+                        expected = (double)(size * 10) + (double)(i % 7) * 0.1;
+                    } else if (op == PG_PROD) {
+                        expected = 1.0;
+                        for (int rk = 0; rk < size; rk++) expected *= (rk % 2 == 0 ? 1.5 : 1.0);
+                    }
+                    double diff = r[i] - expected;
+                    if (diff < -1e-5 || diff > 1e-5) errors++;
+                }
+            }
+
+            if (errors > 0) {
+                fprintf(stderr, "  [FAIL] %s x %s -> %d mismatches on rank %d\n", dt_names[d], op_names[o], errors, rank);
+                free(sendbuf); free(recvbuf);
+                return PG_ERR_RDMA;
+            } else if (rank == 0) {
+                printf("  [PASS] %-10s x %-10s -> Verified %d elements SIMD exactness\n",
+                       dt_names[d], op_names[o], count);
+            }
+
+            free(sendbuf);
+            free(recvbuf);
+        }
+    }
+    pg_barrier(pg_handle);
+    if (rank == 0) {
+        printf("[PG V10 Datatypes & Operations] SUCCESS: All 12 datatype x op combinations passed.\n");
+    }
+    return PG_SUCCESS;
+}
+
+static int run_v10_non_divisible_counts_tests(void *pg_handle) {
+    int rank = pg_get_rank(pg_handle);
+    int size = pg_get_size(pg_handle);
+    int counts[] = { 1001, 1003, 33333, 1000007 };
+    int num_counts = (int)(sizeof(counts) / sizeof(counts[0]));
+
+    if (rank == 0) {
+        printf("=================================================================\n");
+        printf("[PG V10 Non-Divisible Counts] Testing Arbitrary Remainder Slices\n");
+        printf("=================================================================\n");
+    }
+
+    for (int c = 0; c < num_counts; c++) {
+        int count = counts[c];
+        size_t sz = (size_t)count * sizeof(int);
+
+        void *sendbuf = malloc(sz);
+        void *recvbuf = calloc(1, sz);
+        if (!sendbuf || !recvbuf) {
+            if (sendbuf) free(sendbuf);
+            if (recvbuf) free(recvbuf);
+            return PG_ERR_NOMEM;
+        }
+
+        int *s = (int *)sendbuf;
+        int *r = (int *)recvbuf;
+        for (int i = 0; i < count; i++) {
+            s[i] = (rank + 1) * 100 + (i % 100);
+        }
+
+        pg_barrier(pg_handle);
+        int rc = pg_all_reduce(sendbuf, recvbuf, count, PG_INT, PG_SUM, pg_handle);
+        if (rc != PG_SUCCESS) {
+            fprintf(stderr, "  [FAIL] Non-divisible count %d failed with code %d\n", count, rc);
+            free(sendbuf); free(recvbuf);
+            return rc;
+        }
+
+        int expected_multiplier = (size * (size + 1)) / 2;
+        int errors = 0;
+        for (int i = 0; i < count; i++) {
+            int expected = expected_multiplier * 100 + size * (i % 100);
+            if (r[i] != expected) errors++;
+        }
+
+        if (errors > 0) {
+            fprintf(stderr, "  [FAIL] Count %d -> %d mismatches on rank %d\n", count, errors, rank);
+            free(sendbuf); free(recvbuf);
+            return PG_ERR_RDMA;
+        } else if (rank == 0) {
+            printf("  [PASS] Count %d ints (remainder=%d) -> Verified across all ranks\n",
+                   count, count % size);
+        }
+
+        free(sendbuf);
+        free(recvbuf);
+    }
+
+    pg_barrier(pg_handle);
+    if (rank == 0) {
+        printf("[PG V10 Non-Divisible Counts] SUCCESS: All remainder count tests passed.\n");
+    }
+    return PG_SUCCESS;
+}
+
+static int run_v10_barrier_free_stress_test(void *pg_handle) {
+    int rank = pg_get_rank(pg_handle);
+    int size = pg_get_size(pg_handle);
+    int count = 16384;
+    size_t sz = (size_t)count * sizeof(int);
+
+    if (rank == 0) {
+        printf("=================================================================\n");
+        printf("[PG V10 Barrier-Free Stress] Testing 100 Rapid Back-to-Back Iterations\n");
+        printf("=================================================================\n");
+    }
+
+    void *sendbuf = malloc(sz);
+    void *recvbuf = calloc(1, sz);
+    if (!sendbuf || !recvbuf) {
+        if (sendbuf) free(sendbuf);
+        if (recvbuf) free(recvbuf);
+        return PG_ERR_NOMEM;
+    }
+
+    int *s = (int *)sendbuf;
+    int *r = (int *)recvbuf;
+    for (int i = 0; i < count; i++) {
+        s[i] = (rank + 1);
+    }
+
+    pg_barrier(pg_handle);
+
+    int expected_sum = (size * (size + 1)) / 2;
+    int rc = PG_SUCCESS;
+
+    for (int iter = 0; iter < 100; iter++) {
+        rc = pg_all_reduce(sendbuf, recvbuf, count, PG_INT, PG_SUM, pg_handle);
+        if (rc != PG_SUCCESS) {
+            fprintf(stderr, "  [FAIL] Rapid iteration %d failed with code %d\n", iter, rc);
+            break;
+        }
+        if (r[0] != expected_sum) {
+            fprintf(stderr, "  [FAIL] Rapid iteration %d data mismatch: got %d, expected %d\n",
+                    iter, r[0], expected_sum);
+            rc = PG_ERR_RDMA;
+            break;
+        }
+    }
+
+    free(sendbuf);
+    free(recvbuf);
+    pg_barrier(pg_handle);
+
+    if (rc == PG_SUCCESS && rank == 0) {
+        printf("[PG V10 Barrier-Free Stress] SUCCESS: 100 rapid iterations completed with 0 errors.\n");
+    }
+    return rc;
+}
+
 int main(int argc, char **argv) {
     setbuf(stdout, NULL);
     setbuf(stderr, NULL);
+    mallopt(M_MMAP_MAX, 0);
+    mallopt(M_TRIM_THRESHOLD, -1);
 
     if (parse_args(argc, argv) != 0) {
         print_usage(argv[0]);
@@ -653,16 +909,27 @@ int main(int argc, char **argv) {
         printf("[PG V7 All-Reduce] FAILURE: One or more all-reduce tests failed.\n");
     }
 
-    int bench_rc = PG_SUCCESS;
+    int dt_rc = PG_SUCCESS;
+    int rem_rc = PG_SUCCESS;
+    int stress_rc = PG_SUCCESS;
     if (all_passed && rs_passed && ag_passed && ar_passed) {
+        dt_rc = run_v10_datatypes_and_ops_tests(pg_handle);
+        rem_rc = run_v10_non_divisible_counts_tests(pg_handle);
+        stress_rc = run_v10_barrier_free_stress_test(pg_handle);
+    }
+
+    int bench_rc = PG_SUCCESS;
+    if (all_passed && rs_passed && ag_passed && ar_passed &&
+        dt_rc == PG_SUCCESS && rem_rc == PG_SUCCESS && stress_rc == PG_SUCCESS) {
         bench_rc = run_benchmark_harness(pg_handle);
     }
 
     rc = pg_close(pg_handle);
 
-    if (rc != PG_SUCCESS || !all_passed || !rs_passed || !ag_passed || !ar_passed || bench_rc != PG_SUCCESS) {
-        fprintf(stderr, "pg_close or tests failed (rc=%d, all_passed=%d, rs_passed=%d, ag_passed=%d, ar_passed=%d, bench_rc=%d)\n",
-                rc, all_passed, rs_passed, ag_passed, ar_passed, bench_rc);
+    if (rc != PG_SUCCESS || !all_passed || !rs_passed || !ag_passed || !ar_passed ||
+        dt_rc != PG_SUCCESS || rem_rc != PG_SUCCESS || stress_rc != PG_SUCCESS || bench_rc != PG_SUCCESS) {
+        fprintf(stderr, "pg_close or tests failed (rc=%d, all_passed=%d, rs_passed=%d, ag_passed=%d, ar_passed=%d, dt_rc=%d, rem_rc=%d, stress_rc=%d, bench_rc=%d)\n",
+                rc, all_passed, rs_passed, ag_passed, ar_passed, dt_rc, rem_rc, stress_rc, bench_rc);
         return 1;
     }
 

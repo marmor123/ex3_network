@@ -334,7 +334,7 @@ int pg_rdma_init_resources(struct pg_context *ctx) {
         return PG_ERR_RDMA;
     }
 
-    uint32_t max_send_wr = 64;
+    uint32_t max_send_wr = 256;
     uint32_t max_recv_wr = PG_CTRL_POOL_DEPTH;
     if (max_send_wr > (uint32_t)dev_attr.max_qp_wr) max_send_wr = dev_attr.max_qp_wr;
     if (max_recv_wr > (uint32_t)dev_attr.max_qp_wr) max_recv_wr = dev_attr.max_qp_wr;
@@ -613,9 +613,14 @@ int pg_post_ctrl_send(struct pg_context *ctx, int qp_dir, const struct pg_ctrl_m
 struct ibv_mr *pg_get_or_reg_mr(struct pg_context *ctx, void *addr, size_t length, int access_flags) {
     if (!ctx || !addr || length == 0) return NULL;
 
-    /* Check if exact (addr, length) with sufficient access_flags is already cached */
+    /* Check if exact (addr, length) or containing MR with sufficient access_flags is already cached */
     for (int i = 0; i < ctx->mr_cache_count; i++) {
-        if (ctx->mr_cache[i].addr == addr && ctx->mr_cache[i].length == length) {
+        uintptr_t cached_start = (uintptr_t)ctx->mr_cache[i].addr;
+        uintptr_t cached_end = cached_start + ctx->mr_cache[i].length;
+        uintptr_t req_start = (uintptr_t)addr;
+        uintptr_t req_end = req_start + length;
+
+        if (req_start >= cached_start && req_end <= cached_end) {
             if ((ctx->mr_cache[i].access_flags & access_flags) == access_flags) {
                 return ctx->mr_cache[i].mr;
             }
@@ -642,7 +647,7 @@ struct ibv_mr *pg_get_or_reg_mr(struct pg_context *ctx, void *addr, size_t lengt
     return mr;
 }
 
-/* Ensure internal staging and safe-mode work buffers are allocated and registered (ADR-0002) */
+/* Ensure internal staging and safe-mode work buffers are allocated and registered (ADR-0002 & V10 64B align) */
 int pg_ensure_internal_buffers(struct pg_context *ctx, size_t count_bytes, size_t segment_bytes) {
     if (!ctx) return PG_ERR_INVAL;
 
@@ -657,8 +662,7 @@ int pg_ensure_internal_buffers(struct pg_context *ctx, size_t count_bytes, size_
             ctx->staging_buf = NULL;
         }
 
-        ctx->staging_buf = malloc(segment_bytes);
-        if (!ctx->staging_buf) {
+        if (posix_memalign((void **)&ctx->staging_buf, 64, segment_bytes) != 0 || !ctx->staging_buf) {
             ctx->staging_capacity = 0;
             return PG_ERR_NOMEM;
         }
@@ -687,8 +691,7 @@ int pg_ensure_internal_buffers(struct pg_context *ctx, size_t count_bytes, size_
             ctx->work_buf = NULL;
         }
 
-        ctx->work_buf = malloc(count_bytes);
-        if (!ctx->work_buf) {
+        if (posix_memalign((void **)&ctx->work_buf, 64, count_bytes) != 0 || !ctx->work_buf) {
             ctx->work_capacity = 0;
             return PG_ERR_NOMEM;
         }
@@ -709,6 +712,350 @@ int pg_ensure_internal_buffers(struct pg_context *ctx, size_t count_bytes, size_
 #endif
 
     return PG_SUCCESS;
+}
+
+/* Initialize Runtime Hyperparameters from Environment with compile-time defaults (V10) */
+void pg_init_tuning_params(struct pg_context *ctx) {
+    if (!ctx) return;
+
+    ctx->pipeline_chunk = PG_PIPELINE_CHUNK;
+    const char *chunk_env = getenv("PG_PIPELINE_CHUNK");
+    if (chunk_env && *chunk_env) {
+        size_t val = (size_t)strtoul(chunk_env, NULL, 10);
+        if (val > 0) ctx->pipeline_chunk = val;
+    }
+
+    ctx->rdma_window = PG_RDMA_WINDOW;
+    const char *win_env = getenv("PG_RDMA_WINDOW");
+    if (win_env && *win_env) {
+        int val = atoi(win_env);
+        if (val > 0) ctx->rdma_window = val;
+    }
+
+    ctx->rdma_signal_interval = PG_RDMA_SIGNAL_INTERVAL;
+    const char *sig_env = getenv("PG_RDMA_SIGNAL_INTERVAL");
+    if (sig_env && *sig_env) {
+        int val = atoi(sig_env);
+        if (val > 0) ctx->rdma_signal_interval = val;
+    }
+
+    ctx->batch_size = PG_DEFAULT_BATCH_SIZE;
+    const char *batch_env = getenv("PG_BATCH_SIZE");
+    if (batch_env && *batch_env) {
+        int val = atoi(batch_env);
+        if (val > 0) ctx->batch_size = val;
+    }
+
+    ctx->eager_threshold = PG_EAGER_THRESHOLD;
+    const char *eager_env = getenv("PG_EAGER_THRESHOLD");
+    if (eager_env && *eager_env) {
+        size_t val = (size_t)strtoul(eager_env, NULL, 10);
+        if (val > 0) ctx->eager_threshold = val;
+    }
+
+    ctx->eager_window = PG_EAGER_WINDOW;
+    const char *ewin_env = getenv("PG_EAGER_WINDOW");
+    if (ewin_env && *ewin_env) {
+        int val = atoi(ewin_env);
+        if (val > 0) ctx->eager_window = val;
+    }
+
+    ctx->use_streaming_stores = 1;
+    const char *stream_env = getenv("PG_USE_STREAMING_STORES");
+    if (stream_env && *stream_env) {
+        ctx->use_streaming_stores = atoi(stream_env);
+    }
+}
+
+/* Vectorized CPU reduction engine with SSE4.2 and 4x loop unrolling (V10) */
+void pg_reduce_buffer(void *dest, const void *src, int count,
+                      DATATYPE datatype, OPERATION op, int use_streaming) {
+    (void)use_streaming;
+    if (count <= 0 || !dest || !src) return;
+
+    switch (datatype) {
+        case PG_INT: {
+            int32_t *d = (int32_t *)dest;
+            const int32_t *s = (const int32_t *)src;
+            int i = 0;
+
+            if (op == PG_SUM) {
+                for (; i + 16 <= count; i += 16) {
+                    __m128i vd0 = _mm_loadu_si128((const __m128i *)(d + i));
+                    __m128i vd1 = _mm_loadu_si128((const __m128i *)(d + i + 4));
+                    __m128i vd2 = _mm_loadu_si128((const __m128i *)(d + i + 8));
+                    __m128i vd3 = _mm_loadu_si128((const __m128i *)(d + i + 12));
+                    __m128i vs0 = _mm_loadu_si128((const __m128i *)(s + i));
+                    __m128i vs1 = _mm_loadu_si128((const __m128i *)(s + i + 4));
+                    __m128i vs2 = _mm_loadu_si128((const __m128i *)(s + i + 8));
+                    __m128i vs3 = _mm_loadu_si128((const __m128i *)(s + i + 12));
+                    _mm_storeu_si128((__m128i *)(d + i), _mm_add_epi32(vd0, vs0));
+                    _mm_storeu_si128((__m128i *)(d + i + 4), _mm_add_epi32(vd1, vs1));
+                    _mm_storeu_si128((__m128i *)(d + i + 8), _mm_add_epi32(vd2, vs2));
+                    _mm_storeu_si128((__m128i *)(d + i + 12), _mm_add_epi32(vd3, vs3));
+                }
+                for (; i + 4 <= count; i += 4) {
+                    __m128i vd = _mm_loadu_si128((const __m128i *)(d + i));
+                    __m128i vs = _mm_loadu_si128((const __m128i *)(s + i));
+                    _mm_storeu_si128((__m128i *)(d + i), _mm_add_epi32(vd, vs));
+                }
+                for (; i < count; i++) d[i] += s[i];
+            } else if (op == PG_MIN) {
+                for (; i + 16 <= count; i += 16) {
+                    __m128i vd0 = _mm_loadu_si128((const __m128i *)(d + i));
+                    __m128i vd1 = _mm_loadu_si128((const __m128i *)(d + i + 4));
+                    __m128i vd2 = _mm_loadu_si128((const __m128i *)(d + i + 8));
+                    __m128i vd3 = _mm_loadu_si128((const __m128i *)(d + i + 12));
+                    __m128i vs0 = _mm_loadu_si128((const __m128i *)(s + i));
+                    __m128i vs1 = _mm_loadu_si128((const __m128i *)(s + i + 4));
+                    __m128i vs2 = _mm_loadu_si128((const __m128i *)(s + i + 8));
+                    __m128i vs3 = _mm_loadu_si128((const __m128i *)(s + i + 12));
+                    _mm_storeu_si128((__m128i *)(d + i), _mm_min_epi32(vd0, vs0));
+                    _mm_storeu_si128((__m128i *)(d + i + 4), _mm_min_epi32(vd1, vs1));
+                    _mm_storeu_si128((__m128i *)(d + i + 8), _mm_min_epi32(vd2, vs2));
+                    _mm_storeu_si128((__m128i *)(d + i + 12), _mm_min_epi32(vd3, vs3));
+                }
+                for (; i + 4 <= count; i += 4) {
+                    __m128i vd = _mm_loadu_si128((const __m128i *)(d + i));
+                    __m128i vs = _mm_loadu_si128((const __m128i *)(s + i));
+                    _mm_storeu_si128((__m128i *)(d + i), _mm_min_epi32(vd, vs));
+                }
+                for (; i < count; i++) { if (s[i] < d[i]) d[i] = s[i]; }
+            } else if (op == PG_MAX) {
+                for (; i + 16 <= count; i += 16) {
+                    __m128i vd0 = _mm_loadu_si128((const __m128i *)(d + i));
+                    __m128i vd1 = _mm_loadu_si128((const __m128i *)(d + i + 4));
+                    __m128i vd2 = _mm_loadu_si128((const __m128i *)(d + i + 8));
+                    __m128i vd3 = _mm_loadu_si128((const __m128i *)(d + i + 12));
+                    __m128i vs0 = _mm_loadu_si128((const __m128i *)(s + i));
+                    __m128i vs1 = _mm_loadu_si128((const __m128i *)(s + i + 4));
+                    __m128i vs2 = _mm_loadu_si128((const __m128i *)(s + i + 8));
+                    __m128i vs3 = _mm_loadu_si128((const __m128i *)(s + i + 12));
+                    _mm_storeu_si128((__m128i *)(d + i), _mm_max_epi32(vd0, vs0));
+                    _mm_storeu_si128((__m128i *)(d + i + 4), _mm_max_epi32(vd1, vs1));
+                    _mm_storeu_si128((__m128i *)(d + i + 8), _mm_max_epi32(vd2, vs2));
+                    _mm_storeu_si128((__m128i *)(d + i + 12), _mm_max_epi32(vd3, vs3));
+                }
+                for (; i + 4 <= count; i += 4) {
+                    __m128i vd = _mm_loadu_si128((const __m128i *)(d + i));
+                    __m128i vs = _mm_loadu_si128((const __m128i *)(s + i));
+                    _mm_storeu_si128((__m128i *)(d + i), _mm_max_epi32(vd, vs));
+                }
+                for (; i < count; i++) { if (s[i] > d[i]) d[i] = s[i]; }
+            } else if (op == PG_PROD) {
+                for (; i + 16 <= count; i += 16) {
+                    __m128i vd0 = _mm_loadu_si128((const __m128i *)(d + i));
+                    __m128i vd1 = _mm_loadu_si128((const __m128i *)(d + i + 4));
+                    __m128i vd2 = _mm_loadu_si128((const __m128i *)(d + i + 8));
+                    __m128i vd3 = _mm_loadu_si128((const __m128i *)(d + i + 12));
+                    __m128i vs0 = _mm_loadu_si128((const __m128i *)(s + i));
+                    __m128i vs1 = _mm_loadu_si128((const __m128i *)(s + i + 4));
+                    __m128i vs2 = _mm_loadu_si128((const __m128i *)(s + i + 8));
+                    __m128i vs3 = _mm_loadu_si128((const __m128i *)(s + i + 12));
+                    _mm_storeu_si128((__m128i *)(d + i), _mm_mullo_epi32(vd0, vs0));
+                    _mm_storeu_si128((__m128i *)(d + i + 4), _mm_mullo_epi32(vd1, vs1));
+                    _mm_storeu_si128((__m128i *)(d + i + 8), _mm_mullo_epi32(vd2, vs2));
+                    _mm_storeu_si128((__m128i *)(d + i + 12), _mm_mullo_epi32(vd3, vs3));
+                }
+                for (; i + 4 <= count; i += 4) {
+                    __m128i vd = _mm_loadu_si128((const __m128i *)(d + i));
+                    __m128i vs = _mm_loadu_si128((const __m128i *)(s + i));
+                    _mm_storeu_si128((__m128i *)(d + i), _mm_mullo_epi32(vd, vs));
+                }
+                for (; i < count; i++) d[i] *= s[i];
+            }
+            break;
+        }
+
+        case PG_FLOAT: {
+            float *d = (float *)dest;
+            const float *s = (const float *)src;
+            int i = 0;
+
+            if (op == PG_SUM) {
+                for (; i + 16 <= count; i += 16) {
+                    __m128 vd0 = _mm_loadu_ps(d + i);
+                    __m128 vd1 = _mm_loadu_ps(d + i + 4);
+                    __m128 vd2 = _mm_loadu_ps(d + i + 8);
+                    __m128 vd3 = _mm_loadu_ps(d + i + 12);
+                    __m128 vs0 = _mm_loadu_ps(s + i);
+                    __m128 vs1 = _mm_loadu_ps(s + i + 4);
+                    __m128 vs2 = _mm_loadu_ps(s + i + 8);
+                    __m128 vs3 = _mm_loadu_ps(s + i + 12);
+                    _mm_storeu_ps(d + i, _mm_add_ps(vd0, vs0));
+                    _mm_storeu_ps(d + i + 4, _mm_add_ps(vd1, vs1));
+                    _mm_storeu_ps(d + i + 8, _mm_add_ps(vd2, vs2));
+                    _mm_storeu_ps(d + i + 12, _mm_add_ps(vd3, vs3));
+                }
+                for (; i + 4 <= count; i += 4) {
+                    __m128 vd = _mm_loadu_ps(d + i);
+                    __m128 vs = _mm_loadu_ps(s + i);
+                    _mm_storeu_ps(d + i, _mm_add_ps(vd, vs));
+                }
+                for (; i < count; i++) d[i] += s[i];
+            } else if (op == PG_MIN) {
+                for (; i + 16 <= count; i += 16) {
+                    __m128 vd0 = _mm_loadu_ps(d + i);
+                    __m128 vd1 = _mm_loadu_ps(d + i + 4);
+                    __m128 vd2 = _mm_loadu_ps(d + i + 8);
+                    __m128 vd3 = _mm_loadu_ps(d + i + 12);
+                    __m128 vs0 = _mm_loadu_ps(s + i);
+                    __m128 vs1 = _mm_loadu_ps(s + i + 4);
+                    __m128 vs2 = _mm_loadu_ps(s + i + 8);
+                    __m128 vs3 = _mm_loadu_ps(s + i + 12);
+                    _mm_storeu_ps(d + i, _mm_min_ps(vd0, vs0));
+                    _mm_storeu_ps(d + i + 4, _mm_min_ps(vd1, vs1));
+                    _mm_storeu_ps(d + i + 8, _mm_min_ps(vd2, vs2));
+                    _mm_storeu_ps(d + i + 12, _mm_min_ps(vd3, vs3));
+                }
+                for (; i + 4 <= count; i += 4) {
+                    __m128 vd = _mm_loadu_ps(d + i);
+                    __m128 vs = _mm_loadu_ps(s + i);
+                    _mm_storeu_ps(d + i, _mm_min_ps(vd, vs));
+                }
+                for (; i < count; i++) { if (s[i] < d[i]) d[i] = s[i]; }
+            } else if (op == PG_MAX) {
+                for (; i + 16 <= count; i += 16) {
+                    __m128 vd0 = _mm_loadu_ps(d + i);
+                    __m128 vd1 = _mm_loadu_ps(d + i + 4);
+                    __m128 vd2 = _mm_loadu_ps(d + i + 8);
+                    __m128 vd3 = _mm_loadu_ps(d + i + 12);
+                    __m128 vs0 = _mm_loadu_ps(s + i);
+                    __m128 vs1 = _mm_loadu_ps(s + i + 4);
+                    __m128 vs2 = _mm_loadu_ps(s + i + 8);
+                    __m128 vs3 = _mm_loadu_ps(s + i + 12);
+                    _mm_storeu_ps(d + i, _mm_max_ps(vd0, vs0));
+                    _mm_storeu_ps(d + i + 4, _mm_max_ps(vd1, vs1));
+                    _mm_storeu_ps(d + i + 8, _mm_max_ps(vd2, vs2));
+                    _mm_storeu_ps(d + i + 12, _mm_max_ps(vd3, vs3));
+                }
+                for (; i + 4 <= count; i += 4) {
+                    __m128 vd = _mm_loadu_ps(d + i);
+                    __m128 vs = _mm_loadu_ps(s + i);
+                    _mm_storeu_ps(d + i, _mm_max_ps(vd, vs));
+                }
+                for (; i < count; i++) { if (s[i] > d[i]) d[i] = s[i]; }
+            } else if (op == PG_PROD) {
+                for (; i + 16 <= count; i += 16) {
+                    __m128 vd0 = _mm_loadu_ps(d + i);
+                    __m128 vd1 = _mm_loadu_ps(d + i + 4);
+                    __m128 vd2 = _mm_loadu_ps(d + i + 8);
+                    __m128 vd3 = _mm_loadu_ps(d + i + 12);
+                    __m128 vs0 = _mm_loadu_ps(s + i);
+                    __m128 vs1 = _mm_loadu_ps(s + i + 4);
+                    __m128 vs2 = _mm_loadu_ps(s + i + 8);
+                    __m128 vs3 = _mm_loadu_ps(s + i + 12);
+                    _mm_storeu_ps(d + i, _mm_mul_ps(vd0, vs0));
+                    _mm_storeu_ps(d + i + 4, _mm_mul_ps(vd1, vs1));
+                    _mm_storeu_ps(d + i + 8, _mm_mul_ps(vd2, vs2));
+                    _mm_storeu_ps(d + i + 12, _mm_mul_ps(vd3, vs3));
+                }
+                for (; i + 4 <= count; i += 4) {
+                    __m128 vd = _mm_loadu_ps(d + i);
+                    __m128 vs = _mm_loadu_ps(s + i);
+                    _mm_storeu_ps(d + i, _mm_mul_ps(vd, vs));
+                }
+                for (; i < count; i++) d[i] *= s[i];
+            }
+            break;
+        }
+
+        case PG_DOUBLE: {
+            double *d = (double *)dest;
+            const double *s = (const double *)src;
+            int i = 0;
+
+            if (op == PG_SUM) {
+                for (; i + 8 <= count; i += 8) {
+                    __m128d vd0 = _mm_loadu_pd(d + i);
+                    __m128d vd1 = _mm_loadu_pd(d + i + 2);
+                    __m128d vd2 = _mm_loadu_pd(d + i + 4);
+                    __m128d vd3 = _mm_loadu_pd(d + i + 6);
+                    __m128d vs0 = _mm_loadu_pd(s + i);
+                    __m128d vs1 = _mm_loadu_pd(s + i + 2);
+                    __m128d vs2 = _mm_loadu_pd(s + i + 4);
+                    __m128d vs3 = _mm_loadu_pd(s + i + 6);
+                    _mm_storeu_pd(d + i, _mm_add_pd(vd0, vs0));
+                    _mm_storeu_pd(d + i + 2, _mm_add_pd(vd1, vs1));
+                    _mm_storeu_pd(d + i + 4, _mm_add_pd(vd2, vs2));
+                    _mm_storeu_pd(d + i + 6, _mm_add_pd(vd3, vs3));
+                }
+                for (; i + 2 <= count; i += 2) {
+                    __m128d vd = _mm_loadu_pd(d + i);
+                    __m128d vs = _mm_loadu_pd(s + i);
+                    _mm_storeu_pd(d + i, _mm_add_pd(vd, vs));
+                }
+                for (; i < count; i++) d[i] += s[i];
+            } else if (op == PG_MIN) {
+                for (; i + 8 <= count; i += 8) {
+                    __m128d vd0 = _mm_loadu_pd(d + i);
+                    __m128d vd1 = _mm_loadu_pd(d + i + 2);
+                    __m128d vd2 = _mm_loadu_pd(d + i + 4);
+                    __m128d vd3 = _mm_loadu_pd(d + i + 6);
+                    __m128d vs0 = _mm_loadu_pd(s + i);
+                    __m128d vs1 = _mm_loadu_pd(s + i + 2);
+                    __m128d vs2 = _mm_loadu_pd(s + i + 4);
+                    __m128d vs3 = _mm_loadu_pd(s + i + 6);
+                    _mm_storeu_pd(d + i, _mm_min_pd(vd0, vs0));
+                    _mm_storeu_pd(d + i + 2, _mm_min_pd(vd1, vs1));
+                    _mm_storeu_pd(d + i + 4, _mm_min_pd(vd2, vs2));
+                    _mm_storeu_pd(d + i + 6, _mm_min_pd(vd3, vs3));
+                }
+                for (; i + 2 <= count; i += 2) {
+                    __m128d vd = _mm_loadu_pd(d + i);
+                    __m128d vs = _mm_loadu_pd(s + i);
+                    _mm_storeu_pd(d + i, _mm_min_pd(vd, vs));
+                }
+                for (; i < count; i++) { if (s[i] < d[i]) d[i] = s[i]; }
+            } else if (op == PG_MAX) {
+                for (; i + 8 <= count; i += 8) {
+                    __m128d vd0 = _mm_loadu_pd(d + i);
+                    __m128d vd1 = _mm_loadu_pd(d + i + 2);
+                    __m128d vd2 = _mm_loadu_pd(d + i + 4);
+                    __m128d vd3 = _mm_loadu_pd(d + i + 6);
+                    __m128d vs0 = _mm_loadu_pd(s + i);
+                    __m128d vs1 = _mm_loadu_pd(s + i + 2);
+                    __m128d vs2 = _mm_loadu_pd(s + i + 4);
+                    __m128d vs3 = _mm_loadu_pd(s + i + 6);
+                    _mm_storeu_pd(d + i, _mm_max_pd(vd0, vs0));
+                    _mm_storeu_pd(d + i + 2, _mm_max_pd(vd1, vs1));
+                    _mm_storeu_pd(d + i + 4, _mm_max_pd(vd2, vs2));
+                    _mm_storeu_pd(d + i + 6, _mm_max_pd(vd3, vs3));
+                }
+                for (; i + 2 <= count; i += 2) {
+                    __m128d vd = _mm_loadu_pd(d + i);
+                    __m128d vs = _mm_loadu_pd(s + i);
+                    _mm_storeu_pd(d + i, _mm_max_pd(vd, vs));
+                }
+                for (; i < count; i++) { if (s[i] > d[i]) d[i] = s[i]; }
+            } else if (op == PG_PROD) {
+                for (; i + 8 <= count; i += 8) {
+                    __m128d vd0 = _mm_loadu_pd(d + i);
+                    __m128d vd1 = _mm_loadu_pd(d + i + 2);
+                    __m128d vd2 = _mm_loadu_pd(d + i + 4);
+                    __m128d vd3 = _mm_loadu_pd(d + i + 6);
+                    __m128d vs0 = _mm_loadu_pd(s + i);
+                    __m128d vs1 = _mm_loadu_pd(s + i + 2);
+                    __m128d vs2 = _mm_loadu_pd(s + i + 4);
+                    __m128d vs3 = _mm_loadu_pd(s + i + 6);
+                    _mm_storeu_pd(d + i, _mm_mul_pd(vd0, vs0));
+                    _mm_storeu_pd(d + i + 2, _mm_mul_pd(vd1, vs1));
+                    _mm_storeu_pd(d + i + 4, _mm_mul_pd(vd2, vs2));
+                    _mm_storeu_pd(d + i + 6, _mm_mul_pd(vd3, vs3));
+                }
+                for (; i + 2 <= count; i += 2) {
+                    __m128d vd = _mm_loadu_pd(d + i);
+                    __m128d vs = _mm_loadu_pd(s + i);
+                    _mm_storeu_pd(d + i, _mm_mul_pd(vd, vs));
+                }
+                for (; i < count; i++) d[i] *= s[i];
+            }
+            break;
+        }
+
+        default:
+            break;
+    }
 }
 
 /* Post one signaled RDMA_WRITE operation */
@@ -993,11 +1340,9 @@ static int pg_barrier_token_pass(struct pg_context *ctx, uint16_t msg_type) {
 
         int send_done = 0, recv_done = 0;
 
-        /* Check if the expected barrier token was already received and buffered */
-        if (ctx->has_pending_ctrl[PG_QP_DIR_FROM_PREV] &&
-            ctx->pending_ctrl_msg[PG_QP_DIR_FROM_PREV].type == msg_type) {
+        /* Check if the expected barrier token was already received and queued */
+        if (pg_pending_pop_matching(ctx, PG_QP_DIR_FROM_PREV, (int)msg_type, (uint32_t)-1, NULL, NULL)) {
             recv_done = 1;
-            ctx->has_pending_ctrl[PG_QP_DIR_FROM_PREV] = 0;
         }
 
         clock_gettime(CLOCK_MONOTONIC, &start);
@@ -1021,10 +1366,8 @@ static int pg_barrier_token_pass(struct pg_context *ctx, uint16_t msg_type) {
                         if (recv_msg.type == msg_type) {
                             recv_done = 1;
                         } else {
-                            /* Preserve unexpected control message & payload in pending slot */
-                            memcpy(ctx->pending_slot_buf[qp_dir], ctx->recv_slot_buf[qp_dir][slot], PG_EAGER_SLOT_SIZE);
-                            ctx->pending_ctrl_msg[qp_dir] = recv_msg;
-                            ctx->has_pending_ctrl[qp_dir] = 1;
+                            /* Push unexpected control message & payload into pending queue */
+                            pg_pending_push(ctx, qp_dir, &recv_msg, ctx->recv_slot_buf[qp_dir][slot]);
                         }
                     }
 
@@ -1042,11 +1385,9 @@ static int pg_barrier_token_pass(struct pg_context *ctx, uint16_t msg_type) {
         /* Rank != 0: Wait for token from prev, forward to next, wait for send completion */
         int recv_done = 0;
 
-        /* Check if the expected barrier token was already received and buffered */
-        if (ctx->has_pending_ctrl[PG_QP_DIR_FROM_PREV] &&
-            ctx->pending_ctrl_msg[PG_QP_DIR_FROM_PREV].type == msg_type) {
+        /* Check if the expected barrier token was already received and queued */
+        if (pg_pending_pop_matching(ctx, PG_QP_DIR_FROM_PREV, (int)msg_type, (uint32_t)-1, NULL, NULL)) {
             recv_done = 1;
-            ctx->has_pending_ctrl[PG_QP_DIR_FROM_PREV] = 0;
         }
 
         clock_gettime(CLOCK_MONOTONIC, &start);
@@ -1068,10 +1409,8 @@ static int pg_barrier_token_pass(struct pg_context *ctx, uint16_t msg_type) {
                         if (recv_msg.type == msg_type) {
                             recv_done = 1;
                         } else {
-                            /* Preserve unexpected control message & payload in pending slot */
-                            memcpy(ctx->pending_slot_buf[qp_dir], ctx->recv_slot_buf[qp_dir][slot], PG_EAGER_SLOT_SIZE);
-                            ctx->pending_ctrl_msg[qp_dir] = recv_msg;
-                            ctx->has_pending_ctrl[qp_dir] = 1;
+                            /* Push unexpected control message & payload into pending queue */
+                            pg_pending_push(ctx, qp_dir, &recv_msg, ctx->recv_slot_buf[qp_dir][slot]);
                         }
                     }
 
@@ -1110,13 +1449,11 @@ static int pg_barrier_token_pass(struct pg_context *ctx, uint16_t msg_type) {
                 if (wr_type == PG_WR_TYPE_SEND_CTRL && qp_dir == PG_QP_DIR_TO_NEXT) {
                     send_done = 1;
                 } else if (wr_type == PG_WR_TYPE_RECV_CTRL) {
-                    /* Repost and buffer any incoming control message */
+                    /* Repost and queue any incoming control message */
                     struct pg_ctrl_msg recv_msg = *pg_recv_slot_msg(ctx, qp_dir, slot);
 
                     if (recv_msg.tag == PG_CTRL_TAG) {
-                        memcpy(ctx->pending_slot_buf[qp_dir], ctx->recv_slot_buf[qp_dir][slot], PG_EAGER_SLOT_SIZE);
-                        ctx->pending_ctrl_msg[qp_dir] = recv_msg;
-                        ctx->has_pending_ctrl[qp_dir] = 1;
+                        pg_pending_push(ctx, qp_dir, &recv_msg, ctx->recv_slot_buf[qp_dir][slot]);
                     }
 
                     if (pg_repost_ctrl_recv_slot(ctx, qp_dir, slot)) return PG_ERR_RDMA;
@@ -1193,6 +1530,9 @@ int connect_process_group(char *servername, void **pg_handle) {
     for (int i = 0; i < ctx->size; i++) {
         snprintf(ctx->host_list[i], sizeof(ctx->host_list[i]), "%s", g_pg_args.hosts[i]);
     }
+
+    /* Initialize runtime tuning hyperparameters from environment or defaults (V10) */
+    pg_init_tuning_params(ctx);
 
     /* 1. Allocate RDMA resources (PD, CQ, QPs in INIT state, pre-posted recvs) */
     int rc = pg_rdma_init_resources(ctx);
@@ -1277,28 +1617,30 @@ int pg_reduce_scatter(void *sendbuf, void *recvbuf, int count,
     }
     struct pg_context *ctx = (struct pg_context *)pg_handle;
 
-    if (datatype != PG_INT || op != PG_SUM) {
+    if (datatype != PG_INT && datatype != PG_FLOAT && datatype != PG_DOUBLE) {
+        return PG_ERR_UNSUPPORTED;
+    }
+    if (op != PG_SUM && op != PG_MIN && op != PG_MAX && op != PG_PROD) {
         return PG_ERR_UNSUPPORTED;
     }
 
-    if (count % ctx->size != 0) {
-        fprintf(stderr, "[pg_reduce_scatter] Error: count (%d) must be divisible by ring size (%d)\n",
-                count, ctx->size);
-        return PG_ERR_INVAL;
-    }
-
-    int segment_count = count / ctx->size;
-    size_t segment_bytes = (size_t)segment_count * sizeof(int);
-    size_t total_bytes = (size_t)count * sizeof(int);
+    size_t elem_size = pg_get_datatype_size(datatype);
+    size_t total_bytes = (size_t)count * elem_size;
 
     /* Single rank degenerate ring: copy input directly to output */
     if (ctx->size == 1) {
-        memcpy(recvbuf, sendbuf, total_bytes);
+        if (recvbuf != sendbuf) {
+            memcpy(recvbuf, sendbuf, total_bytes);
+        }
         return PG_SUCCESS;
     }
 
+    /* Maximum segment byte size across ranks */
+    int max_seg_elems = pg_get_seg_count(0, count, ctx->size);
+    size_t max_seg_bytes = (size_t)max_seg_elems * elem_size;
+
     /* Ensure internal staging (and safe-mode work) buffers */
-    int rc = pg_ensure_internal_buffers(ctx, total_bytes, segment_bytes);
+    int rc = pg_ensure_internal_buffers(ctx, total_bytes, max_seg_bytes);
     if (rc != PG_SUCCESS) return rc;
 
     void *work_ptr = NULL;
@@ -1314,32 +1656,43 @@ int pg_reduce_scatter(void *sendbuf, void *recvbuf, int count,
     }
 #else
     /* Safe mode: copy sendbuf into internal working buffer */
-    memcpy(ctx->work_buf, sendbuf, total_bytes);
+    if (sendbuf != ctx->work_buf) {
+        memcpy(ctx->work_buf, sendbuf, total_bytes);
+    }
     work_ptr = ctx->work_buf;
     work_mr = ctx->work_mr;
 #endif
-
-    uint32_t num_micros = (uint32_t)((segment_bytes + PG_PIPELINE_CHUNK - 1) / PG_PIPELINE_CHUNK);
 
     int is_eager = 0;
 #if (PG_ACTIVE_MODE == PG_MODE_TYPE_EAGER)
     is_eager = 1;
 #elif (PG_ACTIVE_MODE == PG_MODE_TYPE_AUTO)
-    if (segment_bytes <= PG_EAGER_THRESHOLD) {
+    if (max_seg_bytes <= ctx->eager_threshold) {
         is_eager = 1;
     }
 #endif
 
     if (is_eager) {
-        /* Eager payload SEND ring reduction steps (ADR-0002 & V9) */
+        /* Eager payload SEND ring reduction steps (ADR-0002 & V9 & V10) */
         uint32_t eager_recv_step_micros[PG_MAX_RANKS] = {0};
 
         for (int step = 0; step < ctx->size - 1; step++) {
             int send_seg = (ctx->rank - step - 1 + ctx->size) % ctx->size;
             int recv_seg = (ctx->rank - step - 2 + ctx->size) % ctx->size;
 
-            int send_done = 0;
-            int recv_done = (eager_recv_step_micros[recv_seg] == num_micros) ? 1 : 0;
+            int send_seg_elems = pg_get_seg_count(send_seg, count, ctx->size);
+            size_t send_seg_bytes = (size_t)send_seg_elems * elem_size;
+            size_t send_seg_offset = pg_get_seg_offset_bytes(send_seg, count, ctx->size, elem_size);
+
+            int recv_seg_elems = pg_get_seg_count(recv_seg, count, ctx->size);
+            size_t recv_seg_bytes = (size_t)recv_seg_elems * elem_size;
+            (void)recv_seg_elems;
+
+            uint32_t num_send_micros = (uint32_t)((send_seg_bytes + ctx->pipeline_chunk - 1) / ctx->pipeline_chunk);
+            uint32_t num_recv_micros = (uint32_t)((recv_seg_bytes + ctx->pipeline_chunk - 1) / ctx->pipeline_chunk);
+
+            int send_done = (num_send_micros == 0) ? 1 : 0;
+            int recv_done = (num_recv_micros == 0 || eager_recv_step_micros[recv_seg] == num_recv_micros) ? 1 : 0;
             uint32_t eager_posted_micros = 0;
             uint32_t eager_completed_micros = 0;
 
@@ -1347,56 +1700,54 @@ int pg_reduce_scatter(void *sendbuf, void *recvbuf, int count,
             clock_gettime(CLOCK_MONOTONIC, &start);
 
             while (!send_done || !recv_done) {
-                /* Check if an eager payload was buffered into pending slot */
-                if (ctx->has_pending_ctrl[PG_QP_DIR_FROM_PREV]) {
-                    struct pg_ctrl_msg *hdr = &ctx->pending_ctrl_msg[PG_QP_DIR_FROM_PREV];
-                    if (hdr->tag == PG_CTRL_TAG && hdr->type == PG_CTRL_MSG_EAGER_PAYLOAD) {
-                        uint32_t r_seg = hdr->payload.rdv.seg_idx;
-                        uint32_t k = hdr->payload.rdv.micro_idx;
-                        uint32_t micro_len = hdr->payload.rdv.length;
-                        size_t offset = (size_t)k * PG_PIPELINE_CHUNK;
+                /* Check if an eager payload was buffered into pending queue */
+                struct pg_ctrl_msg hdr;
+                char slot_buf[PG_EAGER_SLOT_SIZE];
+                while (pg_pending_pop_matching(ctx, PG_QP_DIR_FROM_PREV, PG_CTRL_MSG_EAGER_PAYLOAD, (uint32_t)recv_seg, &hdr, slot_buf)) {
+                    uint32_t r_seg = hdr.payload.rdv.seg_idx;
+                    uint32_t k = hdr.payload.rdv.micro_idx;
+                    uint32_t micro_len = hdr.payload.rdv.length;
+                    size_t offset = (size_t)k * ctx->pipeline_chunk;
 
-                        int *dest = (int *)((char *)work_ptr + r_seg * segment_bytes + offset);
-                        int *src = (int *)(ctx->pending_slot_buf[PG_QP_DIR_FROM_PREV] + PG_CTRL_MSG_LEN);
-                        int num_ints = (int)(micro_len / sizeof(int));
-                        for (int i = 0; i < num_ints; i++) {
-                            dest[i] += src[i];
-                        }
+                    size_t r_seg_offset = pg_get_seg_offset_bytes((int)r_seg, count, ctx->size, elem_size);
+                    void *dest = (char *)work_ptr + r_seg_offset + offset;
+                    const void *src = slot_buf + PG_CTRL_MSG_LEN;
+                    int micro_elems = (int)(micro_len / elem_size);
 
-                        if (r_seg < PG_MAX_RANKS) {
-                            eager_recv_step_micros[r_seg]++;
-                            if (r_seg == (uint32_t)recv_seg &&
-                                eager_recv_step_micros[r_seg] == num_micros) {
-                                recv_done = 1;
-                            }
+                    pg_reduce_buffer(dest, src, micro_elems, datatype, op, ctx->use_streaming_stores);
+
+                    if (r_seg < (uint32_t)PG_MAX_RANKS) {
+                        eager_recv_step_micros[r_seg]++;
+                        if (r_seg == (uint32_t)recv_seg &&
+                            eager_recv_step_micros[r_seg] == num_recv_micros) {
+                            recv_done = 1;
                         }
-                        ctx->has_pending_ctrl[PG_QP_DIR_FROM_PREV] = 0;
                     }
                 }
 
-                /* Post 2-SGE eager sends within flow control window */
-                while (eager_posted_micros < num_micros &&
-                       (eager_posted_micros - eager_completed_micros) < (uint32_t)PG_EAGER_WINDOW) {
+                /* Post eager sends within flow control window */
+                while (eager_posted_micros < num_send_micros &&
+                       (eager_posted_micros - eager_completed_micros) < (uint32_t)ctx->eager_window) {
                     uint32_t k = eager_posted_micros;
-                    size_t offset = (size_t)k * PG_PIPELINE_CHUNK;
-                    size_t micro_len = segment_bytes - offset;
-                    if (micro_len > (size_t)PG_PIPELINE_CHUNK) micro_len = PG_PIPELINE_CHUNK;
+                    size_t offset = (size_t)k * ctx->pipeline_chunk;
+                    size_t micro_len = send_seg_bytes - offset;
+                    if (micro_len > ctx->pipeline_chunk) micro_len = ctx->pipeline_chunk;
 
-                    void *local_src = (char *)work_ptr + send_seg * segment_bytes + offset;
+                    void *local_src = (char *)work_ptr + send_seg_offset + offset;
 
-                    struct pg_ctrl_msg hdr;
-                    memset(&hdr, 0, sizeof(hdr));
-                    hdr.tag = PG_CTRL_TAG;
-                    hdr.type = PG_CTRL_MSG_EAGER_PAYLOAD;
-                    hdr.sender_rank = (uint16_t)ctx->rank;
-                    hdr.seq = (uint32_t)(step + 1);
-                    hdr.payload.rdv.seg_idx = (uint32_t)send_seg;
-                    hdr.payload.rdv.micro_idx = k;
-                    hdr.payload.rdv.length = (uint32_t)micro_len;
+                    struct pg_ctrl_msg ehdr;
+                    memset(&ehdr, 0, sizeof(ehdr));
+                    ehdr.tag = PG_CTRL_TAG;
+                    ehdr.type = PG_CTRL_MSG_EAGER_PAYLOAD;
+                    ehdr.sender_rank = (uint16_t)ctx->rank;
+                    ehdr.seq = (uint32_t)(step + 1);
+                    ehdr.payload.rdv.seg_idx = (uint32_t)send_seg;
+                    ehdr.payload.rdv.micro_idx = k;
+                    ehdr.payload.rdv.length = (uint32_t)micro_len;
 
-                    rc = pg_post_eager_send(ctx, PG_QP_DIR_TO_NEXT, &hdr, local_src,
+                    rc = pg_post_eager_send(ctx, PG_QP_DIR_TO_NEXT, &ehdr, local_src,
                                             (uint32_t)micro_len, work_mr->lkey, 1,
-                                            (int)(step * num_micros + k));
+                                            (int)(step * (num_send_micros > 0 ? num_send_micros : 1) + k));
                     if (rc != PG_SUCCESS) {
                         fprintf(stderr, "[pg_reduce_scatter] Rank %d failed to post eager SEND for micro %u\n", ctx->rank, k);
                         return rc;
@@ -1430,7 +1781,7 @@ int pg_reduce_scatter(void *sendbuf, void *recvbuf, int count,
                         case PG_WR_TYPE_EAGER_SEND: {
                             if (qp_dir == PG_QP_DIR_TO_NEXT) {
                                 eager_completed_micros++;
-                                if (eager_completed_micros == num_micros) {
+                                if (eager_completed_micros == num_send_micros) {
                                     send_done = 1;
                                 }
                             }
@@ -1439,34 +1790,32 @@ int pg_reduce_scatter(void *sendbuf, void *recvbuf, int count,
 
                         case PG_WR_TYPE_RECV_CTRL: {
                             if (qp_dir == PG_QP_DIR_FROM_PREV) {
-                                struct pg_ctrl_msg *hdr = pg_recv_slot_msg(ctx, qp_dir, slot);
-                                if (hdr->tag == PG_CTRL_TAG && hdr->type == PG_CTRL_MSG_EAGER_PAYLOAD) {
-                                    uint32_t r_seg = hdr->payload.rdv.seg_idx;
-                                    uint32_t k = hdr->payload.rdv.micro_idx;
-                                    uint32_t micro_len = hdr->payload.rdv.length;
-                                    size_t offset = (size_t)k * PG_PIPELINE_CHUNK;
+                                struct pg_ctrl_msg *rhdr = pg_recv_slot_msg(ctx, qp_dir, slot);
+                                if (rhdr->tag == PG_CTRL_TAG && rhdr->type == PG_CTRL_MSG_EAGER_PAYLOAD &&
+                                    rhdr->payload.rdv.seg_idx == (uint32_t)recv_seg) {
+                                    uint32_t r_seg = rhdr->payload.rdv.seg_idx;
+                                    uint32_t k = rhdr->payload.rdv.micro_idx;
+                                    uint32_t micro_len = rhdr->payload.rdv.length;
+                                    size_t offset = (size_t)k * ctx->pipeline_chunk;
 
-                                    int *dest = (int *)((char *)work_ptr + r_seg * segment_bytes + offset);
-                                    int *src = (int *)pg_recv_slot_payload(ctx, qp_dir, slot);
-                                    int num_ints = (int)(micro_len / sizeof(int));
-                                    for (int i = 0; i < num_ints; i++) {
-                                        dest[i] += src[i];
-                                    }
+                                    size_t r_seg_offset = pg_get_seg_offset_bytes((int)r_seg, count, ctx->size, elem_size);
+                                    void *dest = (char *)work_ptr + r_seg_offset + offset;
+                                    const void *src = pg_recv_slot_payload(ctx, qp_dir, slot);
+                                    int micro_elems = (int)(micro_len / elem_size);
 
-                                    if (r_seg < PG_MAX_RANKS) {
+                                    pg_reduce_buffer(dest, src, micro_elems, datatype, op, ctx->use_streaming_stores);
+
+                                    if (r_seg < (uint32_t)PG_MAX_RANKS) {
                                         eager_recv_step_micros[r_seg]++;
                                         if (r_seg == (uint32_t)recv_seg &&
-                                            eager_recv_step_micros[r_seg] == num_micros) {
+                                            eager_recv_step_micros[r_seg] == num_recv_micros) {
                                             recv_done = 1;
                                         }
                                     }
-                                } else if (hdr->tag == PG_CTRL_TAG) {
-                                    memcpy(ctx->pending_slot_buf[qp_dir], ctx->recv_slot_buf[qp_dir][slot], PG_EAGER_SLOT_SIZE);
-                                    ctx->pending_ctrl_msg[qp_dir] = *hdr;
-                                    ctx->has_pending_ctrl[qp_dir] = 1;
+                                } else if (rhdr->tag == PG_CTRL_TAG) {
+                                    pg_pending_push(ctx, qp_dir, rhdr, ctx->recv_slot_buf[qp_dir][slot]);
                                 }
 
-                                /* Repost receive buffer immediately */
                                 if (pg_repost_recv_slot(ctx, qp_dir, (int)slot)) {
                                     perror("[pg_reduce_scatter] Error reposting recv slot");
                                     return PG_ERR_RDMA;
@@ -1485,22 +1834,39 @@ int pg_reduce_scatter(void *sendbuf, void *recvbuf, int count,
                 if (elapsed >= (double)PG_CTRL_POLL_TIMEOUT_SEC) {
                     fprintf(stderr, "[pg_reduce_scatter] Rank %d eager timed out on step %d: "
                                     "send_done=%d (%u/%u), recv_done=%d (%u/%u)\n",
-                            ctx->rank, step, send_done, eager_completed_micros, num_micros,
-                            recv_done, eager_recv_step_micros[recv_seg], num_micros);
+                            ctx->rank, step, send_done, eager_completed_micros, num_send_micros,
+                            recv_done, eager_recv_step_micros[recv_seg], num_recv_micros);
                     return PG_ERR_TIMEOUT;
                 }
             }
         }
 
-        /* Deliver owned reduced segment (rank) into caller's recvbuf */
-        memcpy(recvbuf, (char *)work_ptr + ctx->rank * segment_bytes, segment_bytes);
+        /* Deliver locally owned segment to recvbuf */
+        int my_seg_elems = pg_get_seg_count(ctx->rank, count, ctx->size);
+        size_t my_seg_bytes = (size_t)my_seg_elems * elem_size;
+        size_t my_seg_offset = pg_get_seg_offset_bytes(ctx->rank, count, ctx->size, elem_size);
+        if (recvbuf != (char *)work_ptr + my_seg_offset) {
+            memcpy(recvbuf, (char *)work_ptr + my_seg_offset, my_seg_bytes);
+        }
+
         return PG_SUCCESS;
     }
 
-    /* Execute size - 1 ring reduction steps (Rendezvous path) */
+    /* Execute size - 1 ring reduction steps (Rendezvous path with Multi-WR Batching) */
     for (int step = 0; step < ctx->size - 1; step++) {
         int send_seg = (ctx->rank - step - 1 + ctx->size) % ctx->size;
         int recv_seg = (ctx->rank - step - 2 + ctx->size) % ctx->size;
+
+        int send_seg_elems = pg_get_seg_count(send_seg, count, ctx->size);
+        size_t send_seg_bytes = (size_t)send_seg_elems * elem_size;
+        size_t send_seg_offset = pg_get_seg_offset_bytes(send_seg, count, ctx->size, elem_size);
+
+        int recv_seg_elems = pg_get_seg_count(recv_seg, count, ctx->size);
+        size_t recv_seg_bytes = (size_t)recv_seg_elems * elem_size;
+        size_t recv_seg_offset = pg_get_seg_offset_bytes(recv_seg, count, ctx->size, elem_size);
+
+        uint32_t num_send_micros = (uint32_t)((send_seg_bytes + ctx->pipeline_chunk - 1) / ctx->pipeline_chunk);
+        uint32_t num_recv_micros = (uint32_t)((recv_seg_bytes + ctx->pipeline_chunk - 1) / ctx->pipeline_chunk);
 
         /* Post RTS to next rank on qp_to_next */
         struct pg_ctrl_msg rts_msg;
@@ -1510,7 +1876,7 @@ int pg_reduce_scatter(void *sendbuf, void *recvbuf, int count,
         rts_msg.sender_rank = (uint16_t)ctx->rank;
         rts_msg.seq = (uint32_t)(step + 1);
         rts_msg.payload.rdv.seg_idx = (uint32_t)send_seg;
-        rts_msg.payload.rdv.length = (uint32_t)segment_bytes;
+        rts_msg.payload.rdv.length = (uint32_t)send_seg_bytes;
 
         rc = pg_post_ctrl_send(ctx, PG_QP_DIR_TO_NEXT, &rts_msg);
         if (rc != PG_SUCCESS) {
@@ -1518,8 +1884,8 @@ int pg_reduce_scatter(void *sendbuf, void *recvbuf, int count,
             return rc;
         }
 
-        int send_done = 0;
-        int recv_done = 0;
+        int send_done = (num_send_micros == 0) ? 1 : 0;
+        int recv_done = (num_recv_micros == 0) ? 1 : 0;
         int cts_received = 0;
         uint64_t remote_staging_addr = 0;
         uint32_t remote_staging_rkey = 0;
@@ -1527,6 +1893,7 @@ int pg_reduce_scatter(void *sendbuf, void *recvbuf, int count,
         uint32_t rdma_posted_micros = 0;
         uint32_t rdma_completed_micros = 0;
         uint32_t data_done_sent_micros = 0;
+        uint32_t data_done_sent_count = 0;
         uint32_t data_done_recv_micros = 0;
         uint32_t send_ctrl_completed_to_next = 0;
         uint32_t send_ctrl_completed_from_prev = 0;
@@ -1536,94 +1903,102 @@ int pg_reduce_scatter(void *sendbuf, void *recvbuf, int count,
 
         while (!send_done || !recv_done) {
             /* Check pending control messages */
-            if (ctx->has_pending_ctrl[PG_QP_DIR_FROM_PREV]) {
-                struct pg_ctrl_msg *pmsg = &ctx->pending_ctrl_msg[PG_QP_DIR_FROM_PREV];
-                if (pmsg->type == PG_CTRL_MSG_RTS && pmsg->payload.rdv.seg_idx == (uint32_t)recv_seg) {
-                    struct pg_ctrl_msg cts_msg;
-                    memset(&cts_msg, 0, sizeof(cts_msg));
-                    cts_msg.tag = PG_CTRL_TAG;
-                    cts_msg.type = PG_CTRL_MSG_CTS;
-                    cts_msg.sender_rank = (uint16_t)ctx->rank;
-                    cts_msg.seq = pmsg->seq;
-                    cts_msg.payload.rdv.remote_addr = (uint64_t)(uintptr_t)ctx->staging_buf;
-                    cts_msg.payload.rdv.rkey = ctx->staging_mr->rkey;
-                    cts_msg.payload.rdv.seg_idx = pmsg->payload.rdv.seg_idx;
-                    cts_msg.payload.rdv.length = pmsg->payload.rdv.length;
+            struct pg_ctrl_msg pmsg;
+            if (pg_pending_pop_matching(ctx, PG_QP_DIR_FROM_PREV, PG_CTRL_MSG_RTS, (uint32_t)recv_seg, &pmsg, NULL)) {
+                struct pg_ctrl_msg cts_msg;
+                memset(&cts_msg, 0, sizeof(cts_msg));
+                cts_msg.tag = PG_CTRL_TAG;
+                cts_msg.type = PG_CTRL_MSG_CTS;
+                cts_msg.sender_rank = (uint16_t)ctx->rank;
+                cts_msg.seq = pmsg.seq;
+                cts_msg.payload.rdv.remote_addr = (uint64_t)(uintptr_t)ctx->staging_buf;
+                cts_msg.payload.rdv.rkey = ctx->staging_mr->rkey;
+                cts_msg.payload.rdv.seg_idx = pmsg.payload.rdv.seg_idx;
+                cts_msg.payload.rdv.length = pmsg.payload.rdv.length;
 
-                    rc = pg_post_ctrl_send(ctx, PG_QP_DIR_FROM_PREV, &cts_msg);
-                    if (rc != PG_SUCCESS) {
-                        fprintf(stderr, "[pg_reduce_scatter] Rank %d failed to send CTS\n", ctx->rank);
-                        return rc;
-                    }
-                    ctx->has_pending_ctrl[PG_QP_DIR_FROM_PREV] = 0;
-                    clock_gettime(CLOCK_MONOTONIC, &start);
-                } else if (pmsg->type == PG_CTRL_MSG_DATA_DONE && pmsg->payload.rdv.seg_idx == (uint32_t)recv_seg && !recv_done) {
-                    uint32_t k = pmsg->payload.rdv.micro_idx;
-                    uint32_t micro_len = pmsg->payload.rdv.length;
-                    size_t offset = (size_t)k * PG_PIPELINE_CHUNK;
+                rc = pg_post_ctrl_send(ctx, PG_QP_DIR_FROM_PREV, &cts_msg);
+                if (rc != PG_SUCCESS) {
+                    fprintf(stderr, "[pg_reduce_scatter] Rank %d failed to send CTS\n", ctx->rank);
+                    return rc;
+                }
+                clock_gettime(CLOCK_MONOTONIC, &start);
+            }
 
-                    int *dest = (int *)((char *)work_ptr + recv_seg * segment_bytes + offset);
-                    int *src = (int *)((char *)ctx->staging_buf + offset);
-                    int num_ints = (int)(micro_len / sizeof(int));
-                    for (int i = 0; i < num_ints; i++) {
-                        dest[i] += src[i];
-                    }
+            while (pg_pending_pop_matching(ctx, PG_QP_DIR_FROM_PREV, PG_CTRL_MSG_DATA_DONE, (uint32_t)recv_seg, &pmsg, NULL)) {
+                uint32_t target_micros = pmsg.payload.rdv.micro_idx;
+                if (target_micros > num_recv_micros) target_micros = num_recv_micros;
+                while (data_done_recv_micros < target_micros) {
+                    uint32_t k = data_done_recv_micros;
+                    size_t offset = (size_t)k * ctx->pipeline_chunk;
+                    size_t micro_len = recv_seg_bytes - offset;
+                    if (micro_len > ctx->pipeline_chunk) micro_len = ctx->pipeline_chunk;
+
+                    void *dest = (char *)work_ptr + recv_seg_offset + offset;
+                    const void *src = (char *)ctx->staging_buf + offset;
+                    int micro_elems = (int)(micro_len / elem_size);
+
+                    pg_reduce_buffer(dest, src, micro_elems, datatype, op, ctx->use_streaming_stores);
                     data_done_recv_micros++;
-                    if (data_done_recv_micros == num_micros && send_ctrl_completed_from_prev >= 1) {
-                        recv_done = 1;
-                    }
-                    ctx->has_pending_ctrl[PG_QP_DIR_FROM_PREV] = 0;
-                    clock_gettime(CLOCK_MONOTONIC, &start);
                 }
+                if (data_done_recv_micros == num_recv_micros && send_ctrl_completed_from_prev >= 1) {
+                    recv_done = 1;
+                }
+                clock_gettime(CLOCK_MONOTONIC, &start);
             }
 
-            if (ctx->has_pending_ctrl[PG_QP_DIR_TO_NEXT]) {
-                struct pg_ctrl_msg *pmsg = &ctx->pending_ctrl_msg[PG_QP_DIR_TO_NEXT];
-                if (pmsg->type == PG_CTRL_MSG_CTS && pmsg->payload.rdv.seg_idx == (uint32_t)send_seg && !cts_received) {
-                    cts_received = 1;
-                    remote_staging_addr = pmsg->payload.rdv.remote_addr;
-                    remote_staging_rkey = pmsg->payload.rdv.rkey;
-                    ctx->has_pending_ctrl[PG_QP_DIR_TO_NEXT] = 0;
-                    clock_gettime(CLOCK_MONOTONIC, &start);
-                }
+            if (!cts_received && pg_pending_pop_matching(ctx, PG_QP_DIR_TO_NEXT, PG_CTRL_MSG_CTS, (uint32_t)send_seg, &pmsg, NULL)) {
+                cts_received = 1;
+                remote_staging_addr = pmsg.payload.rdv.remote_addr;
+                remote_staging_rkey = pmsg.payload.rdv.rkey;
+                clock_gettime(CLOCK_MONOTONIC, &start);
             }
 
-            /* Post RDMA Writes within window */
-            while (cts_received && rdma_posted_micros < num_micros &&
-                   (rdma_posted_micros - rdma_completed_micros) < (uint32_t)PG_RDMA_WINDOW) {
-                uint32_t k = rdma_posted_micros;
-                size_t offset = (size_t)k * PG_PIPELINE_CHUNK;
-                size_t micro_len = segment_bytes - offset;
-                if (micro_len > (size_t)PG_PIPELINE_CHUNK) micro_len = PG_PIPELINE_CHUNK;
+            /* Post batched RDMA Writes within window */
+            while (cts_received && rdma_posted_micros < num_send_micros &&
+                   (rdma_posted_micros - rdma_completed_micros) < (uint32_t)ctx->rdma_window) {
+                uint32_t in_flight = rdma_posted_micros - rdma_completed_micros;
+                uint32_t win_avail = (uint32_t)ctx->rdma_window - in_flight;
+                uint32_t remaining = num_send_micros - rdma_posted_micros;
+                uint32_t to_post = win_avail < remaining ? win_avail : remaining;
+                if (to_post > (uint32_t)ctx->batch_size) to_post = (uint32_t)ctx->batch_size;
+                if (to_post > 64) to_post = 64;
+                if (to_post == 0) break;
 
-                void *local_src = (char *)work_ptr + send_seg * segment_bytes + offset;
-                uint64_t remote_addr = remote_staging_addr + offset;
+                struct ibv_sge sges[64];
+                struct ibv_send_wr wrs[64];
+                memset(wrs, 0, sizeof(struct ibv_send_wr) * to_post);
 
-                struct ibv_sge sge = {
-                    .addr   = (uintptr_t)local_src,
-                    .length = (uint32_t)micro_len,
-                    .lkey   = work_mr->lkey
-                };
-                struct ibv_send_wr wr = {
-                    .wr_id      = pg_make_wr_slot(PG_QP_DIR_TO_NEXT, PG_WR_TYPE_RDMA_WRITE, k),
-                    .opcode     = IBV_WR_RDMA_WRITE,
-                    .send_flags = IBV_SEND_SIGNALED,
-                    .sg_list    = &sge,
-                    .num_sge    = 1,
-                    .next       = NULL,
-                    .wr         = {
-                        .rdma = {
-                            .remote_addr = remote_addr,
-                            .rkey        = remote_staging_rkey
-                        }
-                    }
-                };
+                for (uint32_t b = 0; b < to_post; b++) {
+                    uint32_t k = rdma_posted_micros + b;
+                    size_t offset = (size_t)k * ctx->pipeline_chunk;
+                    size_t micro_len = send_seg_bytes - offset;
+                    if (micro_len > ctx->pipeline_chunk) micro_len = ctx->pipeline_chunk;
+
+                    void *local_src = (char *)work_ptr + send_seg_offset + offset;
+                    uint64_t remote_addr = remote_staging_addr + offset;
+
+                    int is_signaled = ((k + 1) % ctx->rdma_signal_interval == 0 || (k + 1) == num_send_micros);
+
+                    sges[b].addr   = (uintptr_t)local_src;
+                    sges[b].length = (uint32_t)micro_len;
+                    sges[b].lkey   = work_mr->lkey;
+
+                    wrs[b].wr_id      = pg_make_wr_slot(PG_QP_DIR_TO_NEXT, PG_WR_TYPE_RDMA_WRITE, k);
+                    wrs[b].opcode     = IBV_WR_RDMA_WRITE;
+                    wrs[b].send_flags = is_signaled ? IBV_SEND_SIGNALED : 0;
+                    wrs[b].sg_list    = &sges[b];
+                    wrs[b].num_sge    = 1;
+                    wrs[b].next       = (b + 1 < to_post) ? &wrs[b + 1] : NULL;
+                    wrs[b].wr.rdma.remote_addr = remote_addr;
+                    wrs[b].wr.rdma.rkey        = remote_staging_rkey;
+                }
+
                 struct ibv_send_wr *bad_wr = NULL;
-                if (ibv_post_send(ctx->qp_to_next, &wr, &bad_wr)) {
-                    perror("[pg_reduce_scatter] Error: ibv_post_send failed for micro RDMA Write");
+                if (ibv_post_send(ctx->qp_to_next, &wrs[0], &bad_wr)) {
+                    perror("[pg_reduce_scatter] Error: ibv_post_send failed for batched RDMA Write");
                     return PG_ERR_RDMA;
                 }
-                rdma_posted_micros++;
+                rdma_posted_micros += to_post;
                 clock_gettime(CLOCK_MONOTONIC, &start);
             }
 
@@ -1688,23 +2063,26 @@ int pg_reduce_scatter(void *sendbuf, void *recvbuf, int count,
                             remote_staging_rkey = recv_msg.payload.rdv.rkey;
                         } else if (recv_msg.type == PG_CTRL_MSG_DATA_DONE && qp_dir == PG_QP_DIR_FROM_PREV &&
                                    recv_msg.payload.rdv.seg_idx == (uint32_t)recv_seg && !recv_done) {
-                            uint32_t k = recv_msg.payload.rdv.micro_idx;
-                            uint32_t micro_len = recv_msg.payload.rdv.length;
-                            size_t offset = (size_t)k * PG_PIPELINE_CHUNK;
+                            uint32_t target_micros = recv_msg.payload.rdv.micro_idx;
+                            if (target_micros > num_recv_micros) target_micros = num_recv_micros;
+                            while (data_done_recv_micros < target_micros) {
+                                uint32_t k = data_done_recv_micros;
+                                size_t offset = (size_t)k * ctx->pipeline_chunk;
+                                size_t micro_len = recv_seg_bytes - offset;
+                                if (micro_len > ctx->pipeline_chunk) micro_len = ctx->pipeline_chunk;
 
-                            int *dest = (int *)((char *)work_ptr + recv_seg * segment_bytes + offset);
-                            int *src = (int *)((char *)ctx->staging_buf + offset);
-                            int num_ints = (int)(micro_len / sizeof(int));
-                            for (int i = 0; i < num_ints; i++) {
-                                dest[i] += src[i];
+                                void *dest = (char *)work_ptr + recv_seg_offset + offset;
+                                const void *src = (char *)ctx->staging_buf + offset;
+                                int micro_elems = (int)(micro_len / elem_size);
+
+                                pg_reduce_buffer(dest, src, micro_elems, datatype, op, ctx->use_streaming_stores);
+                                data_done_recv_micros++;
                             }
-                            data_done_recv_micros++;
-                            if (data_done_recv_micros == num_micros && send_ctrl_completed_from_prev >= 1) {
+                            if (data_done_recv_micros == num_recv_micros && send_ctrl_completed_from_prev >= 1) {
                                 recv_done = 1;
                             }
                         } else {
-                            ctx->pending_ctrl_msg[qp_dir] = recv_msg;
-                            ctx->has_pending_ctrl[qp_dir] = 1;
+                            pg_pending_push(ctx, qp_dir, &recv_msg, ctx->recv_slot_buf[qp_dir][slot]);
                         }
                         break;
                     }
@@ -1712,28 +2090,29 @@ int pg_reduce_scatter(void *sendbuf, void *recvbuf, int count,
                     case PG_WR_TYPE_RDMA_WRITE: {
                         if (qp_dir == PG_QP_DIR_TO_NEXT) {
                             uint32_t k = slot;
-                            rdma_completed_micros++;
-
-                            size_t offset = (size_t)k * PG_PIPELINE_CHUNK;
-                            size_t micro_len = segment_bytes - offset;
-                            if (micro_len > (size_t)PG_PIPELINE_CHUNK) micro_len = PG_PIPELINE_CHUNK;
-
-                            struct pg_ctrl_msg done_msg;
-                            memset(&done_msg, 0, sizeof(done_msg));
-                            done_msg.tag = PG_CTRL_TAG;
-                            done_msg.type = PG_CTRL_MSG_DATA_DONE;
-                            done_msg.sender_rank = (uint16_t)ctx->rank;
-                            done_msg.seq = (uint32_t)(step + 1);
-                            done_msg.payload.rdv.seg_idx = (uint32_t)send_seg;
-                            done_msg.payload.rdv.micro_idx = k;
-                            done_msg.payload.rdv.length = (uint32_t)micro_len;
-
-                            rc = pg_post_ctrl_send(ctx, PG_QP_DIR_TO_NEXT, &done_msg);
-                            if (rc != PG_SUCCESS) {
-                                fprintf(stderr, "[pg_reduce_scatter] Rank %d failed to send DATA_DONE for micro %u\n", ctx->rank, k);
-                                return rc;
+                            if (k + 1 > rdma_completed_micros) {
+                                rdma_completed_micros = k + 1;
                             }
-                            data_done_sent_micros++;
+
+                            if (data_done_sent_micros < rdma_completed_micros) {
+                                struct pg_ctrl_msg done_msg;
+                                memset(&done_msg, 0, sizeof(done_msg));
+                                done_msg.tag = PG_CTRL_TAG;
+                                done_msg.type = PG_CTRL_MSG_DATA_DONE;
+                                done_msg.sender_rank = (uint16_t)ctx->rank;
+                                done_msg.seq = (uint32_t)(step + 1);
+                                done_msg.payload.rdv.seg_idx = (uint32_t)send_seg;
+                                done_msg.payload.rdv.micro_idx = rdma_completed_micros;
+                                done_msg.payload.rdv.length = (uint32_t)send_seg_bytes;
+
+                                rc = pg_post_ctrl_send(ctx, PG_QP_DIR_TO_NEXT, &done_msg);
+                                if (rc != PG_SUCCESS) {
+                                    fprintf(stderr, "[pg_reduce_scatter] Rank %d failed to send DATA_DONE for micro %u\n", ctx->rank, rdma_completed_micros);
+                                    return rc;
+                                }
+                                data_done_sent_micros = rdma_completed_micros;
+                                data_done_sent_count++;
+                            }
                         }
                         break;
                     }
@@ -1741,13 +2120,14 @@ int pg_reduce_scatter(void *sendbuf, void *recvbuf, int count,
                     case PG_WR_TYPE_SEND_CTRL: {
                         if (qp_dir == PG_QP_DIR_TO_NEXT) {
                             send_ctrl_completed_to_next++;
-                            if (rdma_completed_micros == num_micros &&
-                                send_ctrl_completed_to_next == (1 + num_micros)) {
+                            if (rdma_completed_micros == num_send_micros &&
+                                data_done_sent_micros == num_send_micros &&
+                                send_ctrl_completed_to_next >= (1 + data_done_sent_count)) {
                                 send_done = 1;
                             }
                         } else if (qp_dir == PG_QP_DIR_FROM_PREV) {
                             send_ctrl_completed_from_prev++;
-                            if (data_done_recv_micros == num_micros &&
+                            if (data_done_recv_micros == num_recv_micros &&
                                 send_ctrl_completed_from_prev >= 1) {
                                 recv_done = 1;
                             }
@@ -1766,29 +2146,35 @@ int pg_reduce_scatter(void *sendbuf, void *recvbuf, int count,
                 fprintf(stderr, "[pg_reduce_scatter] Rank %d timed out on step %d:\n"
                                 "  send_done=%d (cts=%d, rdma_post=%u/%u, rdma_comp=%u/%u, done_sent=%u/%u)\n"
                                 "  recv_done=%d (done_recv=%u/%u)\n",
-                        ctx->rank, step, send_done, cts_received, rdma_posted_micros, num_micros,
-                        rdma_completed_micros, num_micros, data_done_sent_micros, num_micros,
-                        recv_done, data_done_recv_micros, num_micros);
+                        ctx->rank, step, send_done, cts_received, rdma_posted_micros, num_send_micros,
+                        rdma_completed_micros, num_send_micros, data_done_sent_micros, num_send_micros,
+                        recv_done, data_done_recv_micros, num_recv_micros);
                 return PG_ERR_TIMEOUT;
             }
         }
     }
 
     /* Deliver owned reduced segment (rank) into caller's recvbuf */
-    memcpy(recvbuf, (char *)work_ptr + ctx->rank * segment_bytes, segment_bytes);
+    int my_seg_elems = pg_get_seg_count(ctx->rank, count, ctx->size);
+    size_t my_seg_bytes = (size_t)my_seg_elems * elem_size;
+    size_t my_seg_offset = pg_get_seg_offset_bytes(ctx->rank, count, ctx->size, elem_size);
+    if (recvbuf != (char *)work_ptr + my_seg_offset) {
+        memcpy(recvbuf, (char *)work_ptr + my_seg_offset, my_seg_bytes);
+    }
 
     return PG_SUCCESS;
 }
 
-/* Ring All-Gather Core Engine (Zero-Copy RDMA Write into final recvbuf) */
-int pg_ring_all_gather_core(struct pg_context *ctx, void *recvbuf, size_t segment_bytes) {
-    if (!ctx || !recvbuf || segment_bytes == 0) return PG_ERR_INVAL;
+/* Ring All-Gather Generalized Engine (Zero-Copy RDMA Write into final recvbuf with Multi-WR Batching) */
+int pg_ring_all_gather_generalized(struct pg_context *ctx, void *recvbuf, int count, DATATYPE datatype) {
+    if (!ctx || !recvbuf || count <= 0) return PG_ERR_INVAL;
 
     if (ctx->size == 1) {
         return PG_SUCCESS;
     }
 
-    size_t total_bytes = segment_bytes * (size_t)ctx->size;
+    size_t elem_size = pg_get_datatype_size(datatype);
+    size_t total_bytes = (size_t)count * elem_size;
 
     /* Register full recvbuf with local and remote write access */
     struct ibv_mr *recv_mr = pg_get_or_reg_mr(ctx, recvbuf, total_bytes,
@@ -1799,27 +2185,41 @@ int pg_ring_all_gather_core(struct pg_context *ctx, void *recvbuf, size_t segmen
         return PG_ERR_RDMA;
     }
 
-    uint32_t num_micros = (uint32_t)((segment_bytes + PG_PIPELINE_CHUNK - 1) / PG_PIPELINE_CHUNK);
+    int rc = PG_SUCCESS;
+    int max_seg_elems = pg_get_seg_count(0, count, ctx->size);
+    size_t max_seg_bytes = (size_t)max_seg_elems * elem_size;
+    (void)max_seg_bytes;
 
     int is_eager = 0;
 #if (PG_ACTIVE_MODE == PG_MODE_TYPE_EAGER)
     is_eager = 1;
 #elif (PG_ACTIVE_MODE == PG_MODE_TYPE_AUTO)
-    if (segment_bytes <= PG_EAGER_THRESHOLD) {
+    if (max_seg_bytes <= ctx->eager_threshold) {
         is_eager = 1;
     }
 #endif
 
     if (is_eager) {
-        /* Eager payload SEND ring gathering steps (ADR-0002 & V9) */
+        /* Eager payload SEND all-gather ring steps (ADR-0002 & V9) */
         uint32_t eager_recv_step_micros[PG_MAX_RANKS] = {0};
 
         for (int step = 0; step < ctx->size - 1; step++) {
             int send_origin = (ctx->rank - step + ctx->size) % ctx->size;
             int recv_origin = (ctx->rank - step - 1 + ctx->size) % ctx->size;
 
-            int send_done = 0;
-            int recv_done = (eager_recv_step_micros[recv_origin] == num_micros) ? 1 : 0;
+            int send_seg_elems = pg_get_seg_count(send_origin, count, ctx->size);
+            size_t send_seg_bytes = (size_t)send_seg_elems * elem_size;
+            size_t send_seg_offset = pg_get_seg_offset_bytes(send_origin, count, ctx->size, elem_size);
+
+            int recv_seg_elems = pg_get_seg_count(recv_origin, count, ctx->size);
+            size_t recv_seg_bytes = (size_t)recv_seg_elems * elem_size;
+            (void)recv_seg_elems;
+
+            uint32_t num_send_micros = (uint32_t)((send_seg_bytes + ctx->pipeline_chunk - 1) / ctx->pipeline_chunk);
+            uint32_t num_recv_micros = (uint32_t)((recv_seg_bytes + ctx->pipeline_chunk - 1) / ctx->pipeline_chunk);
+
+            int send_done = (num_send_micros == 0) ? 1 : 0;
+            int recv_done = (num_recv_micros == 0 || eager_recv_step_micros[recv_origin] == num_recv_micros) ? 1 : 0;
             uint32_t eager_posted_micros = 0;
             uint32_t eager_completed_micros = 0;
 
@@ -1827,52 +2227,51 @@ int pg_ring_all_gather_core(struct pg_context *ctx, void *recvbuf, size_t segmen
             clock_gettime(CLOCK_MONOTONIC, &start);
 
             while (!send_done || !recv_done) {
-                /* Check if an eager payload was buffered into pending slot */
-                if (ctx->has_pending_ctrl[PG_QP_DIR_FROM_PREV]) {
-                    struct pg_ctrl_msg *hdr = &ctx->pending_ctrl_msg[PG_QP_DIR_FROM_PREV];
-                    if (hdr->tag == PG_CTRL_TAG && hdr->type == PG_CTRL_MSG_EAGER_PAYLOAD) {
-                        uint32_t r_origin = hdr->payload.rdv.seg_idx;
-                        uint32_t k = hdr->payload.rdv.micro_idx;
-                        uint32_t micro_len = hdr->payload.rdv.length;
-                        size_t offset = (size_t)k * PG_PIPELINE_CHUNK;
+                /* Check pending eager payload queue */
+                struct pg_ctrl_msg hdr;
+                char slot_buf[PG_EAGER_SLOT_SIZE];
+                while (pg_pending_pop_matching(ctx, PG_QP_DIR_FROM_PREV, PG_CTRL_MSG_EAGER_PAYLOAD, (uint32_t)recv_origin, &hdr, slot_buf)) {
+                    uint32_t r_origin = hdr.payload.rdv.seg_idx;
+                    uint32_t k = hdr.payload.rdv.micro_idx;
+                    uint32_t micro_len = hdr.payload.rdv.length;
+                    size_t offset = (size_t)k * ctx->pipeline_chunk;
 
-                        void *dest = (char *)recvbuf + r_origin * segment_bytes + offset;
-                        memcpy(dest, ctx->pending_slot_buf[PG_QP_DIR_FROM_PREV] + PG_CTRL_MSG_LEN, micro_len);
+                    size_t r_origin_offset = pg_get_seg_offset_bytes((int)r_origin, count, ctx->size, elem_size);
+                    void *dest = (char *)recvbuf + r_origin_offset + offset;
+                    memcpy(dest, slot_buf + PG_CTRL_MSG_LEN, micro_len);
 
-                        if (r_origin < PG_MAX_RANKS) {
-                            eager_recv_step_micros[r_origin]++;
-                            if (r_origin == (uint32_t)recv_origin &&
-                                eager_recv_step_micros[r_origin] == num_micros) {
-                                recv_done = 1;
-                            }
+                    if (r_origin < (uint32_t)PG_MAX_RANKS) {
+                        eager_recv_step_micros[r_origin]++;
+                        if (r_origin == (uint32_t)recv_origin &&
+                            eager_recv_step_micros[r_origin] == num_recv_micros) {
+                            recv_done = 1;
                         }
-                        ctx->has_pending_ctrl[PG_QP_DIR_FROM_PREV] = 0;
                     }
                 }
 
-                /* Post 2-SGE eager sends within flow control window */
-                while (eager_posted_micros < num_micros &&
-                       (eager_posted_micros - eager_completed_micros) < (uint32_t)PG_EAGER_WINDOW) {
+                /* Post eager sends within flow control window */
+                while (eager_posted_micros < num_send_micros &&
+                       (eager_posted_micros - eager_completed_micros) < (uint32_t)ctx->eager_window) {
                     uint32_t k = eager_posted_micros;
-                    size_t offset = (size_t)k * PG_PIPELINE_CHUNK;
-                    size_t micro_len = segment_bytes - offset;
-                    if (micro_len > (size_t)PG_PIPELINE_CHUNK) micro_len = PG_PIPELINE_CHUNK;
+                    size_t offset = (size_t)k * ctx->pipeline_chunk;
+                    size_t micro_len = send_seg_bytes - offset;
+                    if (micro_len > ctx->pipeline_chunk) micro_len = ctx->pipeline_chunk;
 
-                    void *local_src = (char *)recvbuf + send_origin * segment_bytes + offset;
+                    void *local_src = (char *)recvbuf + send_seg_offset + offset;
 
-                    struct pg_ctrl_msg hdr;
-                    memset(&hdr, 0, sizeof(hdr));
-                    hdr.tag = PG_CTRL_TAG;
-                    hdr.type = PG_CTRL_MSG_EAGER_PAYLOAD;
-                    hdr.sender_rank = (uint16_t)ctx->rank;
-                    hdr.seq = (uint32_t)(step + 1);
-                    hdr.payload.rdv.seg_idx = (uint32_t)send_origin;
-                    hdr.payload.rdv.micro_idx = k;
-                    hdr.payload.rdv.length = (uint32_t)micro_len;
+                    struct pg_ctrl_msg ehdr;
+                    memset(&ehdr, 0, sizeof(ehdr));
+                    ehdr.tag = PG_CTRL_TAG;
+                    ehdr.type = PG_CTRL_MSG_EAGER_PAYLOAD;
+                    ehdr.sender_rank = (uint16_t)ctx->rank;
+                    ehdr.seq = (uint32_t)(step + 1);
+                    ehdr.payload.rdv.seg_idx = (uint32_t)send_origin;
+                    ehdr.payload.rdv.micro_idx = k;
+                    ehdr.payload.rdv.length = (uint32_t)micro_len;
 
-                    int rc = pg_post_eager_send(ctx, PG_QP_DIR_TO_NEXT, &hdr, local_src,
-                                                (uint32_t)micro_len, recv_mr->lkey, 1,
-                                                (int)(step * num_micros + k));
+                    rc = pg_post_eager_send(ctx, PG_QP_DIR_TO_NEXT, &ehdr, local_src,
+                                            (uint32_t)micro_len, recv_mr->lkey, 1,
+                                            (int)(step * (num_send_micros > 0 ? num_send_micros : 1) + k));
                     if (rc != PG_SUCCESS) {
                         fprintf(stderr, "[pg_all_gather] Rank %d failed to post eager SEND for micro %u\n", ctx->rank, k);
                         return rc;
@@ -1906,7 +2305,7 @@ int pg_ring_all_gather_core(struct pg_context *ctx, void *recvbuf, size_t segmen
                         case PG_WR_TYPE_EAGER_SEND: {
                             if (qp_dir == PG_QP_DIR_TO_NEXT) {
                                 eager_completed_micros++;
-                                if (eager_completed_micros == num_micros) {
+                                if (eager_completed_micros == num_send_micros) {
                                     send_done = 1;
                                 }
                             }
@@ -1915,30 +2314,29 @@ int pg_ring_all_gather_core(struct pg_context *ctx, void *recvbuf, size_t segmen
 
                         case PG_WR_TYPE_RECV_CTRL: {
                             if (qp_dir == PG_QP_DIR_FROM_PREV) {
-                                struct pg_ctrl_msg *hdr = pg_recv_slot_msg(ctx, qp_dir, slot);
-                                if (hdr->tag == PG_CTRL_TAG && hdr->type == PG_CTRL_MSG_EAGER_PAYLOAD) {
-                                    uint32_t r_origin = hdr->payload.rdv.seg_idx;
-                                    uint32_t k = hdr->payload.rdv.micro_idx;
-                                    uint32_t micro_len = hdr->payload.rdv.length;
-                                    size_t offset = (size_t)k * PG_PIPELINE_CHUNK;
+                                struct pg_ctrl_msg *rhdr = pg_recv_slot_msg(ctx, qp_dir, slot);
+                                if (rhdr->tag == PG_CTRL_TAG && rhdr->type == PG_CTRL_MSG_EAGER_PAYLOAD &&
+                                    rhdr->payload.rdv.seg_idx == (uint32_t)recv_origin) {
+                                    uint32_t r_origin = rhdr->payload.rdv.seg_idx;
+                                    uint32_t k = rhdr->payload.rdv.micro_idx;
+                                    uint32_t micro_len = rhdr->payload.rdv.length;
+                                    size_t offset = (size_t)k * ctx->pipeline_chunk;
 
-                                    void *dest = (char *)recvbuf + r_origin * segment_bytes + offset;
+                                    size_t r_origin_offset = pg_get_seg_offset_bytes((int)r_origin, count, ctx->size, elem_size);
+                                    void *dest = (char *)recvbuf + r_origin_offset + offset;
                                     memcpy(dest, pg_recv_slot_payload(ctx, qp_dir, slot), micro_len);
 
-                                    if (r_origin < PG_MAX_RANKS) {
+                                    if (r_origin < (uint32_t)PG_MAX_RANKS) {
                                         eager_recv_step_micros[r_origin]++;
                                         if (r_origin == (uint32_t)recv_origin &&
-                                            eager_recv_step_micros[r_origin] == num_micros) {
+                                            eager_recv_step_micros[r_origin] == num_recv_micros) {
                                             recv_done = 1;
                                         }
                                     }
-                                } else if (hdr->tag == PG_CTRL_TAG) {
-                                    memcpy(ctx->pending_slot_buf[qp_dir], ctx->recv_slot_buf[qp_dir][slot], PG_EAGER_SLOT_SIZE);
-                                    ctx->pending_ctrl_msg[qp_dir] = *hdr;
-                                    ctx->has_pending_ctrl[qp_dir] = 1;
+                                } else if (rhdr->tag == PG_CTRL_TAG) {
+                                    pg_pending_push(ctx, qp_dir, rhdr, ctx->recv_slot_buf[qp_dir][slot]);
                                 }
 
-                                /* Repost receive buffer immediately */
                                 if (pg_repost_recv_slot(ctx, qp_dir, (int)slot)) {
                                     perror("[pg_all_gather] Error reposting recv slot");
                                     return PG_ERR_RDMA;
@@ -1957,8 +2355,8 @@ int pg_ring_all_gather_core(struct pg_context *ctx, void *recvbuf, size_t segmen
                 if (elapsed >= (double)PG_CTRL_POLL_TIMEOUT_SEC) {
                     fprintf(stderr, "[pg_all_gather] Rank %d eager timed out on step %d: "
                                     "send_done=%d (%u/%u), recv_done=%d (%u/%u)\n",
-                            ctx->rank, step, send_done, eager_completed_micros, num_micros,
-                            recv_done, eager_recv_step_micros[recv_origin], num_micros);
+                            ctx->rank, step, send_done, eager_completed_micros, num_send_micros,
+                            recv_done, eager_recv_step_micros[recv_origin], num_recv_micros);
                     return PG_ERR_TIMEOUT;
                 }
             }
@@ -1967,10 +2365,21 @@ int pg_ring_all_gather_core(struct pg_context *ctx, void *recvbuf, size_t segmen
         return PG_SUCCESS;
     }
 
-    /* Execute size - 1 ring gathering steps (Rendezvous path) */
+    /* Execute size - 1 ring gathering steps (Rendezvous path with Multi-WR Batching) */
     for (int step = 0; step < ctx->size - 1; step++) {
         int send_origin = (ctx->rank - step + ctx->size) % ctx->size;
         int recv_origin = (ctx->rank - step - 1 + ctx->size) % ctx->size;
+
+        int send_seg_elems = pg_get_seg_count(send_origin, count, ctx->size);
+        size_t send_seg_bytes = (size_t)send_seg_elems * elem_size;
+        size_t send_seg_offset = pg_get_seg_offset_bytes(send_origin, count, ctx->size, elem_size);
+
+        int recv_seg_elems = pg_get_seg_count(recv_origin, count, ctx->size);
+        size_t recv_seg_bytes = (size_t)recv_seg_elems * elem_size;
+        size_t recv_seg_offset = pg_get_seg_offset_bytes(recv_origin, count, ctx->size, elem_size);
+
+        uint32_t num_send_micros = (uint32_t)((send_seg_bytes + ctx->pipeline_chunk - 1) / ctx->pipeline_chunk);
+        uint32_t num_recv_micros = (uint32_t)((recv_seg_bytes + ctx->pipeline_chunk - 1) / ctx->pipeline_chunk);
 
         /* Post RTS to next rank on qp_to_next */
         struct pg_ctrl_msg rts_msg;
@@ -1980,16 +2389,16 @@ int pg_ring_all_gather_core(struct pg_context *ctx, void *recvbuf, size_t segmen
         rts_msg.sender_rank = (uint16_t)ctx->rank;
         rts_msg.seq = (uint32_t)(step + 1);
         rts_msg.payload.rdv.seg_idx = (uint32_t)send_origin;
-        rts_msg.payload.rdv.length = (uint32_t)segment_bytes;
+        rts_msg.payload.rdv.length = (uint32_t)send_seg_bytes;
 
-        int rc = pg_post_ctrl_send(ctx, PG_QP_DIR_TO_NEXT, &rts_msg);
+        rc = pg_post_ctrl_send(ctx, PG_QP_DIR_TO_NEXT, &rts_msg);
         if (rc != PG_SUCCESS) {
             fprintf(stderr, "[pg_all_gather] Rank %d failed to send RTS for step %d\n", ctx->rank, step);
             return rc;
         }
 
-        int send_done = 0;
-        int recv_done = 0;
+        int send_done = (num_send_micros == 0) ? 1 : 0;
+        int recv_done = (num_recv_micros == 0) ? 1 : 0;
         int cts_received = 0;
         uint64_t remote_recv_addr = 0;
         uint32_t remote_recv_rkey = 0;
@@ -2006,86 +2415,88 @@ int pg_ring_all_gather_core(struct pg_context *ctx, void *recvbuf, size_t segmen
 
         while (!send_done || !recv_done) {
             /* Check pending control messages */
-            if (ctx->has_pending_ctrl[PG_QP_DIR_FROM_PREV]) {
-                struct pg_ctrl_msg *pmsg = &ctx->pending_ctrl_msg[PG_QP_DIR_FROM_PREV];
-                if (pmsg->type == PG_CTRL_MSG_RTS && pmsg->payload.rdv.seg_idx == (uint32_t)recv_origin) {
-                    struct pg_ctrl_msg cts_msg;
-                    memset(&cts_msg, 0, sizeof(cts_msg));
-                    cts_msg.tag = PG_CTRL_TAG;
-                    cts_msg.type = PG_CTRL_MSG_CTS;
-                    cts_msg.sender_rank = (uint16_t)ctx->rank;
-                    cts_msg.seq = pmsg->seq;
-                    cts_msg.payload.rdv.remote_addr = (uint64_t)(uintptr_t)((char *)recvbuf + recv_origin * segment_bytes);
-                    cts_msg.payload.rdv.rkey = recv_mr->rkey;
-                    cts_msg.payload.rdv.seg_idx = pmsg->payload.rdv.seg_idx;
-                    cts_msg.payload.rdv.length = pmsg->payload.rdv.length;
+            struct pg_ctrl_msg pmsg;
+            if (pg_pending_pop_matching(ctx, PG_QP_DIR_FROM_PREV, PG_CTRL_MSG_RTS, (uint32_t)recv_origin, &pmsg, NULL)) {
+                struct pg_ctrl_msg cts_msg;
+                memset(&cts_msg, 0, sizeof(cts_msg));
+                cts_msg.tag = PG_CTRL_TAG;
+                cts_msg.type = PG_CTRL_MSG_CTS;
+                cts_msg.sender_rank = (uint16_t)ctx->rank;
+                cts_msg.seq = pmsg.seq;
+                cts_msg.payload.rdv.remote_addr = (uint64_t)(uintptr_t)((char *)recvbuf + recv_seg_offset);
+                cts_msg.payload.rdv.rkey = recv_mr->rkey;
+                cts_msg.payload.rdv.seg_idx = pmsg.payload.rdv.seg_idx;
+                cts_msg.payload.rdv.length = pmsg.payload.rdv.length;
 
-                    rc = pg_post_ctrl_send(ctx, PG_QP_DIR_FROM_PREV, &cts_msg);
-                    if (rc != PG_SUCCESS) {
-                        fprintf(stderr, "[pg_all_gather] Rank %d failed to send CTS\n", ctx->rank);
-                        return rc;
-                    }
-                    ctx->has_pending_ctrl[PG_QP_DIR_FROM_PREV] = 0;
-                    clock_gettime(CLOCK_MONOTONIC, &start);
-                } else if (pmsg->type == PG_CTRL_MSG_DATA_DONE && pmsg->payload.rdv.seg_idx == (uint32_t)recv_origin && !recv_done) {
-                    data_done_recv = 1;
-                    if (send_ctrl_completed_from_prev >= 1) {
-                        recv_done = 1;
-                    }
-                    ctx->has_pending_ctrl[PG_QP_DIR_FROM_PREV] = 0;
-                    clock_gettime(CLOCK_MONOTONIC, &start);
+                rc = pg_post_ctrl_send(ctx, PG_QP_DIR_FROM_PREV, &cts_msg);
+                if (rc != PG_SUCCESS) {
+                    fprintf(stderr, "[pg_all_gather] Rank %d failed to send CTS\n", ctx->rank);
+                    return rc;
                 }
+                clock_gettime(CLOCK_MONOTONIC, &start);
             }
 
-            if (ctx->has_pending_ctrl[PG_QP_DIR_TO_NEXT]) {
-                struct pg_ctrl_msg *pmsg = &ctx->pending_ctrl_msg[PG_QP_DIR_TO_NEXT];
-                if (pmsg->type == PG_CTRL_MSG_CTS && pmsg->payload.rdv.seg_idx == (uint32_t)send_origin && !cts_received) {
-                    cts_received = 1;
-                    remote_recv_addr = pmsg->payload.rdv.remote_addr;
-                    remote_recv_rkey = pmsg->payload.rdv.rkey;
-                    ctx->has_pending_ctrl[PG_QP_DIR_TO_NEXT] = 0;
-                    clock_gettime(CLOCK_MONOTONIC, &start);
+            if (!data_done_recv && pg_pending_pop_matching(ctx, PG_QP_DIR_FROM_PREV, PG_CTRL_MSG_DATA_DONE, (uint32_t)recv_origin, &pmsg, NULL)) {
+                data_done_recv = 1;
+                if (send_ctrl_completed_from_prev >= 1) {
+                    recv_done = 1;
                 }
+                clock_gettime(CLOCK_MONOTONIC, &start);
             }
 
-            /* Post micro-chunk RDMA Writes within window */
-            while (cts_received && rdma_posted_micros < num_micros &&
-                   (rdma_posted_micros - rdma_completed_micros) < (uint32_t)PG_RDMA_WINDOW) {
-                uint32_t k = rdma_posted_micros;
-                size_t offset = (size_t)k * PG_PIPELINE_CHUNK;
-                size_t micro_len = segment_bytes - offset;
-                if (micro_len > (size_t)PG_PIPELINE_CHUNK) micro_len = PG_PIPELINE_CHUNK;
+            if (!cts_received && pg_pending_pop_matching(ctx, PG_QP_DIR_TO_NEXT, PG_CTRL_MSG_CTS, (uint32_t)send_origin, &pmsg, NULL)) {
+                cts_received = 1;
+                remote_recv_addr = pmsg.payload.rdv.remote_addr;
+                remote_recv_rkey = pmsg.payload.rdv.rkey;
+                clock_gettime(CLOCK_MONOTONIC, &start);
+            }
 
-                void *local_src = (char *)recvbuf + send_origin * segment_bytes + offset;
-                uint64_t remote_addr = remote_recv_addr + offset;
+            /* Post batched micro-chunk RDMA Writes within window */
+            while (cts_received && rdma_posted_micros < num_send_micros &&
+                   (rdma_posted_micros - rdma_completed_micros) < (uint32_t)ctx->rdma_window) {
+                uint32_t in_flight = rdma_posted_micros - rdma_completed_micros;
+                uint32_t win_avail = (uint32_t)ctx->rdma_window - in_flight;
+                uint32_t remaining = num_send_micros - rdma_posted_micros;
+                uint32_t to_post = win_avail < remaining ? win_avail : remaining;
+                if (to_post > (uint32_t)ctx->batch_size) to_post = (uint32_t)ctx->batch_size;
+                if (to_post > 64) to_post = 64;
+                if (to_post == 0) break;
 
-                int is_signaled = ((k + 1) % PG_RDMA_SIGNAL_INTERVAL == 0 || (k + 1) == num_micros);
+                struct ibv_sge sges[64];
+                struct ibv_send_wr wrs[64];
+                memset(wrs, 0, sizeof(struct ibv_send_wr) * to_post);
 
-                struct ibv_sge sge = {
-                    .addr   = (uintptr_t)local_src,
-                    .length = (uint32_t)micro_len,
-                    .lkey   = recv_mr->lkey
-                };
-                struct ibv_send_wr wr = {
-                    .wr_id      = pg_make_wr_slot(PG_QP_DIR_TO_NEXT, PG_WR_TYPE_RDMA_WRITE, k),
-                    .opcode     = IBV_WR_RDMA_WRITE,
-                    .send_flags = is_signaled ? IBV_SEND_SIGNALED : 0,
-                    .sg_list    = &sge,
-                    .num_sge    = 1,
-                    .next       = NULL,
-                    .wr         = {
-                        .rdma = {
-                            .remote_addr = remote_addr,
-                            .rkey        = remote_recv_rkey
-                        }
-                    }
-                };
+                for (uint32_t b = 0; b < to_post; b++) {
+                    uint32_t k = rdma_posted_micros + b;
+                    size_t offset = (size_t)k * ctx->pipeline_chunk;
+                    size_t micro_len = send_seg_bytes - offset;
+                    if (micro_len > ctx->pipeline_chunk) micro_len = ctx->pipeline_chunk;
+
+                    void *local_src = (char *)recvbuf + send_seg_offset + offset;
+                    uint64_t remote_addr = remote_recv_addr + offset;
+
+                    int is_signaled = ((k + 1) % ctx->rdma_signal_interval == 0 || (k + 1) == num_send_micros);
+
+                    sges[b].addr   = (uintptr_t)local_src;
+                    sges[b].length = (uint32_t)micro_len;
+                    sges[b].lkey   = recv_mr->lkey;
+
+                    wrs[b].wr_id      = pg_make_wr_slot(PG_QP_DIR_TO_NEXT, PG_WR_TYPE_RDMA_WRITE, k);
+                    wrs[b].opcode     = IBV_WR_RDMA_WRITE;
+                    wrs[b].send_flags = is_signaled ? IBV_SEND_SIGNALED : 0;
+                    wrs[b].sg_list    = &sges[b];
+                    wrs[b].num_sge    = 1;
+                    wrs[b].next       = (b + 1 < to_post) ? &wrs[b + 1] : NULL;
+                    wrs[b].wr.rdma.remote_addr = remote_addr;
+                    wrs[b].wr.rdma.rkey        = remote_recv_rkey;
+                }
+
                 struct ibv_send_wr *bad_wr = NULL;
-                if (ibv_post_send(ctx->qp_to_next, &wr, &bad_wr)) {
-                    perror("[pg_all_gather] Error: ibv_post_send failed for micro RDMA Write");
+                if (ibv_post_send(ctx->qp_to_next, &wrs[0], &bad_wr)) {
+                    perror("[pg_all_gather] Error: ibv_post_send failed for batched RDMA Write");
                     return PG_ERR_RDMA;
                 }
-                rdma_posted_micros++;
+                rdma_posted_micros += to_post;
                 clock_gettime(CLOCK_MONOTONIC, &start);
             }
 
@@ -2133,7 +2544,7 @@ int pg_ring_all_gather_core(struct pg_context *ctx, void *recvbuf, size_t segmen
                             cts_msg.type = PG_CTRL_MSG_CTS;
                             cts_msg.sender_rank = (uint16_t)ctx->rank;
                             cts_msg.seq = recv_msg.seq;
-                            cts_msg.payload.rdv.remote_addr = (uint64_t)(uintptr_t)((char *)recvbuf + recv_origin * segment_bytes);
+                            cts_msg.payload.rdv.remote_addr = (uint64_t)(uintptr_t)((char *)recvbuf + recv_seg_offset);
                             cts_msg.payload.rdv.rkey = recv_mr->rkey;
                             cts_msg.payload.rdv.seg_idx = recv_msg.payload.rdv.seg_idx;
                             cts_msg.payload.rdv.length = recv_msg.payload.rdv.length;
@@ -2155,8 +2566,7 @@ int pg_ring_all_gather_core(struct pg_context *ctx, void *recvbuf, size_t segmen
                                 recv_done = 1;
                             }
                         } else {
-                            ctx->pending_ctrl_msg[qp_dir] = recv_msg;
-                            ctx->has_pending_ctrl[qp_dir] = 1;
+                            pg_pending_push(ctx, qp_dir, &recv_msg, ctx->recv_slot_buf[qp_dir][slot]);
                         }
                         break;
                     }
@@ -2164,8 +2574,11 @@ int pg_ring_all_gather_core(struct pg_context *ctx, void *recvbuf, size_t segmen
                     case PG_WR_TYPE_RDMA_WRITE: {
                         if (qp_dir == PG_QP_DIR_TO_NEXT) {
                             uint32_t k = slot;
-                            rdma_completed_micros = k + 1;
-                            if (rdma_completed_micros == num_micros) {
+                            if (k + 1 > rdma_completed_micros) {
+                                rdma_completed_micros = k + 1;
+                            }
+
+                            if (rdma_completed_micros == num_send_micros && !data_done_sent) {
                                 struct pg_ctrl_msg done_msg;
                                 memset(&done_msg, 0, sizeof(done_msg));
                                 done_msg.tag = PG_CTRL_TAG;
@@ -2173,7 +2586,8 @@ int pg_ring_all_gather_core(struct pg_context *ctx, void *recvbuf, size_t segmen
                                 done_msg.sender_rank = (uint16_t)ctx->rank;
                                 done_msg.seq = (uint32_t)(step + 1);
                                 done_msg.payload.rdv.seg_idx = (uint32_t)send_origin;
-                                done_msg.payload.rdv.length = (uint32_t)segment_bytes;
+                                done_msg.payload.rdv.micro_idx = num_send_micros;
+                                done_msg.payload.rdv.length = (uint32_t)send_seg_bytes;
 
                                 rc = pg_post_ctrl_send(ctx, PG_QP_DIR_TO_NEXT, &done_msg);
                                 if (rc != PG_SUCCESS) {
@@ -2189,7 +2603,8 @@ int pg_ring_all_gather_core(struct pg_context *ctx, void *recvbuf, size_t segmen
                     case PG_WR_TYPE_SEND_CTRL: {
                         if (qp_dir == PG_QP_DIR_TO_NEXT) {
                             send_ctrl_completed_to_next++;
-                            if (rdma_completed_micros == num_micros &&
+                            if (rdma_completed_micros == num_send_micros &&
+                                data_done_sent &&
                                 send_ctrl_completed_to_next >= 2) {
                                 send_done = 1;
                             }
@@ -2212,15 +2627,22 @@ int pg_ring_all_gather_core(struct pg_context *ctx, void *recvbuf, size_t segmen
             if (elapsed >= (double)PG_CTRL_POLL_TIMEOUT_SEC) {
                 fprintf(stderr, "[pg_all_gather] Rank %d timed out on step %d:\n"
                                 "  send_done=%d (cts=%d, rdma_post=%u/%u, rdma_comp=%u/%u, done_sent=%d)\n"
-                                "  recv_done=%d\n",
-                        ctx->rank, step, send_done, cts_received, rdma_posted_micros, num_micros,
-                        rdma_completed_micros, num_micros, data_done_sent, recv_done);
+                                "  recv_done=%d (done_recv=%d)\n",
+                        ctx->rank, step, send_done, cts_received, rdma_posted_micros, num_send_micros,
+                        rdma_completed_micros, num_send_micros, data_done_sent,
+                        recv_done, data_done_recv);
                 return PG_ERR_TIMEOUT;
             }
         }
     }
 
     return PG_SUCCESS;
+}
+
+int pg_ring_all_gather_core(struct pg_context *ctx, void *recvbuf, size_t segment_bytes) {
+    if (!ctx || !recvbuf || segment_bytes == 0) return PG_ERR_INVAL;
+    int count = (int)(segment_bytes * (size_t)ctx->size / sizeof(int));
+    return pg_ring_all_gather_generalized(ctx, recvbuf, count, PG_INT);
 }
 
 int pg_all_gather(void *sendbuf, void *recvbuf, int count,
@@ -2231,23 +2653,29 @@ int pg_all_gather(void *sendbuf, void *recvbuf, int count,
     }
     struct pg_context *ctx = (struct pg_context *)pg_handle;
 
-    if (datatype != PG_INT) {
+    if (datatype != PG_INT && datatype != PG_FLOAT && datatype != PG_DOUBLE) {
         return PG_ERR_UNSUPPORTED;
     }
 
-    size_t segment_bytes = (size_t)count * sizeof(int);
+    size_t elem_size = pg_get_datatype_size(datatype);
+    size_t segment_bytes = (size_t)count * elem_size;
 
     /* Single rank degenerate ring: copy input directly to output */
     if (ctx->size == 1) {
-        memcpy(recvbuf, sendbuf, segment_bytes);
+        if (recvbuf != sendbuf) {
+            memcpy(recvbuf, sendbuf, segment_bytes);
+        }
         return PG_SUCCESS;
     }
 
     /* Copy sendbuf into our owned slice within recvbuf (recvbuf[rank]) */
-    memcpy((char *)recvbuf + ctx->rank * segment_bytes, sendbuf, segment_bytes);
+    size_t my_offset = (size_t)ctx->rank * segment_bytes;
+    if ((char *)recvbuf + my_offset != sendbuf) {
+        memcpy((char *)recvbuf + my_offset, sendbuf, segment_bytes);
+    }
 
     /* Run ring zero-copy RDMA all-gather */
-    return pg_ring_all_gather_core(ctx, recvbuf, segment_bytes);
+    return pg_ring_all_gather_generalized(ctx, recvbuf, count * ctx->size, datatype);
 }
 
 int pg_all_reduce(void *sendbuf, void *recvbuf, int count,
@@ -2258,27 +2686,29 @@ int pg_all_reduce(void *sendbuf, void *recvbuf, int count,
     }
     struct pg_context *ctx = (struct pg_context *)pg_handle;
 
-    if (datatype != PG_INT || op != PG_SUM) {
+    if (datatype != PG_INT && datatype != PG_FLOAT && datatype != PG_DOUBLE) {
+        return PG_ERR_UNSUPPORTED;
+    }
+    if (op != PG_SUM && op != PG_MIN && op != PG_MAX && op != PG_PROD) {
         return PG_ERR_UNSUPPORTED;
     }
 
-    if (count % ctx->size != 0) {
-        fprintf(stderr, "[pg_all_reduce] Error: count (%d) must be divisible by ring size (%d)\n",
-                count, ctx->size);
-        return PG_ERR_INVAL;
-    }
+    size_t elem_size = pg_get_datatype_size(datatype);
+    size_t total_bytes = (size_t)count * elem_size;
 
     /* Single rank degenerate ring: copy input directly to output */
     if (ctx->size == 1) {
-        memcpy(recvbuf, sendbuf, (size_t)count * sizeof(int));
+        if (recvbuf != sendbuf) {
+            memcpy(recvbuf, sendbuf, total_bytes);
+        }
         return PG_SUCCESS;
     }
 
-    int segment_count = count / ctx->size;
-    size_t segment_bytes = (size_t)segment_count * sizeof(int);
+    /* Offset for local owned slice within recvbuf */
+    size_t my_seg_offset = pg_get_seg_offset_bytes(ctx->rank, count, ctx->size, elem_size);
 
     /* Phase 1: Reduce-Scatter into local owned slice recvbuf[rank] */
-    int rc = pg_reduce_scatter(sendbuf, (char *)recvbuf + ctx->rank * segment_bytes,
+    int rc = pg_reduce_scatter(sendbuf, (char *)recvbuf + my_seg_offset,
                                count, datatype, op, pg_handle);
     if (rc != PG_SUCCESS) {
         fprintf(stderr, "[pg_all_reduce] Rank %d Reduce-Scatter phase failed with code %d\n",
@@ -2294,8 +2724,8 @@ int pg_all_reduce(void *sendbuf, void *recvbuf, int count,
         return rc;
     }
 
-    /* Phase 3: Zero-copy All-Gather distributing reduced segments across ring */
-    rc = pg_ring_all_gather_core(ctx, recvbuf, segment_bytes);
+    /* Phase 3: Direct All-Gather distributing reduced segments across ring */
+    rc = pg_ring_all_gather_generalized(ctx, recvbuf, count, datatype);
     if (rc != PG_SUCCESS) {
         fprintf(stderr, "[pg_all_reduce] Rank %d All-Gather phase failed with code %d\n",
                 ctx->rank, rc);
@@ -2379,57 +2809,51 @@ int pg_test_v3_rendezvous(void *pg_handle, void *sendbuf, void *recvbuf, size_t 
     clock_gettime(CLOCK_MONOTONIC, &start);
 
     while (!send_done || !recv_done) {
-        /* Check if we already received and buffered control messages */
-        if (ctx->has_pending_ctrl[PG_QP_DIR_FROM_PREV]) {
-            struct pg_ctrl_msg *pmsg = &ctx->pending_ctrl_msg[PG_QP_DIR_FROM_PREV];
-            if (pmsg->type == PG_CTRL_MSG_RTS && !rts_received) {
-                rts_received = 1;
-                struct pg_ctrl_msg cts_msg;
-                memset(&cts_msg, 0, sizeof(cts_msg));
-                cts_msg.tag = PG_CTRL_TAG;
-                cts_msg.type = PG_CTRL_MSG_CTS;
-                cts_msg.sender_rank = (uint16_t)ctx->rank;
-                cts_msg.seq = 1;
-                cts_msg.payload.rdv.remote_addr = (uint64_t)(uintptr_t)recvbuf;
-                cts_msg.payload.rdv.rkey = recv_mr->rkey;
-                cts_msg.payload.rdv.seg_idx = pmsg->payload.rdv.seg_idx;
-                cts_msg.payload.rdv.length = pmsg->payload.rdv.length;
+        /* Check if we already received and queued control messages */
+        struct pg_ctrl_msg pmsg;
+        if (!rts_received && pg_pending_pop_matching(ctx, PG_QP_DIR_FROM_PREV, PG_CTRL_MSG_RTS, (uint32_t)-1, &pmsg, NULL)) {
+            rts_received = 1;
+            struct pg_ctrl_msg cts_msg;
+            memset(&cts_msg, 0, sizeof(cts_msg));
+            cts_msg.tag = PG_CTRL_TAG;
+            cts_msg.type = PG_CTRL_MSG_CTS;
+            cts_msg.sender_rank = (uint16_t)ctx->rank;
+            cts_msg.seq = 1;
+            cts_msg.payload.rdv.remote_addr = (uint64_t)(uintptr_t)recvbuf;
+            cts_msg.payload.rdv.rkey = recv_mr->rkey;
+            cts_msg.payload.rdv.seg_idx = pmsg.payload.rdv.seg_idx;
+            cts_msg.payload.rdv.length = pmsg.payload.rdv.length;
 
-                rc = pg_post_ctrl_send(ctx, PG_QP_DIR_FROM_PREV, &cts_msg);
-                if (rc != PG_SUCCESS) {
-                    fprintf(stderr, "[pg_rdma] Rank %d failed to send CTS to prev rank %d\n",
-                            ctx->rank, ctx->prev_rank);
-                    if (allocated_here) { free(sendbuf); free(recvbuf); }
-                    return rc;
-                }
-                ctx->has_pending_ctrl[PG_QP_DIR_FROM_PREV] = 0;
-            } else if (pmsg->type == PG_CTRL_MSG_DATA_DONE && !recv_done) {
-                data_done_recv = 1;
-                if (send_ctrl_completed_from_prev >= 1) {
-                    recv_done = 1;
-                }
-                ctx->has_pending_ctrl[PG_QP_DIR_FROM_PREV] = 0;
+            rc = pg_post_ctrl_send(ctx, PG_QP_DIR_FROM_PREV, &cts_msg);
+            if (rc != PG_SUCCESS) {
+                fprintf(stderr, "[pg_rdma] Rank %d failed to send CTS to prev rank %d\n",
+                        ctx->rank, ctx->prev_rank);
+                if (allocated_here) { free(sendbuf); free(recvbuf); }
+                return rc;
             }
         }
 
-        if (ctx->has_pending_ctrl[PG_QP_DIR_TO_NEXT]) {
-            struct pg_ctrl_msg *pmsg = &ctx->pending_ctrl_msg[PG_QP_DIR_TO_NEXT];
-            if (pmsg->type == PG_CTRL_MSG_CTS && !rdma_posted) {
-                cts_received = 1;
-                uint64_t remote_addr = pmsg->payload.rdv.remote_addr;
-                uint32_t rkey = pmsg->payload.rdv.rkey;
-
-                rc = pg_post_rdma_write(ctx, PG_QP_DIR_TO_NEXT, sendbuf, size_bytes,
-                                        send_mr->lkey, remote_addr, rkey);
-                if (rc != PG_SUCCESS) {
-                    fprintf(stderr, "[pg_rdma] Rank %d failed to post RDMA Write to rank %d\n",
-                            ctx->rank, ctx->next_rank);
-                    if (allocated_here) { free(sendbuf); free(recvbuf); }
-                    return rc;
-                }
-                rdma_posted = 1;
-                ctx->has_pending_ctrl[PG_QP_DIR_TO_NEXT] = 0;
+        if (!recv_done && pg_pending_pop_matching(ctx, PG_QP_DIR_FROM_PREV, PG_CTRL_MSG_DATA_DONE, (uint32_t)-1, &pmsg, NULL)) {
+            data_done_recv = 1;
+            if (send_ctrl_completed_from_prev >= 1) {
+                recv_done = 1;
             }
+        }
+
+        if (!cts_received && pg_pending_pop_matching(ctx, PG_QP_DIR_TO_NEXT, PG_CTRL_MSG_CTS, (uint32_t)-1, &pmsg, NULL)) {
+            cts_received = 1;
+            uint64_t remote_addr = pmsg.payload.rdv.remote_addr;
+            uint32_t rkey = pmsg.payload.rdv.rkey;
+
+            rc = pg_post_rdma_write(ctx, PG_QP_DIR_TO_NEXT, sendbuf, size_bytes,
+                                    send_mr->lkey, remote_addr, rkey);
+            if (rc != PG_SUCCESS) {
+                fprintf(stderr, "[pg_rdma] Rank %d failed to post RDMA Write to rank %d\n",
+                        ctx->rank, ctx->next_rank);
+                if (allocated_here) { free(sendbuf); free(recvbuf); }
+                return rc;
+            }
+            rdma_posted = 1;
         }
 
         if (send_done && recv_done) break;
@@ -2515,9 +2939,8 @@ int pg_test_v3_rendezvous(void *pg_handle, void *sendbuf, void *recvbuf, size_t 
                             recv_done = 1;
                         }
                     } else {
-                        /* Save unhandled message into pending buffer */
-                        ctx->pending_ctrl_msg[qp_dir] = recv_msg;
-                        ctx->has_pending_ctrl[qp_dir] = 1;
+                        /* Push unhandled message into pending queue */
+                        pg_pending_push(ctx, qp_dir, &recv_msg, ctx->recv_slot_buf[qp_dir][slot]);
                     }
                     break;
                 }
