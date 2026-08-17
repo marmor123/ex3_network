@@ -544,10 +544,6 @@ int pg_barrier(void *pg_handle);
 
 /* Ring All-Gather Generalized Core Engine (Zero-Copy RDMA Write) */
 int pg_ring_all_gather_generalized(struct pg_context *ctx, void *recvbuf, int count, DATATYPE datatype);
-int pg_ring_all_gather_core(struct pg_context *ctx, void *recvbuf, size_t segment_bytes);
-
-/* V3 Rendezvous Segment Transfer Test */
-int pg_test_v3_rendezvous(void *pg_handle, void *sendbuf, void *recvbuf, size_t size_bytes);
 
 #endif /* PG_INTERNAL_H */
 

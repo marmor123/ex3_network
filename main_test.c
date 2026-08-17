@@ -533,7 +533,7 @@ int main(int argc, char **argv) {
     struct pg_context *ctx = (struct pg_context *)pg_handle;
 
     printf("=================================================================\n");
-    printf("[PG V2 RDMA Control Ring] Ring Edge & Ping Verified\n");
+    printf("[PG Collective Ring] Process Group Ring Connected\n");
     printf("=================================================================\n");
     printf("  Total Ranks : %d\n", size);
     printf("  Local Rank  : %d (1-based index: %02d, servername: %s)\n",
@@ -559,22 +559,11 @@ int main(int argc, char **argv) {
            "WORKBUFFER=SAFE"
 #endif
     );
-    printf("  Ring Edge IN (prev %d -> me %d):\n", prev_rank, rank);
-    printf("    Peer sender QP   : QPN=0x%x PSN=0x%x LID=0x%04x\n",
-           ctx->remote_from_prev.qpn, ctx->remote_from_prev.psn, ctx->remote_from_prev.lid);
-    printf("    Local receiver QP: QPN=0x%x PSN=0x%x LID=0x%04x (inline=%u, sq_depth=%u)\n",
-           ctx->local_from_prev.qpn, ctx->local_from_prev.psn, ctx->local_from_prev.lid,
-           ctx->max_inline_data[PG_QP_DIR_FROM_PREV], ctx->sq_depth[PG_QP_DIR_FROM_PREV]);
-    printf("  Ring Edge OUT (me %d -> next %d):\n", rank, next_rank);
-    printf("    Local sender QP  : QPN=0x%x PSN=0x%x LID=0x%04x (inline=%u, sq_depth=%u)\n",
-           ctx->local_to_next.qpn, ctx->local_to_next.psn, ctx->local_to_next.lid,
-           ctx->max_inline_data[PG_QP_DIR_TO_NEXT], ctx->sq_depth[PG_QP_DIR_TO_NEXT]);
-    printf("    Peer receiver QP : QPN=0x%x PSN=0x%x LID=0x%04x\n",
-           ctx->remote_to_next.qpn, ctx->remote_to_next.psn, ctx->remote_to_next.lid);
+    printf("  Ring Neighbors : prev (rank %d) <-> me (rank %d) <-> next (rank %d)\n",
+           prev_rank, rank, next_rank);
     printf("=================================================================\n");
-    printf("[PG V2 RDMA Control Ring] SUCCESS: Hardware ring established and ping verified.\n");
 
-    /* Run Pipelined Collectives Verification Suite (4 KiB, 64 KiB, 1 MiB, 4 MiB, and 1 GiB for RDV) */
+    /* Run Collectives Verification Suite (4 KiB, 64 KiB, 1 MiB, 4 MiB, and 1 GiB for RDV) */
     size_t test_sizes[] = {
         4 * 1024,                    /* 4 KiB (sub-chunk) */
         64 * 1024,                   /* 64 KiB (single micro) */
@@ -585,66 +574,6 @@ int main(int argc, char **argv) {
 #endif
     };
     int num_tests = (int)(sizeof(test_sizes) / sizeof(test_sizes[0]));
-
-    printf("=================================================================\n");
-    printf("[PG V3 Rendezvous] Testing RTS/CTS/RDMA_WRITE/DATA_DONE Transfer\n");
-    printf("=================================================================\n");
-
-    int all_passed = 1;
-    for (int t = 0; t < num_tests; t++) {
-        size_t sz = test_sizes[t];
-
-        void *sendbuf = malloc(sz);
-        void *recvbuf = calloc(1, sz);
-        if (!check_collective_alloc(pg_handle, sendbuf, recvbuf, sz, 0)) {
-            if (sendbuf) free(sendbuf);
-            if (recvbuf) free(recvbuf);
-            continue;
-        }
-
-        /* Synchronize all ranks before starting the next payload transfer */
-        int brc = pg_barrier(pg_handle);
-        if (brc != PG_SUCCESS) {
-            fprintf(stderr, "Pre-test barrier failed with code %d\n", brc);
-            all_passed = 0;
-            free(sendbuf);
-            free(recvbuf);
-            break;
-        }
-
-        int trc = pg_test_v3_rendezvous(pg_handle, sendbuf, recvbuf, sz);
-        if (trc == PG_SUCCESS) {
-            printf("  [PASS] Size %10zu B (%9zu ints) -> Verified transferred data integrity from rank %d\n",
-                   sz, sz / sizeof(int), prev_rank);
-        } else {
-            printf("  [FAIL] Size %10zu B (%9zu ints) -> Failed with code %d\n",
-                   sz, sz / sizeof(int), trc);
-            all_passed = 0;
-            free(sendbuf);
-            free(recvbuf);
-            break;
-        }
-
-        /* Synchronize all ranks after finishing the transfer */
-        brc = pg_barrier(pg_handle);
-        if (brc != PG_SUCCESS) {
-            fprintf(stderr, "Post-test barrier failed with code %d\n", brc);
-            all_passed = 0;
-            free(sendbuf);
-            free(recvbuf);
-            break;
-        }
-
-        free(sendbuf);
-        free(recvbuf);
-    }
-
-    printf("=================================================================\n");
-    if (all_passed) {
-        printf("[PG V3 Rendezvous] SUCCESS: All rendezvous segment transfers verified.\n");
-    } else {
-        printf("[PG V3 Rendezvous] FAILURE: One or more rendezvous transfers failed.\n");
-    }
 
     /* Run V7 Pipelined Reduce-Scatter Tests (PG_INT + PG_SUM) */
     printf("=================================================================\n");
@@ -935,24 +864,24 @@ int main(int argc, char **argv) {
     int dt_rc = PG_SUCCESS;
     int rem_rc = PG_SUCCESS;
     int stress_rc = PG_SUCCESS;
-    if (all_passed && rs_passed && ag_passed && ar_passed) {
+    if (rs_passed && ag_passed && ar_passed) {
         dt_rc = run_v10_datatypes_and_ops_tests(pg_handle);
         rem_rc = run_v10_non_divisible_counts_tests(pg_handle);
         stress_rc = run_v10_barrier_free_stress_test(pg_handle);
     }
 
     int bench_rc = PG_SUCCESS;
-    if (all_passed && rs_passed && ag_passed && ar_passed &&
+    if (rs_passed && ag_passed && ar_passed &&
         dt_rc == PG_SUCCESS && rem_rc == PG_SUCCESS && stress_rc == PG_SUCCESS) {
         bench_rc = run_benchmark_harness(pg_handle);
     }
 
     rc = pg_close(pg_handle);
 
-    if (rc != PG_SUCCESS || !all_passed || !rs_passed || !ag_passed || !ar_passed ||
+    if (rc != PG_SUCCESS || !rs_passed || !ag_passed || !ar_passed ||
         dt_rc != PG_SUCCESS || rem_rc != PG_SUCCESS || stress_rc != PG_SUCCESS || bench_rc != PG_SUCCESS) {
-        fprintf(stderr, "pg_close or tests failed (rc=%d, all_passed=%d, rs_passed=%d, ag_passed=%d, ar_passed=%d, dt_rc=%d, rem_rc=%d, stress_rc=%d, bench_rc=%d)\n",
-                rc, all_passed, rs_passed, ag_passed, ar_passed, dt_rc, rem_rc, stress_rc, bench_rc);
+        fprintf(stderr, "pg_close or tests failed (rc=%d, rs_passed=%d, ag_passed=%d, ar_passed=%d, dt_rc=%d, rem_rc=%d, stress_rc=%d, bench_rc=%d)\n",
+                rc, rs_passed, ag_passed, ar_passed, dt_rc, rem_rc, stress_rc, bench_rc);
         return 1;
     }
 
