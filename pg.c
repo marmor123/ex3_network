@@ -17,6 +17,10 @@
 /* Global process group arguments initialized from CLI */
 struct pg_args g_pg_args = {0};
 
+/* ========================================================================= */
+/* === MODULE 1: TCP BOOTSTRAP & CLI TOPOLOGY                           === */
+/* ========================================================================= */
+
 /* Exact-length stream read helper handling EINTR and short reads */
 static int pg_tcp_read_full(int fd, void *buf, size_t len) {
     size_t got = 0;
@@ -297,6 +301,10 @@ void pg_rdma_cleanup(struct pg_context *ctx) {
         ctx->ib_ctx = NULL;
     }
 }
+
+/* ========================================================================= */
+/* === MODULE 2: VERBS HARDWARE & QP LIFECYCLE                          === */
+/* ========================================================================= */
 
 /* Open first IB device, query capabilities, allocate PD, CQ, QPs, and pre-post receive pool */
 int pg_rdma_init_resources(struct pg_context *ctx) {
@@ -609,6 +617,10 @@ int pg_post_ctrl_send(struct pg_context *ctx, int qp_dir, const struct pg_ctrl_m
     return PG_SUCCESS;
 }
 
+/* ========================================================================= */
+/* === MODULE 3: MEMORY REGISTRATION & STAGING CACHE                    === */
+/* ========================================================================= */
+
 /* Lazy MR Cache registration helper (ADR-0002) */
 struct ibv_mr *pg_get_or_reg_mr(struct pg_context *ctx, void *addr, size_t length, int access_flags) {
     if (!ctx || !addr || length == 0) return NULL;
@@ -766,6 +778,10 @@ void pg_init_tuning_params(struct pg_context *ctx) {
         ctx->use_streaming_stores = atoi(stream_env);
     }
 }
+
+/* ========================================================================= */
+/* === MODULE 5: SSE4.2 VECTOR REDUCTION COMPUTE KERNELS                === */
+/* ========================================================================= */
 
 /* Vectorized CPU reduction engine with SSE4.2 and 4x loop unrolling (V10) */
 void pg_reduce_buffer(void *dest, const void *src, int count,
@@ -1057,6 +1073,10 @@ void pg_reduce_buffer(void *dest, const void *src, int count,
             break;
     }
 }
+
+/* ========================================================================= */
+/* === MODULE 4: PROGRESS ENGINE & CQ DISPATCH                          === */
+/* ========================================================================= */
 
 /* Post one signaled RDMA_WRITE operation */
 int pg_post_rdma_write(struct pg_context *ctx, int qp_dir, void *local_addr, size_t length,
@@ -1512,9 +1532,9 @@ struct pg_context *ctx = (struct pg_context *)pg_handle;
     return ctx->host_list[rank];
 }
 
-/* ============================================================================
- * Candidate #02: Unified Ring Step Transfer Engine (ADR-0002 & V10)
- * ============================================================================ */
+/* ========================================================================= */
+/* === MODULE 6: RING STEP TRANSFER & COLLECTIVES ORCHESTRATION         === */
+/* ========================================================================= */
 
 struct pg_reduce_cb_ctx {
     DATATYPE datatype;
