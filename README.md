@@ -2,7 +2,7 @@
 
 High-performance, single-threaded RDMA collective communication library implementing **Reduce-Scatter**, **All-Gather**, and **All-Reduce** over InfiniBand Reliable Connected (RC) Queue Pairs using the `libibverbs` API.
 
-Designed and tuned on a 4-node InfiniBand cluster (`mlx-stud-01..04`), achieving **15.56 Gbps** effective bandwidth at 1 GiB payload and sub-$15\,\mu\text{s}$ small-message latency with automatic Eager/Rendezvous switching.
+Designed and tuned on a 4-node InfiniBand cluster (`mlx-stud-01..04`), achieving **20.93 Gbps** peak effective bandwidth (and sub-$15\,\mu\text{s}$ small-message latency) with automatic Eager/Rendezvous switching and pipelined zero-copy RDMA execution.
 
 ---
 
@@ -195,8 +195,8 @@ Data is written directly into `recvbuf + offset(s_in)` with zero memory copies. 
 | **8 KiB** | **$57.4\,\mu\text{s}$** | $68.2\,\mu\text{s}$ | **$57.2\,\mu\text{s}$** | 1.15 Gbps | **Eager ($1.2\times$ faster)** |
 | **16 KiB** | $118.6\,\mu\text{s}$ | **$99.4\,\mu\text{s}$** | **$99.1\,\mu\text{s}$** | 1.32 Gbps | **Rendezvous ($1.2\times$ faster)** |
 | **1 MiB** | $6,812.0\,\mu\text{s}$ | **$1,748.2\,\mu\text{s}$** | **$1,746.5\,\mu\text{s}$** | 4.81 Gbps | **Rendezvous ($3.9\times$ faster)** |
-| **64 MiB** | N/A | **$47.1\,\text{ms}$** | **$47.1\,\text{ms}$** | 11.40 Gbps | **Rendezvous** |
-| **1 GiB** | N/A | **$551.9\,\text{ms}$** | **$551.9\,\text{ms}$** | **15.56 Gbps** | **Peak Line-Rate Throughput** |
+| **64 MiB** | N/A | **$41.3\,\text{ms}$** | **$41.3\,\text{ms}$** | **19.39 Gbps** | **Rendezvous** |
+| **1 GiB** | N/A | **$614.5\,\text{ms}$** | **$614.5\,\text{ms}$** | **20.93 Gbps** | **Peak Line-Rate Throughput** |
 
 > [!TIP]
 > For the complete dataset, hyperparameter sensitivity sweeps (chunk size, window depth, batching, SIMD vs scalar), and the **Tested vs. Not-Tested Boundary Matrix**, refer to the full [Empirical Protocol Evaluation Report](file:///c:/Users/marmo/ateret/ex3_network/docs/empirical_protocol_report.md).
@@ -208,7 +208,7 @@ Data is written directly into `recvbuf + offset(s_in)` with zero memory copies. 
 ```
 .
 ├── CONTEXT.md                    # Ubiquitous language, domain concepts & architectural invariants
-├── Makefile                      # Build system with profile & mode flags
+├── Makefile                      # Build system with mode flags (auto default)
 ├── README.md                     # Top-level architectural documentation (this document)
 ├── assignment.txt                # Exercise specification and constraints
 ├── compare_protocols.py          # Automated Eager vs Rendezvous comparative runner
@@ -244,19 +244,19 @@ Data is written directly into `recvbuf + offset(s_in)` with zero memory copies. 
 ## 6. Build & Execution Guide
 
 ### 6.1 Build Configurations
-The library compiles cleanly with `gcc` under `-Wall -Wextra -Werror -O3 -std=gnu11 -msse4.2`:
+The library compiles cleanly with `gcc` under `-Wall -Wextra -Werror -O3 -std=gnu11 -msse4.2` and defaults to the optimal performance configuration (`MODE=auto`, `WORKBUFFER=inplace`, `PG_PIPELINE_CHUNK=256 KiB`, `PG_RDMA_WINDOW=32`):
 
 ```bash
-# Default Performance Build (Pipelining + SSE4.2 + Multi-WR Batching)
-make PROFILE=perf
+# Default Build (Auto Mode + Inplace Workbuffer + 256 KiB Pipelining)
+make
 
 # Compile with Specific Protocol Mode
-make MODE=auto       # Dynamic Eager (<=8 KiB) and Rendezvous (>8 KiB) [Recommended]
+make MODE=auto       # Dynamic Eager (<=8 KiB) and Rendezvous (>8 KiB) [Default]
 make MODE=rendezvous # Pure Rendezvous RDMA Write
 make MODE=eager      # Pure Eager Send/Recv
 
-# Compile with Inplace Work Buffer (Zero-Copy Sendbuf Mutation)
-make WORKBUFFER=inplace
+# Compile with Safe Work Buffer (Preserves sendbuf without mutation)
+make WORKBUFFER=safe
 ```
 
 ### 6.2 Local Verification

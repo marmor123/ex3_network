@@ -483,6 +483,9 @@ static int run_v10_barrier_free_stress_test(void *pg_handle) {
     int rc = PG_SUCCESS;
 
     for (int iter = 0; iter < 100; iter++) {
+        for (int i = 0; i < count; i++) {
+            s[i] = (rank + 1);
+        }
         rc = pg_all_reduce(sendbuf, recvbuf, count, PG_INT, PG_SUM, pg_handle);
         if (rc != PG_SUCCESS) {
             fprintf(stderr, "  [FAIL] Rapid iteration %d failed with code %d\n", iter, rc);
@@ -540,18 +543,13 @@ int main(int argc, char **argv) {
            rank, g_pg_args.myindex_raw, local_server);
     printf("  RDMA Device : Port=%d, LID=0x%04x, MTU=%d\n",
            PG_IB_PORT, ctx->local_lid, ctx->active_mtu);
-    printf("  Config Mode : %s | %s | %s\n",
+    printf("  Config Mode : %s | %s | Pipelining (256 KiB chunks, window 32)\n",
 #if (PG_ACTIVE_MODE == PG_MODE_TYPE_EAGER)
            "MODE=EAGER",
 #elif (PG_ACTIVE_MODE == PG_MODE_TYPE_AUTO)
            "MODE=AUTO (<=8KiB eager, >8KiB rdv)",
 #else
            "MODE=RENDEZVOUS",
-#endif
-#ifdef PROFILE_PERF
-           "PROFILE=PERF (256 KiB)",
-#else
-           "PROFILE=BRINGUP (64 KiB)",
 #endif
 #ifdef PG_WORKBUFFER_INPLACE
            "WORKBUFFER=INPLACE"

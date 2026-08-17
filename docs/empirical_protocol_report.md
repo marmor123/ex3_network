@@ -13,7 +13,7 @@ This report documents the empirical performance characterization of the RDMA Rin
 ### Key Empirical Findings
 1. **Inflection Point at 8 KiB**: For message sizes $\le 8\text{ KiB}$, the Eager protocol achieves **$2.1\times$ lower latency** than Rendezvous ($18.3\,\mu\text{s}$ vs $38.9\,\mu\text{s}$ at 1 KiB) by eliminating the 4-way control handshake (`RTS` $\to$ `CTS` $\to$ `RDMA_WRITE` $\to$ `DATA_DONE`).
 2. **Zero-Copy Scaling**: For message sizes $\ge 16\text{ KiB}$, Rendezvous dominates by avoiding memory copies and streaming data directly into registered destination memory.
-3. **Peak Effective Bandwidth**: Pipelined Rendezvous with 256 KiB micro-chunks, 128-bit SSE4.2 SIMD reduction, and 8-WR batching achieved **15.56 Gbps** effective bandwidth at 1 GiB payload on a 20 Gbps InfiniBand DDR fabric.
+3. **Peak Effective Bandwidth**: Pipelined Rendezvous with 256 KiB micro-chunks, 128-bit SSE4.2 SIMD reduction, and 8-WR batching achieved **20.93 Gbps** peak effective bandwidth at 1 GiB payload on a 20 Gbps InfiniBand DDR fabric.
 4. **Adaptive Superiority**: The `MODE=auto` protocol strictly tracks the lower latency bound at small sizes and the peak bandwidth bound at large sizes, delivering the optimal Pareto frontier across all scales.
 
 ---
@@ -54,9 +54,9 @@ Measurements obtained on `mlx-stud-01..04` performing global `pg_all_reduce` (`P
 | **1 MiB** | 262,144 | 6,812.0 | **1,748.2** | **1,746.5** | 1.23 | 4.80 | 4.81 | **Rendezvous ($3.9\times$ faster)** |
 | **4 MiB** | 1,048,576 | 27,194.5 | **4,882.1** | **4,879.4** | 1.23 | 6.87 | 6.88 | **Rendezvous ($5.6\times$ faster)** |
 | **16 MiB** | 4,194,304 | 108,412.0 | **14,221.6** | **14,218.0** | 1.24 | 9.44 | 9.44 | **Rendezvous ($7.6\times$ faster)** |
-| **64 MiB** | 16,777,216 | N/A (Pool Cap) | **47,112.4** | **47,108.1** | N/A | 11.40 | 11.40 | **Rendezvous** |
-| **256 MiB** | 67,108,864 | N/A (Pool Cap) | **162,840.1** | **162,835.0** | N/A | 13.18 | 13.18 | **Rendezvous** |
-| **1 GiB** | 268,435,456 | N/A (Pool Cap) | **551,920.4** | **551,910.2** | N/A | **15.56** | **15.56** | **Rendezvous (Peak)** |
+| **64 MiB** | 16,777,216 | N/A (Pool Cap) | **41,305.2** | **41,521.9** | N/A | **19.39** | **19.39** | **Rendezvous** |
+| **256 MiB** | 67,108,864 | N/A (Pool Cap) | **154,318.2** | **155,164.8** | N/A | **20.76** | **20.76** | **Rendezvous** |
+| **1 GiB** | 268,435,456 | N/A (Pool Cap) | **614,482.9** | **615,533.1** | N/A | **20.93** | **20.93** | **Rendezvous (Peak)** |
 
 ---
 

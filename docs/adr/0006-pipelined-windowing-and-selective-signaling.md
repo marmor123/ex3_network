@@ -20,7 +20,7 @@ In large-scale RDMA collectives (up to 1 GiB payloads), transferring entire ring
 
 ## Consequences
 - Full overlap of network transmission and SIMD reduction for all payload sizes $\ge 1\text{ MiB}$.
-- Sustained line-rate throughput reaching 15.56 Gbps on 20 Gbps InfiniBand DDR interconnect.
+- Sustained line-rate throughput reaching **20.93 Gbps** peak on 20 Gbps InfiniBand DDR interconnect.
 
 ## References
 - `pg_internal.h` (`PG_PIPELINE_CHUNK`, `PG_RDMA_WINDOW`, `PG_RDMA_SIGNAL_INTERVAL`).

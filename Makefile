@@ -3,23 +3,18 @@ CFLAGS ?= -Wall -Wextra -Werror -O3 -std=gnu11 -msse4.2
 LDFLAGS ?= 
 LDLIBS ?= -libverbs
 
-PROFILE ?= bringup
-ifeq ($(PROFILE),perf)
-    CFLAGS += -DPROFILE_PERF
-endif
-
-WORKBUFFER ?= safe
+WORKBUFFER ?= inplace
 ifeq ($(WORKBUFFER),inplace)
     CFLAGS += -DPG_WORKBUFFER_INPLACE
 endif
 
-MODE ?= rendezvous
+MODE ?= auto
 ifeq ($(MODE),eager)
     CFLAGS += -DPG_MODE_EAGER
-else ifeq ($(MODE),auto)
-    CFLAGS += -DPG_MODE_AUTO
-else
+else ifeq ($(MODE),rendezvous)
     CFLAGS += -DPG_MODE_RENDEZVOUS
+else
+    CFLAGS += -DPG_MODE_AUTO
 endif
 
 TARGET = test

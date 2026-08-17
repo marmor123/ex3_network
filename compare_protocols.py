@@ -15,15 +15,15 @@ DEFAULT_HOSTS_4 = ["mlx-stud-01", "mlx-stud-02", "mlx-stud-03", "mlx-stud-04"]
 DEFAULT_HOSTS_2 = ["mlx-stud-03", "mlx-stud-04"]
 CLUSTER_DIR = "/cs/usr/ateret.tabib/Downloads/ex3_network"
 
-def sync_and_build(hosts, mode, profile="perf"):
-    print(f"[Compare] Syncing workspace to {hosts[0]} and compiling with MODE={mode} PROFILE={profile}...")
+def sync_and_build(hosts, mode):
+    print(f"[Compare] Syncing workspace to {hosts[0]} and compiling with MODE={mode}...")
     subprocess.run(
         ["rsync", "-avz", "--exclude", ".git", "--exclude", "*.o", "--exclude", "test", "./", f"{hosts[0]}:{CLUSTER_DIR}/"],
         check=True,
         stdout=subprocess.DEVNULL
     )
     subprocess.run(
-        ["ssh", hosts[0], f"cd {CLUSTER_DIR} && make clean && make MODE={mode} PROFILE={profile}"],
+        ["ssh", hosts[0], f"cd {CLUSTER_DIR} && make clean && make MODE={mode}"],
         check=True
     )
 

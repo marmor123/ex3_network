@@ -34,10 +34,10 @@
 
 #if defined(PG_MODE_EAGER)
 #define PG_ACTIVE_MODE          PG_MODE_TYPE_EAGER
-#elif defined(PG_MODE_AUTO)
-#define PG_ACTIVE_MODE          PG_MODE_TYPE_AUTO
-#else
+#elif defined(PG_MODE_RENDEZVOUS)
 #define PG_ACTIVE_MODE          PG_MODE_TYPE_RENDEZVOUS
+#else
+#define PG_ACTIVE_MODE          PG_MODE_TYPE_AUTO
 #endif
 
 /* Eager Protocol Constants (ADR-0002 & Summary Sec 10, 25) */
@@ -46,22 +46,10 @@
 #define PG_EAGER_WINDOW         8            /* In-flight send flow control window */
 #define PG_EAGER_BUF_SIZE       (PG_PIPELINE_CHUNK > PG_EAGER_THRESHOLD ? PG_PIPELINE_CHUNK : PG_EAGER_THRESHOLD)
 
-/* Pipelining and Profile Constants (Summary Sec 21, 24, 25 & V10 Cluster Tuning) */
-#ifdef PROFILE_PERF
-#define PG_PIPELINE_CHUNK        (256 * 1024)  /* 256 KiB (optimal sweet spot) */
+/* Pipelining Constants (256 KiB chunk, 32 in-flight window, 8 signal interval) */
+#define PG_PIPELINE_CHUNK        (256 * 1024)  /* 256 KiB optimal sweet spot */
 #define PG_RDMA_WINDOW           32            /* 32 in-flight micro-chunks */
 #define PG_RDMA_SIGNAL_INTERVAL  8             /* Signal every 8 WRs (2 MiB pipeline step) */
-#else
-#ifndef PG_PIPELINE_CHUNK
-#define PG_PIPELINE_CHUNK        (64 * 1024)   /* 64 KiB */
-#endif
-#ifndef PG_RDMA_WINDOW
-#define PG_RDMA_WINDOW           1
-#endif
-#ifndef PG_RDMA_SIGNAL_INTERVAL
-#define PG_RDMA_SIGNAL_INTERVAL  1
-#endif
-#endif
 
 /* Multi-WR Linked-List Batching & Streaming Store Thresholds (V10) */
 #ifndef PG_DEFAULT_BATCH_SIZE

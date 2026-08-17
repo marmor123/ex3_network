@@ -38,7 +38,7 @@ Instead of posting individual send work requests (`ibv_post_send`) for each micr
 ## Consequences
 - CPU reduction time dropped from $184\,\mu\text{s}$ to $41\,\mu\text{s}$ per 256 KiB micro-chunk ($4.5\times$ speedup), completely hiding compute latency behind InfiniBand network transmission.
 - Multi-WR batching reduced QP door-bell overhead by $8\times$.
-- Total collective effective bandwidth on the cluster increased from 7.72 Gbps to **15.56 Gbps**.
+- Total collective effective bandwidth on the cluster increased from 7.72 Gbps to **20.93 Gbps** peak.
 
 ## References
 - `pg.c` (Module 5: Vector Reduction Kernels).
