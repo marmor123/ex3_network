@@ -55,6 +55,9 @@
 #ifndef PG_DEFAULT_BATCH_SIZE
 #define PG_DEFAULT_BATCH_SIZE    8             /* 8 chained WRs per ibv_post_send */
 #endif
+#ifndef PG_STREAMING_STORE_THRESHOLD
+#define PG_STREAMING_STORE_THRESHOLD (64 * 1024) /* 64 KiB */
+#endif
 
 /* Benchmark Harness Constants */
 #ifndef PG_BENCH_MIN_BYTES
@@ -78,7 +81,12 @@
 /* WR_ID Type Enumerations (Bits 0-3 of wr_id per ADR-0001) */
 #define PG_WR_TYPE_RECV_CTRL    1
 #define PG_WR_TYPE_SEND_CTRL    2
+#define PG_WR_TYPE_RTS          3
+#define PG_WR_TYPE_CTS          4
+#define PG_WR_TYPE_DATA_DONE    5
 #define PG_WR_TYPE_RDMA_WRITE   6
+#define PG_WR_TYPE_BARRIER      7
+#define PG_WR_TYPE_EAGER_RECV   8
 #define PG_WR_TYPE_EAGER_SEND   9
 
 /* wr_id Bit-packing helpers (ADR-0001) */
@@ -104,6 +112,7 @@ static inline uint32_t pg_wr_slot(uint64_t wr_id) {
 
 /* Control Message Types */
 #define PG_CTRL_MSG_PING            1
+#define PG_CTRL_MSG_PONG            2
 #define PG_CTRL_MSG_RTS             3
 #define PG_CTRL_MSG_CTS             4
 #define PG_CTRL_MSG_DATA_DONE       5
@@ -182,6 +191,7 @@ struct pg_context {
     int batch_size;
     size_t eager_threshold;
     int eager_window;
+    int use_streaming_stores;
 
     /* InfiniBand Verbs Resources */
     struct ibv_context *ib_ctx;
@@ -512,7 +522,7 @@ int pg_ensure_internal_buffers(struct pg_context *ctx, size_t count_bytes, size_
 
 /* Vectorized Reduction Math Engine */
 void pg_reduce_buffer(void *dest, const void *src, int count,
-                      DATATYPE datatype, OPERATION op);
+                      DATATYPE datatype, OPERATION op, int use_streaming);
 
 /* RDMA Operation Helpers */
 int pg_post_rdma_write(struct pg_context *ctx, int qp_dir, void *local_addr, size_t length,
