@@ -304,6 +304,16 @@ void pg_rdma_cleanup(struct pg_context *ctx) {
         ibv_close_device(ctx->ib_ctx);
         ctx->ib_ctx = NULL;
     }
+
+    /* 5. Free dynamically allocated eager buffers in pending queues */
+    for (int dir = 0; dir < 2; dir++) {
+        for (int k = 0; k < PG_PENDING_QUEUE_MAX; k++) {
+            if (ctx->pending_q[dir].pool[k].eager_buf) {
+                free(ctx->pending_q[dir].pool[k].eager_buf);
+                ctx->pending_q[dir].pool[k].eager_buf = NULL;
+            }
+        }
+    }
 }
 
 /* ========================================================================= */

@@ -148,11 +148,11 @@ struct pg_tcp_qp_info {
 };
 
 /* Pending control message queues (FIFO per QP direction with Pool Indirection) */
-#define PG_PENDING_QUEUE_MAX    64
+#define PG_PENDING_QUEUE_MAX    256
 
 struct pg_pending_entry {
     struct pg_ctrl_msg msg;
-    char eager_buf[PG_EAGER_BUF_SIZE + PG_CTRL_MSG_LEN];
+    char *eager_buf;
     uint32_t eager_len;
     int in_use;
 };
@@ -236,6 +236,9 @@ struct pg_context {
     /* Pending control message queues (FIFO per QP direction) */
     struct pg_pending_queue pending_q[2];
 
+    /* Temporary buffer for eagerly received payloads (single-threaded progress engine) */
+    char eager_rx_buf[PG_EAGER_SLOT_SIZE] __attribute__((aligned(64)));
+
     /* TCP Bootstrap QP metadata */
     struct pg_tcp_qp_info local_to_next;           /* Local QP info for next rank */
     struct pg_tcp_qp_info local_from_prev;         /* Local QP info for prev rank */
@@ -266,8 +269,13 @@ static inline void pg_pending_push(struct pg_context *ctx, int qp_dir, const str
     if (msg->type == PG_CTRL_MSG_EAGER_PAYLOAD && slot_buf) {
         uint32_t elen = msg->payload.rdv.length + PG_CTRL_MSG_LEN;
         if (elen > (PG_EAGER_BUF_SIZE + PG_CTRL_MSG_LEN)) elen = PG_EAGER_BUF_SIZE + PG_CTRL_MSG_LEN;
-        memcpy(q->pool[slot].eager_buf, slot_buf, elen);
-        q->pool[slot].eager_len = elen;
+        if (!q->pool[slot].eager_buf) {
+            q->pool[slot].eager_buf = (char *)malloc(PG_EAGER_SLOT_SIZE);
+        }
+        if (q->pool[slot].eager_buf) {
+            memcpy(q->pool[slot].eager_buf, slot_buf, elen);
+            q->pool[slot].eager_len = elen;
+        }
     }
 
     q->ring[q->tail] = slot;
@@ -275,7 +283,7 @@ static inline void pg_pending_push(struct pg_context *ctx, int qp_dir, const str
     q->count++;
 }
 
-static inline int pg_pending_pop_matching(struct pg_context *ctx, int qp_dir, int type, uint32_t seg_idx, struct pg_ctrl_msg *out_msg, void *out_slot_buf) {
+static inline int pg_pending_pop_matching(struct pg_context *ctx, int qp_dir, int type, uint32_t seg_idx, struct pg_ctrl_msg *out_msg, void *out_slot_buf, uint32_t *out_eager_len) {
     if (!ctx || qp_dir < 0 || qp_dir >= 2) return 0;
     struct pg_pending_queue *q = &ctx->pending_q[qp_dir];
     if (q->count == 0) return 0;
@@ -288,7 +296,8 @@ static inline int pg_pending_pop_matching(struct pg_context *ctx, int qp_dir, in
 
         if (m->type == type && (seg_idx == (uint32_t)-1 || m->payload.rdv.seg_idx == seg_idx)) {
             if (out_msg) *out_msg = *m;
-            if (out_slot_buf && entry->eager_len > 0) {
+            if (out_eager_len) *out_eager_len = entry->eager_len;
+            if (out_slot_buf && entry->eager_len > 0 && entry->eager_buf) {
                 memcpy(out_slot_buf, entry->eager_buf, entry->eager_len);
             }
             entry->in_use = 0;
@@ -371,7 +380,7 @@ struct pg_progress_event {
     int qp_dir;                             /* PG_QP_DIR_TO_NEXT (0) or PG_QP_DIR_FROM_PREV (1) */
     uint32_t slot;                          /* Slot index or micro-chunk sequence index */
     struct pg_ctrl_msg msg;                 /* Message content (for PG_WR_TYPE_RECV_CTRL) */
-    char eager_buf[PG_EAGER_BUF_SIZE + PG_CTRL_MSG_LEN]; /* Copy of eager payload if type is EAGER_PAYLOAD */
+    char *eager_buf;                        /* Pointer to eager payload if type is EAGER_PAYLOAD */
     uint32_t eager_len;                     /* Length of eager payload */
 };
 
@@ -379,19 +388,15 @@ struct pg_progress_event {
 static inline int pg_progress_pop_pending(struct pg_context *ctx, int qp_dir, int msg_type, uint32_t seg_idx, struct pg_progress_event *out_event) {
     if (!ctx || qp_dir < 0 || qp_dir >= 2 || !out_event) return 0;
     struct pg_ctrl_msg msg;
-    char slot_buf[PG_EAGER_SLOT_SIZE];
-    if (pg_pending_pop_matching(ctx, qp_dir, msg_type, seg_idx, &msg, slot_buf)) {
+    uint32_t eager_len = 0;
+    void *target_buf = (msg_type == PG_CTRL_MSG_EAGER_PAYLOAD) ? ctx->eager_rx_buf : NULL;
+    if (pg_pending_pop_matching(ctx, qp_dir, msg_type, seg_idx, &msg, target_buf, &eager_len)) {
         out_event->type = PG_WR_TYPE_RECV_CTRL;
         out_event->qp_dir = qp_dir;
         out_event->slot = 0;
         out_event->msg = msg;
-        out_event->eager_len = 0;
-        if (msg.type == PG_CTRL_MSG_EAGER_PAYLOAD) {
-            uint32_t elen = msg.payload.rdv.length + PG_CTRL_MSG_LEN;
-            if (elen > (PG_EAGER_BUF_SIZE + PG_CTRL_MSG_LEN)) elen = PG_EAGER_BUF_SIZE + PG_CTRL_MSG_LEN;
-            memcpy(out_event->eager_buf, slot_buf, elen);
-            out_event->eager_len = elen;
-        }
+        out_event->eager_buf = (msg.type == PG_CTRL_MSG_EAGER_PAYLOAD) ? ctx->eager_rx_buf : NULL;
+        out_event->eager_len = eager_len;
         return 1;
     }
     return 0;
@@ -425,6 +430,7 @@ static inline int pg_progress_poll(struct pg_context *ctx, struct pg_progress_ev
     out_event->type = pg_wr_type(wc.wr_id);
     out_event->qp_dir = pg_wr_qp(wc.wr_id);
     out_event->slot = pg_wr_slot(wc.wr_id);
+    out_event->eager_buf = NULL;
     out_event->eager_len = 0;
 
     if (out_event->type == PG_WR_TYPE_RECV_CTRL) {
@@ -442,7 +448,8 @@ static inline int pg_progress_poll(struct pg_context *ctx, struct pg_progress_ev
         if (rhdr->type == PG_CTRL_MSG_EAGER_PAYLOAD) {
             uint32_t elen = rhdr->payload.rdv.length + PG_CTRL_MSG_LEN;
             if (elen > (PG_EAGER_BUF_SIZE + PG_CTRL_MSG_LEN)) elen = PG_EAGER_BUF_SIZE + PG_CTRL_MSG_LEN;
-            memcpy(out_event->eager_buf, ctx->recv_slot_buf[dir][slot], elen);
+            memcpy(ctx->eager_rx_buf, ctx->recv_slot_buf[dir][slot], elen);
+            out_event->eager_buf = ctx->eager_rx_buf;
             out_event->eager_len = elen;
         }
 
