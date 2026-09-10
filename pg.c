@@ -777,6 +777,9 @@ void pg_init_tuning_params(struct pg_context *ctx) {
         int val = atoi(sig_env);
         if (val > 0) ctx->rdma_signal_interval = val;
     }
+    if (ctx->rdma_signal_interval > ctx->rdma_window) {
+        ctx->rdma_signal_interval = ctx->rdma_window;
+    }
 
     ctx->batch_size = PG_DEFAULT_BATCH_SIZE;
     const char *batch_env = getenv("PG_BATCH_SIZE");
@@ -1611,7 +1614,12 @@ static int pg_ring_step_transfer_rdv(struct pg_context *ctx, const struct pg_rin
                 void *local_src = (char *)desc->send_buf + offset;
                 uint64_t remote_addr = remote_target_addr + offset;
 
-                int is_signaled = ((k + 1) % ctx->rdma_signal_interval == 0 || (k + 1) == num_send_micros);
+                uint32_t eff_sig_interval = (uint32_t)ctx->rdma_signal_interval;
+                if (eff_sig_interval > (uint32_t)ctx->rdma_window) {
+                    eff_sig_interval = (uint32_t)ctx->rdma_window;
+                }
+                if (eff_sig_interval == 0) eff_sig_interval = 1;
+                int is_signaled = ((k + 1) % eff_sig_interval == 0 || (k + 1) == num_send_micros);
 
                 sges[b].addr   = (uintptr_t)local_src;
                 sges[b].length = (uint32_t)micro_len;
