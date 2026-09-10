@@ -922,8 +922,6 @@ void pg_reduce_buffer(void *dest, const void *src, int count,
 #define PG_REDUCE_LOOP_3WAY_4X(type, vtype, load_fn, store_fn, stream_fn, vec_op, scalar_expr, step) do { \
     if (((uintptr_t)d & 15) == 0) { \
         for (; i + ((step) * 4) <= count; i += ((step) * 4)) { \
-            _mm_prefetch((const char *)(s1 + i + (step) * 8), _MM_HINT_T0); \
-            _mm_prefetch((const char *)(s2 + i + (step) * 8), _MM_HINT_T0); \
             vtype va0 = load_fn(s1 + i); \
             vtype va1 = load_fn(s1 + i + (step)); \
             vtype va2 = load_fn(s1 + i + (step) * 2); \
@@ -1751,7 +1749,7 @@ static int pg_ring_step_transfer_rdv(struct pg_context *ctx, const struct pg_rin
                     eff_sig_interval = (uint32_t)ctx->rdma_window;
                 }
                 if (eff_sig_interval == 0) eff_sig_interval = 1;
-                int is_signaled = (k == 0 || (k + 1) % eff_sig_interval == 0 || (k + 1) == num_send_micros);
+                int is_signaled = ((k + 1) % eff_sig_interval == 0 || (k + 1) == num_send_micros);
 
                 ctx->static_sges[b].addr   = (uintptr_t)local_src;
                 ctx->static_sges[b].length = (uint32_t)micro_len;
