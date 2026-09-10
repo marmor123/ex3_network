@@ -2,7 +2,7 @@
 
 High-performance, single-threaded RDMA collective communication library implementing **Reduce-Scatter**, **All-Gather**, and **All-Reduce** over InfiniBand Reliable Connected (RC) Queue Pairs using the `libibverbs` API.
 
-Designed and tuned on a 4-node InfiniBand cluster (`mlx-stud-01..04`), achieving **22.23 Gbps** peak effective bandwidth (and sub-$16\,\mu\text{s}$ small-message 4-rank all-reduce latency) with automatic Eager/Rendezvous switching, pipelined zero-copy RDMA execution, and NUMA node 0 local PCIe affinity.
+Designed and tuned on a 4-node InfiniBand cluster (`mlx-stud-01..04`), achieving **22.45 Gbps** peak effective bandwidth (and sub-$16\,\mu\text{s}$ small-message 4-rank all-reduce latency) with automatic Eager/Rendezvous switching, pipelined zero-copy RDMA execution, and NUMA node 0 local PCIe affinity.
 
 ---
 
@@ -190,17 +190,17 @@ Data is written directly into `recvbuf + offset(s_in)` with zero memory copies. 
 
 | Size | Eager Latency | Rendezvous Latency | Auto Latency | Auto Bandwidth | Crossover Verdict |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| **64 B** | **$15.7\,\mu\text{s}$** | $92.0\,\mu\text{s}$ | **$16.6\,\mu\text{s}$** | 0.05 Gbps | **Eager ($2.7\times$ faster)** |
-| **256 B** | **$15.7\,\mu\text{s}$** | $91.2\,\mu\text{s}$ | **$16.2\,\mu\text{s}$** | 0.19 Gbps | **Eager ($2.8\times$ faster)** |
-| **1 KiB** | **$17.0\,\mu\text{s}$** | $98.7\,\mu\text{s}$ | **$18.0\,\mu\text{s}$** | 0.68 Gbps | **Eager ($2.5\times$ faster)** |
-| **8 KiB** | **$26.9\,\mu\text{s}$** | $94.7\,\mu\text{s}$ | **$27.7\,\mu\text{s}$** | 3.56 Gbps | **Eager ($1.9\times$ faster)** |
-| **16 KiB** | **$34.7\,\mu\text{s}$** | $101.4\,\mu\text{s}$ | **$35.4\,\mu\text{s}$** | 5.61 Gbps | **Eager ($1.7\times$ faster)** |
-| **64 KiB** | **$89.8\,\mu\text{s}$** | $137.1\,\mu\text{s}$ | **$89.8\,\mu\text{s}$** | **8.80 Gbps** | **Eager ($1.6\times$ faster)** |
-| **128 KiB** | **$139.3\,\mu\text{s}$** | $185.2\,\mu\text{s}$ | **$139.3\,\mu\text{s}$** | **11.36 Gbps** | **Eager ($1.35\times$ faster)** |
-| **256 KiB** | **$232.7\,\mu\text{s}$** | $274.5\,\mu\text{s}$ | **$232.7\,\mu\text{s}$** | **13.50 Gbps** | **Eager ($1.16\times$ faster)** |
-| **1 MiB** | $878.2\,\mu\text{s}$ | **$823.2\,\mu\text{s}$** | **$823.2\,\mu\text{s}$** | **15.42 Gbps** | **Rendezvous ($1.1\times$ faster)** |
-| **64 MiB** | N/A | **$37.2\,\text{ms}$** | **$37.2\,\text{ms}$** | **21.60 Gbps** | **Rendezvous (Adaptive 64K Chunks)** |
-| **1 GiB** | N/A | **$579.7\,\text{ms}$** | **$579.7\,\text{ms}$** | **22.23 Gbps** | **Rendezvous (Peak Line-Rate)** |
+| **64 B** | **$44.3\,\mu\text{s}$** | $94.3\,\mu\text{s}$ | **$42.1\,\mu\text{s}$** | 0.02 Gbps | **Eager ($2.1\times$ faster)** |
+| **256 B** | **$41.9\,\mu\text{s}$** | $92.3\,\mu\text{s}$ | **$43.9\,\mu\text{s}$** | 0.07 Gbps | **Eager ($2.2\times$ faster)** |
+| **1 KiB** | **$44.8\,\mu\text{s}$** | $102.8\,\mu\text{s}$ | **$44.4\,\mu\text{s}$** | 0.28 Gbps | **Eager ($2.3\times$ faster)** |
+| **8 KiB** | **$53.6\,\mu\text{s}$** | $101.9\,\mu\text{s}$ | **$53.3\,\mu\text{s}$** | 1.85 Gbps | **Eager ($1.9\times$ faster)** |
+| **16 KiB** | **$60.5\,\mu\text{s}$** | $101.5\,\mu\text{s}$ | **$60.2\,\mu\text{s}$** | 3.26 Gbps | **Eager ($1.7\times$ faster)** |
+| **64 KiB** | **$91.2\,\mu\text{s}$** | $140.9\,\mu\text{s}$ | **$92.1\,\mu\text{s}$** | **8.54 Gbps** | **Eager ($1.5\times$ faster)** |
+| **128 KiB** | **$138.4\,\mu\text{s}$** | $179.9\,\mu\text{s}$ | **$135.7\,\mu\text{s}$** | **11.59 Gbps** | **Eager ($1.3\times$ faster)** |
+| **256 KiB** | **$231.8\,\mu\text{s}$** | $273.6\,\mu\text{s}$ | **$234.3\,\mu\text{s}$** | **13.42 Gbps** | **Eager ($1.2\times$ faster)** |
+| **1 MiB** | $866.2\,\mu\text{s}$ | **$823.8\,\mu\text{s}$** | **$831.8\,\mu\text{s}$** | **15.13 Gbps** | **Rendezvous ($1.1\times$ faster)** |
+| **64 MiB** | N/A | **$36.9\,\text{ms}$** | **$37.4\,\text{ms}$** | **21.53 Gbps** | **Rendezvous (Adaptive 64K Chunks)** |
+| **1 GiB** | N/A | **$573.9\,\text{ms}$** | **$580.9\,\text{ms}$** | **22.18 Gbps** | **Rendezvous (Peak: 22.45 Gbps)** |
 
 > [!TIP]
 > For the complete dataset, hyperparameter sensitivity sweeps (chunk size, window depth, batching, SIMD vs scalar), and the **Tested vs. Not-Tested Boundary Matrix**, refer to the full [Empirical Protocol Evaluation Report](file:///c:/Users/marmo/ateret/ex3_network/docs/empirical_protocol_report.md).
