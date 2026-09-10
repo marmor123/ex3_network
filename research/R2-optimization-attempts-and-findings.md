@@ -1,4 +1,4 @@
-# R2: Optimization Attempts, Empirical Discoveries, and Future Directions
+# R2: Optimization Attempts, Empirical Successes, and Failure Post-Mortems
 
 **Project**: Low-Latency RDMA Ring Collective Communication Library (`ex3_network`)  
 **Hardware Cluster**: `mlx-stud-01..04` (4 Physical Compute Nodes, Intel Xeon X5550, Mellanox ConnectX IB DDR 20 Gbps)  
@@ -114,34 +114,3 @@ The following 5 changes were implemented, tested on the physical cluster, found 
   - Synchronous in-line CQ handling and asynchronous pending queue replay have subtle differences in state machine progression (e.g., sequence number validation and credit tracking).
   - Merging them into a single helper obscured these distinctions and caused state transition stalls.
 - **Lesson Learned**: Deep module boundaries should encapsulate state transitions rather than prematurely combining separate execution paths that have subtly different preconditions.
-
----
-
-## 4. Open Research Questions & Future Improvement Directions
-
-For subsequent research projects and scaled deployments, the following architectural opportunities are recommended:
-
-### 4.1 Capacity-Aware Dynamic NUMA Allocation
-Rather than static NUMA pinning or unmanaged allocation, implement a capacity-aware allocator:
-1. Query free memory per NUMA node via `numa_node_size64(node, &free)`.
-2. For small to medium transfers ($\le 256\text{ MB}$), bind memory and CPU thread to the HCA's local NUMA node (`numa_run_on_node(0)` and `numa_alloc_on_node()`).
-3. For large transfers ($\ge 512\text{ MB}$), switch to `numa_alloc_interleaved()` across all sockets to distribute memory bandwidth and avoid exhausting single-socket physical RAM.
-
-### 4.2 Modern Vector Extensions (AVX2 & AVX-512)
-The current cluster is constrained to SSE4.2 (128-bit). On modern hardware:
-- **AVX2 (256-bit)**: Reduces the 256 KiB chunk reduction time from $41.1\,\mu\text{s}$ to $\sim 19\,\mu\text{s}$.
-- **AVX-512 (512-bit)**: Reduces chunk reduction time to $<10\,\mu\text{s}$, enabling smaller micro-chunk sizes (e.g. 64 KiB) without compute bottlenecks.
-
-### 4.3 Bidirectional Dual-Ring Collective Interleaving
-The current implementation utilizes a single unidirectional logical ring ($r \to r+1$). On full-duplex InfiniBand links:
-- Implementing two simultaneous counter-rotating rings (Ring A: $r \to r+1$, Ring B: $r \to r-1$) would allow sending half the payload in each direction.
-- This theoretically halves the ring transmission time ($2(N-1)/N \times S$), doubling effective bandwidth on bidirectional fabrics.
-
-### 4.4 Shared Receive Queue (SRQ) for Ring Scaling ($N \gg 4$)
-When scaling the library beyond 4 nodes:
-- The per-QP receive pool consumes $O(N)$ receive buffers.
-- Migrating to a Shared Receive Queue (SRQ) shared across all incoming QPs bounds the memory footprint to $O(1)$ receive slots, regardless of ring size.
-
-### 4.5 RoCEv2 & Multi-Subnet GID Routing
-- Extend bootstrap to exchange RoCEv2 GIDs (Global Identifiers) and configure GRH (Global Route Header) attributes.
-- This enables execution across standard RoCEv2 Converged Ethernet networks without requiring dedicated InfiniBand subnets.

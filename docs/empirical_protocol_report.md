@@ -139,9 +139,9 @@ In accordance with our core engineering principle of presenting only empirical f
 
 ---
 
-## 6. Optimization Attempts, Failures & Future Directions
+## 6. Optimization Attempts, Empirical Successes & Failure Post-Mortems
 
-For complete microarchitectural post-mortems of failed optimization hypotheses (NUMA node pinning memory exhaustion, spin-loop pause throttling, compiler flag skews, barrier CQ drain races) and comprehensive blueprints for future scaling (capacity-aware NUMA allocation, AVX-512, bidirectional rings, SRQ), see:
+For complete microarchitectural post-mortems of failed optimization hypotheses (NUMA node pinning memory exhaustion, spin-loop pause throttling, compiler flag skews, barrier CQ drain races) and details on all verified fixes, see:
 
-👉 [R2: Optimization Attempts, Empirical Discoveries, and Future Directions](file:///c:/Users/marmo/ateret/ex3_network/research/R2-optimization-attempts-and-findings.md)
+👉 [R2: Optimization Attempts, Empirical Successes, and Failure Post-Mortems](file:///c:/Users/marmo/ateret/ex3_network/research/R2-optimization-attempts-and-findings.md)
 

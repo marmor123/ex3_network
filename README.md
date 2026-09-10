@@ -229,7 +229,7 @@ Data is written directly into `recvbuf + offset(s_in)` with zero memory copies. 
 │
 ├── research/
 │   ├── R1-verbs-patterns.md          # Verbs API patterns for RC Queue Pairs in ring collectives
-│   └── R2-optimization-attempts-and-findings.md # Detailed post-mortems of successes, failures & future work
+│   └── R2-optimization-attempts-and-findings.md # Detailed post-mortems of successes & failures
 │
 └── docs/
     ├── empirical_protocol_report.md  # Detailed benchmark analysis and empirical boundary matrix
