@@ -227,6 +227,10 @@ Data is written directly into `recvbuf + offset(s_in)` with zero memory copies. 
 │
 ├── main_test.c                   # Validation & benchmark test harness
 │
+├── research/
+│   ├── R1-verbs-patterns.md          # Verbs API patterns for RC Queue Pairs in ring collectives
+│   └── R2-optimization-attempts-and-findings.md # Detailed post-mortems of successes, failures & future work
+│
 └── docs/
     ├── empirical_protocol_report.md  # Detailed benchmark analysis and empirical boundary matrix
     └── adr/                          # Architectural Decision Records (0001 - 0007)

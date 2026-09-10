@@ -136,3 +136,12 @@ In accordance with our core engineering principle of presenting only empirical f
 | **CPU Architecture** | Intel Nehalem x86_64 with SSE4.2 (128-bit). | Modern AVX-512 / AVX2 CPUs, ARM Neoverse, or POWER9 architectures. |
 | **Collective Integration** | Reduce-Scatter, All-Gather, All-Reduce, Distributed Ring Barrier. | Dual-ring bidirectional full-duplex interleaving. |
 | **Stress & Reliability** | 100 rapid back-to-back iterations with zero deadlocks and zero memory leaks. | Fault tolerance under physical link drop or node kill during collective. |
+
+---
+
+## 6. Optimization Attempts, Failures & Future Directions
+
+For complete microarchitectural post-mortems of failed optimization hypotheses (NUMA node pinning memory exhaustion, spin-loop pause throttling, compiler flag skews, barrier CQ drain races) and comprehensive blueprints for future scaling (capacity-aware NUMA allocation, AVX-512, bidirectional rings, SRQ), see:
+
+👉 [R2: Optimization Attempts, Empirical Discoveries, and Future Directions](file:///c:/Users/marmo/ateret/ex3_network/research/R2-optimization-attempts-and-findings.md)
+
