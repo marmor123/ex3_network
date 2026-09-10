@@ -88,7 +88,7 @@ for i in "${!HOSTS[@]}"; do
     HOST="${HOSTS[$i]}"
     
     echo "Starting Rank $RANK (index $INDEX) on host $HOST..."
-    ssh $SSH_OPTS "$HOST" "cd $CLUSTER_DIR && ./test -myindex $INDEX -list ${HOSTS[*]}" &
+    ssh $SSH_OPTS "$HOST" "cd $CLUSTER_DIR && (command -v numactl >/dev/null 2>&1 && numactl --cpunodebind=0 --preferred=0 ./test -myindex $INDEX -list ${HOSTS[*]} || ./test -myindex $INDEX -list ${HOSTS[*]})" &
     PIDS+=($!)
 done
 
