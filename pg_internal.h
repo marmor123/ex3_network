@@ -482,6 +482,22 @@ static inline int pg_progress_wait(struct pg_context *ctx, double timeout_sec, s
     }
 }
 
+/* Non-blocking CQ drain across collective boundaries (ADR-0007) */
+static inline int pg_progress_drain(struct pg_context *ctx) {
+    if (!ctx) return PG_ERR_INVAL;
+    struct pg_progress_event ev;
+    int drained = 0;
+    while (1) {
+        int rc = pg_progress_poll(ctx, &ev);
+        if (rc <= 0) break;
+        if (ev.type == PG_WR_TYPE_RECV_CTRL) {
+            pg_progress_push_pending(ctx, ev.qp_dir, &ev.msg, ev.eager_buf);
+        }
+        drained++;
+    }
+    return drained;
+}
+
 /* ============================================================================
  * Ring Step Transfer Engine (Pipelined Micro-Chunk Transfer)
  * ============================================================================ */
