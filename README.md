@@ -17,7 +17,7 @@ Designed and tuned on a 4-node InfiniBand cluster (`mlx-stud-01..04`), achieving
                                         |
 +---------------------------------------v---------------------------------------+
 |                    COLLECTIVE ORCHESTRATION ENGINE                            |
-|   - MPI Remainder Slicing ((Q+1)/Q)       - Conditional Phase Barrier         |
+|   - MPI Remainder Slicing ((Q+1)/Q)       - 3-Phase Distributed Ring Barrier  |
 |   - Ring Permutation Step Math            - Safe Workbuf / Zero-Copy Staging  |
 +-------------------+---------------------------------------+-------------------+
                     |                                       |
@@ -100,7 +100,7 @@ sequenceDiagram
 ---
 
 ### 2.3 Eager 2-SGE Scatter-Gather Protocol
-Used for small/medium transfers ($\le 64\text{ KiB}$ segment / $\le 256\text{ KiB}$ tensor) to eliminate both the 2-RTT handshake and intermediate barrier overhead:
+Used for small/medium transfers ($\le 64\text{ KiB}$ segment / $\le 256\text{ KiB}$ tensor) to eliminate the 2-RTT RTS/CTS handshake and push payload directly into pre-posted receive buffers:
 
 ```mermaid
 sequenceDiagram

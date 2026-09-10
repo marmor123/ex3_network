@@ -111,7 +111,7 @@ static int run_benchmark_harness(void *pg_handle) {
 #if (PG_ACTIVE_MODE == PG_MODE_TYPE_EAGER)
     mode_str = "EAGER";
 #elif (PG_ACTIVE_MODE == PG_MODE_TYPE_AUTO)
-    mode_str = "AUTO (Threshold <= 8 KiB Eager, > 8 KiB Rendezvous)";
+    mode_str = "AUTO (Threshold <= 64 KiB Eager, > 64 KiB Rendezvous)";
 #endif
 
     if (rank == 0) {

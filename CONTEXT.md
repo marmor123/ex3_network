@@ -30,7 +30,7 @@ An internal staging area used in safe mode (`WORKBUFFER=safe`) to perform out-of
 ### Collective Operations
 - **Reduce-Scatter**: Reduces an array of data across all processes and distributes the reduced slices across the ranks.
 - **All-Gather**: Gathers distributed slices from all ranks so that every rank ends up with the complete contiguous array (zero-copy RDMA Write).
-- **All-Reduce**: Performs a full global reduction and distributes the complete reduced result to all ranks (implemented as Reduce-Scatter &rarr; Conditional Phase Barrier &rarr; All-Gather, where single-packet Eager transfers bypass the barrier for sub-$16\,\mu\text{s}$ latency).
+- **All-Reduce**: Performs a full global reduction and distributes the complete reduced result to all ranks (implemented as Reduce-Scatter &rarr; Three-Phase Distributed Barrier &rarr; All-Gather, guaranteeing phase synchronization and race-freedom across rapid back-to-back collective iterations).
 
 ---
 
@@ -50,7 +50,7 @@ An internal staging area used in safe mode (`WORKBUFFER=safe`) to perform out-of
 1. **Progress Seam**: All CQ interactions, `wr_id` decoding, and receive pool refills are strictly encapsulated inside the Progress Engine module. Collective routines never interact directly with raw CQ polling.
 2. **Transfer Seam**: Protocol selection (Eager Send/Recv vs Rendezvous RDMA Write) is encapsulated behind the step transfer engine (`pg_step_transfer_*`), keeping collective routines focused purely on segment permutation and compute kernels.
 3. **Memory Registration Invariant**: Application and staging memory are lazily registered in the MR cache and persist until `pg_close`, avoiding registration churn in the hot timed path.
-4. **Barrier Isolation Invariant**: Collective phases (Reduce-Scatter and All-Gather) for Rendezvous transfers are decoupled by a 3-phase distributed ring barrier (`COLLECT` $\to$ `RELEASE` $\to$ `ACK`), while Eager mode safely bypasses it to minimize latency. Unexpected subsequent-iteration traffic is preserved in `pending_q` rather than purged.
+4. **Barrier Isolation Invariant**: Collective phases (Reduce-Scatter and All-Gather) are decoupled by an unconditional 3-phase distributed ring barrier (`COLLECT` $\to$ `RELEASE` $\to$ `ACK`), preventing faster ranks from lapping slower ranks during rapid back-to-back collective iterations. Unexpected subsequent-iteration traffic is preserved in `pending_q` rather than purged.
 
 ---
 

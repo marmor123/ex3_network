@@ -178,10 +178,10 @@ def main():
     
     print("=" * 105)
     print("\nProtocol Trade-off Insights:")
-    print("1. Small Messages (<= 8 KiB): Eager protocol wins because it eliminates the RTS -> CTS negotiation round-trip.")
-    print("2. Large Messages (> 8 KiB): Rendezvous with Zero-Copy RDMA Write wins because it eliminates intermediate buffer copies")
-    print("   and utilizes hardware-level RDMA streaming directly into user memory.")
-    print("3. Auto Mode Sweet-spot: Switching from Eager to Rendezvous at ~8 KiB yields optimal latency across all message sizes.")
+    print("1. Small/Medium Messages (<= 64 KiB segment): Eager protocol wins because it eliminates the RTS -> CTS negotiation round-trip.")
+    print("2. Large Messages (> 64 KiB segment): Rendezvous with Zero-Copy RDMA Write wins because it eliminates intermediate buffer copies")
+    print("   and utilizes hardware-level RDMA streaming directly into user memory with adaptive 64 KiB / 256 KiB pipelining.")
+    print("3. Auto Mode Sweet-spot: Switching from Eager to Rendezvous at 64 KiB segment yields optimal latency and bandwidth across all sizes.")
     print("=" * 105)
 
 if __name__ == "__main__":
