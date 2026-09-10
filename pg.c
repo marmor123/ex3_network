@@ -13,6 +13,7 @@
 #include <arpa/inet.h>
 #include <time.h>
 #include <poll.h>
+#include <sched.h>
 
 /* Global process group arguments initialized from CLI */
 struct pg_args g_pg_args = {0};
@@ -309,6 +310,45 @@ void pg_rdma_cleanup(struct pg_context *ctx) {
 /* === MODULE 2: VERBS HARDWARE & QP LIFECYCLE                          === */
 /* ========================================================================= */
 
+/* Pin process to the local NUMA socket of the InfiniBand HCA to eliminate QPI transit */
+static void pg_pin_to_hca_numa(const char *ib_dev_name) {
+    if (!ib_dev_name) return;
+    int node = -1;
+    char path[256];
+    snprintf(path, sizeof(path), "/sys/class/infiniband/%s/device/numa_node", ib_dev_name);
+    FILE *f = fopen(path, "r");
+    if (f) {
+        if (fscanf(f, "%d", &node) != 1) node = -1;
+        fclose(f);
+    }
+    if (node < 0) {
+        node = 0; /* Nehalem 5520 IOH root bus connects to socket 0 */
+    }
+
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+
+    snprintf(path, sizeof(path), "/sys/devices/system/node/node%d/cpulist", node);
+    f = fopen(path, "r");
+    if (f) {
+        int start = 0, end = 0;
+        if (fscanf(f, "%d-%d", &start, &end) == 2) {
+            for (int c = start; c <= end; c++) CPU_SET(c, &cpuset);
+        } else {
+            rewind(f);
+            int cpu = 0;
+            while (fscanf(f, "%d,", &cpu) == 1) CPU_SET(cpu, &cpuset);
+        }
+        fclose(f);
+    } else {
+        for (int c = 0; c < 4; c++) CPU_SET(c, &cpuset);
+    }
+
+    if (CPU_COUNT(&cpuset) > 0) {
+        sched_setaffinity(0, sizeof(cpuset), &cpuset);
+    }
+}
+
 /* Open first IB device, query capabilities, allocate PD, CQ, QPs, and pre-post receive pool */
 int pg_rdma_init_resources(struct pg_context *ctx) {
     if (!ctx) return PG_ERR_INVAL;
@@ -318,6 +358,11 @@ int pg_rdma_init_resources(struct pg_context *ctx) {
         fprintf(stderr, "[pg_rdma] Error: No InfiniBand devices found\n");
         if (dev_list) ibv_free_device_list(dev_list);
         return PG_ERR_RDMA;
+    }
+
+    const char *dev_name = ibv_get_device_name(dev_list[0]);
+    if (dev_name) {
+        pg_pin_to_hca_numa(dev_name);
     }
 
     ctx->ib_ctx = ibv_open_device(dev_list[0]);
