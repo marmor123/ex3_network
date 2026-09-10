@@ -1584,7 +1584,6 @@ static int pg_ring_step_transfer_eager(struct pg_context *ctx, const struct pg_r
 
     struct timespec start, now;
     clock_gettime(CLOCK_MONOTONIC, &start);
-    uint32_t empty_spin = 0;
 
     while (!send_done || !recv_done) {
         /* 1. Pop any pending eager payloads for this recv_tag */
@@ -1690,21 +1689,14 @@ static int pg_ring_step_transfer_eager(struct pg_context *ctx, const struct pg_r
             }
         }
 
-        if (rc == 0) {
-            __builtin_ia32_pause();
-            if ((++empty_spin & 4095) == 0) {
-                clock_gettime(CLOCK_MONOTONIC, &now);
-                double elapsed = (now.tv_sec - start.tv_sec) + (now.tv_nsec - start.tv_nsec) / 1e9;
-                if (elapsed >= (double)PG_CTRL_POLL_TIMEOUT_SEC) {
-                    fprintf(stderr, "[pg_transfer] Rank %d eager timed out on step %u: "
-                                    "send_done=%d (%u/%u), recv_done=%d (%u/%u)\n",
-                            ctx->rank, desc->step_idx, send_done, eager_completed_micros, num_send_micros,
-                            recv_done, eager_recv_micros, num_recv_micros);
-                    return PG_ERR_TIMEOUT;
-                }
-            }
-        } else {
-            empty_spin = 0;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        double elapsed = (now.tv_sec - start.tv_sec) + (now.tv_nsec - start.tv_nsec) / 1e9;
+        if (elapsed >= (double)PG_CTRL_POLL_TIMEOUT_SEC) {
+            fprintf(stderr, "[pg_transfer] Rank %d eager timed out on step %u: "
+                            "send_done=%d (%u/%u), recv_done=%d (%u/%u)\n",
+                    ctx->rank, desc->step_idx, send_done, eager_completed_micros, num_send_micros,
+                    recv_done, eager_recv_micros, num_recv_micros);
+            return PG_ERR_TIMEOUT;
         }
     }
 
@@ -1750,7 +1742,6 @@ static int pg_ring_step_transfer_rdv(struct pg_context *ctx, const struct pg_rin
 
     struct timespec start, now;
     clock_gettime(CLOCK_MONOTONIC, &start);
-    uint32_t empty_spin = 0;
 
     while (!send_done || !recv_done) {
         /* 1. Check pending RTS messages from prev */
@@ -1991,23 +1982,16 @@ static int pg_ring_step_transfer_rdv(struct pg_context *ctx, const struct pg_rin
             }
         }
 
-        if (rc == 0) {
-            __builtin_ia32_pause();
-            if ((++empty_spin & 4095) == 0) {
-                clock_gettime(CLOCK_MONOTONIC, &now);
-                double elapsed = (now.tv_sec - start.tv_sec) + (now.tv_nsec - start.tv_nsec) / 1e9;
-                if (elapsed >= (double)PG_CTRL_POLL_TIMEOUT_SEC) {
-                    fprintf(stderr, "[pg_transfer] Rank %d timed out on step %u:\n"
-                                    "  send_done=%d (cts=%d, rdma_post=%u/%u, rdma_comp=%u/%u, done_sent=%u/%u)\n"
-                                    "  recv_done=%d (done_recv=%u/%u)\n",
-                            ctx->rank, desc->step_idx, send_done, cts_received, rdma_posted_micros, num_send_micros,
-                            rdma_completed_micros, num_send_micros, data_done_sent_micros, num_send_micros,
-                            recv_done, data_done_recv_micros, num_recv_micros);
-                    return PG_ERR_TIMEOUT;
-                }
-            }
-        } else {
-            empty_spin = 0;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        double elapsed = (now.tv_sec - start.tv_sec) + (now.tv_nsec - start.tv_nsec) / 1e9;
+        if (elapsed >= (double)PG_CTRL_POLL_TIMEOUT_SEC) {
+            fprintf(stderr, "[pg_transfer] Rank %d timed out on step %u:\n"
+                            "  send_done=%d (cts=%d, rdma_post=%u/%u, rdma_comp=%u/%u, done_sent=%u/%u)\n"
+                            "  recv_done=%d (done_recv=%u/%u)\n",
+                    ctx->rank, desc->step_idx, send_done, cts_received, rdma_posted_micros, num_send_micros,
+                    rdma_completed_micros, num_send_micros, data_done_sent_micros, num_send_micros,
+                    recv_done, data_done_recv_micros, num_recv_micros);
+            return PG_ERR_TIMEOUT;
         }
     }
 
