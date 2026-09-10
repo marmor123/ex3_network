@@ -2102,7 +2102,7 @@ int pg_reduce_scatter(void *sendbuf, void *recvbuf, int count,
     size_t my_seg_bytes = (size_t)my_seg_elems * elem_size;
     size_t my_seg_offset = pg_get_seg_offset_bytes(ctx->rank, count, ctx->size, elem_size);
     if (recvbuf != (char *)work_ptr + my_seg_offset) {
-        memcpy(recvbuf, (char *)work_ptr + my_seg_offset, my_seg_bytes);
+        memmove(recvbuf, (char *)work_ptr + my_seg_offset, my_seg_bytes);
     }
 
     return PG_SUCCESS;
