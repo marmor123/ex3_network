@@ -460,17 +460,21 @@ static inline int pg_progress_poll(struct pg_context *ctx, struct pg_progress_ev
 static inline int pg_progress_wait(struct pg_context *ctx, double timeout_sec, struct pg_progress_event *out_event) {
     struct timespec start, now;
     clock_gettime(CLOCK_MONOTONIC, &start);
+    uint32_t spin = 0;
 
     while (1) {
         int rc = pg_progress_poll(ctx, out_event);
         if (rc < 0) return rc;
         if (rc == 1) return 1;
 
-        clock_gettime(CLOCK_MONOTONIC, &now);
-        double elapsed = (now.tv_sec - start.tv_sec) + (now.tv_nsec - start.tv_nsec) / 1e9;
-        if (elapsed >= timeout_sec) {
-            fprintf(stderr, "[pg_progress] Error: Timed out after %.2f s waiting for CQ event\n", elapsed);
-            return PG_ERR_TIMEOUT;
+        __builtin_ia32_pause();
+        if ((++spin & 4095) == 0) {
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            double elapsed = (now.tv_sec - start.tv_sec) + (now.tv_nsec - start.tv_nsec) / 1e9;
+            if (elapsed >= timeout_sec) {
+                fprintf(stderr, "[pg_progress] Error: Timed out after %.2f s waiting for CQ event\n", elapsed);
+                return PG_ERR_TIMEOUT;
+            }
         }
     }
 }
