@@ -472,6 +472,121 @@ static inline int pg_progress_wait(struct pg_context *ctx, double timeout_sec, s
     }
 }
 
+/* Automatically buffer unexpected incoming receive messages into pending queue */
+static inline void pg_progress_buffer_unexpected(struct pg_context *ctx, const struct pg_progress_event *ev) {
+    if (ctx && ev && ev->type == PG_WR_TYPE_RECV_CTRL) {
+        pg_progress_push_pending(ctx, ev->qp_dir, &ev->msg, ev->eager_buf);
+    }
+}
+
+/* Wait for a specific local work completion type (e.g. PG_WR_TYPE_SEND_CTRL) on qp_dir (or any dir if qp_dir < 0) */
+static inline int pg_progress_wait_type(struct pg_context *ctx, int qp_dir, int wr_type, double timeout_sec, struct pg_progress_event *out_event) {
+    if (out_event) memset(out_event, 0, sizeof(*out_event));
+    struct timespec start, now;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+
+    struct pg_progress_event ev;
+    while (1) {
+        int rc = pg_progress_poll(ctx, &ev);
+        if (rc < 0) return rc;
+        if (rc == 1) {
+            if (ev.type == wr_type && (qp_dir < 0 || ev.qp_dir == qp_dir)) {
+                if (out_event) *out_event = ev;
+                return PG_SUCCESS;
+            }
+            pg_progress_buffer_unexpected(ctx, &ev);
+        }
+
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        double elapsed = (now.tv_sec - start.tv_sec) + (now.tv_nsec - start.tv_nsec) / 1e9;
+        if (elapsed >= timeout_sec) {
+            fprintf(stderr, "[pg_progress] Error: Timed out waiting for WR type %d on qp_dir %d\n", wr_type, qp_dir);
+            return PG_ERR_TIMEOUT;
+        }
+    }
+}
+
+/* Wait for a matching incoming control message, auto-buffering unexpected messages */
+static inline int pg_progress_wait_msg(struct pg_context *ctx, int qp_dir, uint16_t msg_type, uint32_t seg_idx, double timeout_sec, struct pg_progress_event *out_event) {
+    if (out_event) memset(out_event, 0, sizeof(*out_event));
+    /* 1. First check if already buffered in pending queue */
+    if (pg_progress_pop_pending(ctx, qp_dir, (int)msg_type, seg_idx, out_event)) {
+        return PG_SUCCESS;
+    }
+
+    /* 2. Poll until matching message arrives or timeout */
+    struct timespec start, now;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+
+    struct pg_progress_event ev;
+    while (1) {
+        int rc = pg_progress_poll(ctx, &ev);
+        if (rc < 0) return rc;
+        if (rc == 1) {
+            if (ev.type == PG_WR_TYPE_RECV_CTRL && ev.qp_dir == qp_dir &&
+                ev.msg.type == msg_type &&
+                (seg_idx == (uint32_t)-1 || ev.msg.payload.rdv.seg_idx == seg_idx)) {
+                if (out_event) *out_event = ev;
+                return PG_SUCCESS;
+            }
+            pg_progress_buffer_unexpected(ctx, &ev);
+        }
+
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        double elapsed = (now.tv_sec - start.tv_sec) + (now.tv_nsec - start.tv_nsec) / 1e9;
+        if (elapsed >= timeout_sec) {
+            fprintf(stderr, "[pg_progress] Error: Timed out waiting for msg_type %u from qp_dir %d\n", msg_type, qp_dir);
+            return PG_ERR_TIMEOUT;
+        }
+    }
+}
+
+/* Concurrently wait for a local send completion and a matching incoming control message */
+static inline int pg_progress_wait_send_recv(struct pg_context *ctx,
+                                             int send_qp_dir, int send_wr_type,
+                                             int recv_qp_dir, uint16_t recv_msg_type, uint32_t seg_idx,
+                                             double timeout_sec,
+                                             struct pg_progress_event *out_recv_event) {
+    if (out_recv_event) memset(out_recv_event, 0, sizeof(*out_recv_event));
+    int send_done = 0;
+    int recv_done = 0;
+
+    if (pg_progress_pop_pending(ctx, recv_qp_dir, (int)recv_msg_type, seg_idx, out_recv_event)) {
+        recv_done = 1;
+    }
+
+    struct timespec start, now;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+
+    struct pg_progress_event ev;
+    while (!send_done || !recv_done) {
+        int rc = pg_progress_poll(ctx, &ev);
+        if (rc < 0) return rc;
+        if (rc == 1) {
+            if (!send_done && ev.type == send_wr_type && (send_qp_dir < 0 || ev.qp_dir == send_qp_dir)) {
+                send_done = 1;
+            } else if (!recv_done && ev.type == PG_WR_TYPE_RECV_CTRL && ev.qp_dir == recv_qp_dir &&
+                       ev.msg.type == recv_msg_type &&
+                       (seg_idx == (uint32_t)-1 || ev.msg.payload.rdv.seg_idx == seg_idx)) {
+                if (out_recv_event) *out_recv_event = ev;
+                recv_done = 1;
+            } else {
+                pg_progress_buffer_unexpected(ctx, &ev);
+            }
+        }
+
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        double elapsed = (now.tv_sec - start.tv_sec) + (now.tv_nsec - start.tv_nsec) / 1e9;
+        if (elapsed >= timeout_sec) {
+            fprintf(stderr, "[pg_progress] Error: Timed out waiting for send_type %d / recv_msg %u\n",
+                    send_wr_type, recv_msg_type);
+            return PG_ERR_TIMEOUT;
+        }
+    }
+
+    return PG_SUCCESS;
+}
+
 /* ============================================================================
  * Ring Step Transfer Engine (Pipelined Micro-Chunk Transfer)
  * ============================================================================ */

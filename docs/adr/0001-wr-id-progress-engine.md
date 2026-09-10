@@ -23,9 +23,10 @@ We needed a low-overhead, deterministic completion routing mechanism that distin
 - A fixed receive pool of depth `PG_CTRL_POOL_DEPTH = 32` is pre-posted on each QP at initialization.
 - Upon polling a `PG_WR_TYPE_RECV_CTRL` CQ completion, the progress engine copies/processes the message and immediately reposts the receive work request to maintain invariant pool depth.
 
-### 3. Progress Engine Polling & Dispatch (Pointer Indirection)
-- Encapsulated within `pg_progress_poll` and `pg_progress_wait`.
-- Unexpected or future-step control messages are automatically diverted into an internal FIFO queue (`pending_q`) and popped when the target step begins.
+### 3. Progress Engine Polling, Dispatch & Automatic Buffering
+- Encapsulated within `pg_progress_poll`, `pg_progress_wait`, `pg_progress_wait_msg`, `pg_progress_wait_type`, and `pg_progress_wait_send_recv`.
+- Unexpected or future-step control messages are automatically diverted into an internal FIFO queue (`pending_q`) via `pg_progress_buffer_unexpected` rather than leaking queue maintenance to callers.
+- Callers declaratively wait on expected control messages or completion types without manual pushback loops.
 - **Dynamic Pointer Indirection**: In `struct pg_pending_entry` and `struct pg_progress_event`, eager message payloads are referenced via dynamic pointers backed by a single 64-byte cacheline-aligned context buffer (`ctx->eager_rx_buf`) rather than embedding 262 KB arrays in each struct.
 
 ## Consequences

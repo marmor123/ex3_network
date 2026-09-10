@@ -1088,34 +1088,16 @@ int pg_rdma_ring_ping(struct pg_context *ctx) {
         return rc;
     }
 
-    int send_done = 0;
-    int recv_done = 0;
+    struct pg_progress_event ev = {0};
+    rc = pg_progress_wait_send_recv(ctx, PG_QP_DIR_TO_NEXT, PG_WR_TYPE_SEND_CTRL,
+                                    PG_QP_DIR_FROM_PREV, PG_CTRL_MSG_PING, (uint32_t)-1,
+                                    PG_CTRL_POLL_TIMEOUT_SEC, &ev);
+    if (rc != PG_SUCCESS) return rc;
 
-    struct pg_progress_event ev;
-    if (pg_progress_pop_pending(ctx, PG_QP_DIR_FROM_PREV, PG_CTRL_MSG_PING, (uint32_t)-1, &ev)) {
-        recv_done = 1;
-    }
-
-    while (!send_done || !recv_done) {
-        rc = pg_progress_wait(ctx, PG_CTRL_POLL_TIMEOUT_SEC, &ev);
-        if (rc != 1) return rc < 0 ? rc : PG_ERR_TIMEOUT;
-
-        if (ev.type == PG_WR_TYPE_SEND_CTRL && ev.qp_dir == PG_QP_DIR_TO_NEXT) {
-            send_done = 1;
-        } else if (ev.type == PG_WR_TYPE_RECV_CTRL && ev.qp_dir == PG_QP_DIR_FROM_PREV) {
-            if (ev.msg.type == PG_CTRL_MSG_PING) {
-                if (ev.msg.sender_rank != (uint16_t)ctx->prev_rank) {
-                    fprintf(stderr, "[pg_rdma] Rank %d received ping from unexpected sender %u (expected %d)\n",
-                            ctx->rank, ev.msg.sender_rank, ctx->prev_rank);
-                    return PG_ERR_RDMA;
-                }
-                recv_done = 1;
-            } else {
-                pg_progress_push_pending(ctx, ev.qp_dir, &ev.msg, ev.eager_buf);
-            }
-        } else if (ev.type == PG_WR_TYPE_RECV_CTRL) {
-            pg_progress_push_pending(ctx, ev.qp_dir, &ev.msg, ev.eager_buf);
-        }
+    if (ev.msg.sender_rank != (uint16_t)ctx->prev_rank) {
+        fprintf(stderr, "[pg_rdma] Rank %d received ping from unexpected sender %u (expected %d)\n",
+                ctx->rank, ev.msg.sender_rank, ctx->prev_rank);
+        return PG_ERR_RDMA;
     }
 
     return PG_SUCCESS;
@@ -1124,81 +1106,35 @@ int pg_rdma_ring_ping(struct pg_context *ctx) {
 /* Pass a token once around the entire ring for Phase 1 (Collect), Phase 2 (Release), or Phase 3 (Ack) */
 static int pg_barrier_token_pass(struct pg_context *ctx, uint16_t msg_type) {
     int rc;
-    struct pg_progress_event ev;
+    struct pg_progress_event ev = {0};
+
+    struct pg_ctrl_msg msg;
+    memset(&msg, 0, sizeof(msg));
+    msg.tag = PG_CTRL_TAG;
+    msg.type = msg_type;
+    msg.sender_rank = (uint16_t)ctx->rank;
 
     if (ctx->rank == 0) {
-        struct pg_ctrl_msg msg;
-        memset(&msg, 0, sizeof(msg));
-        msg.tag = PG_CTRL_TAG;
-        msg.type = msg_type;
-        msg.sender_rank = (uint16_t)ctx->rank;
-
+        /* Rank 0: Originate token to next_rank and wait for token to traverse the ring back from prev_rank */
         rc = pg_post_ctrl_send(ctx, PG_QP_DIR_TO_NEXT, &msg);
         if (rc != PG_SUCCESS) return rc;
 
-        int send_done = 0, recv_done = 0;
-        if (pg_progress_pop_pending(ctx, PG_QP_DIR_FROM_PREV, (int)msg_type, (uint32_t)-1, &ev)) {
-            recv_done = 1;
-        }
-
-        while (!send_done || !recv_done) {
-            rc = pg_progress_wait(ctx, PG_CTRL_POLL_TIMEOUT_SEC, &ev);
-            if (rc != 1) return rc < 0 ? rc : PG_ERR_TIMEOUT;
-
-            if (ev.type == PG_WR_TYPE_SEND_CTRL && ev.qp_dir == PG_QP_DIR_TO_NEXT) {
-                send_done = 1;
-            } else if (ev.type == PG_WR_TYPE_RECV_CTRL && ev.qp_dir == PG_QP_DIR_FROM_PREV) {
-                if (ev.msg.type == msg_type) {
-                    recv_done = 1;
-                } else {
-                    pg_progress_push_pending(ctx, ev.qp_dir, &ev.msg, ev.eager_buf);
-                }
-            } else if (ev.type == PG_WR_TYPE_RECV_CTRL) {
-                pg_progress_push_pending(ctx, ev.qp_dir, &ev.msg, ev.eager_buf);
-            }
-        }
+        rc = pg_progress_wait_send_recv(ctx, PG_QP_DIR_TO_NEXT, PG_WR_TYPE_SEND_CTRL,
+                                        PG_QP_DIR_FROM_PREV, msg_type, (uint32_t)-1,
+                                        PG_CTRL_POLL_TIMEOUT_SEC, &ev);
+        if (rc != PG_SUCCESS) return rc;
     } else {
-        int recv_done = 0;
-        if (pg_progress_pop_pending(ctx, PG_QP_DIR_FROM_PREV, (int)msg_type, (uint32_t)-1, &ev)) {
-            recv_done = 1;
-        }
-
-        while (!recv_done) {
-            rc = pg_progress_wait(ctx, PG_CTRL_POLL_TIMEOUT_SEC, &ev);
-            if (rc != 1) return rc < 0 ? rc : PG_ERR_TIMEOUT;
-
-            if (ev.type == PG_WR_TYPE_RECV_CTRL && ev.qp_dir == PG_QP_DIR_FROM_PREV) {
-                if (ev.msg.type == msg_type) {
-                    recv_done = 1;
-                } else {
-                    pg_progress_push_pending(ctx, ev.qp_dir, &ev.msg, ev.eager_buf);
-                }
-            } else if (ev.type == PG_WR_TYPE_RECV_CTRL) {
-                pg_progress_push_pending(ctx, ev.qp_dir, &ev.msg, ev.eager_buf);
-            }
-        }
-
-        /* Forward token to next rank */
-        struct pg_ctrl_msg msg;
-        memset(&msg, 0, sizeof(msg));
-        msg.tag = PG_CTRL_TAG;
-        msg.type = msg_type;
-        msg.sender_rank = (uint16_t)ctx->rank;
+        /* Other Ranks: Wait for token from prev_rank, then forward token to next_rank */
+        rc = pg_progress_wait_msg(ctx, PG_QP_DIR_FROM_PREV, msg_type, (uint32_t)-1,
+                                  PG_CTRL_POLL_TIMEOUT_SEC, &ev);
+        if (rc != PG_SUCCESS) return rc;
 
         rc = pg_post_ctrl_send(ctx, PG_QP_DIR_TO_NEXT, &msg);
         if (rc != PG_SUCCESS) return rc;
 
-        int send_done = 0;
-        while (!send_done) {
-            rc = pg_progress_wait(ctx, PG_CTRL_POLL_TIMEOUT_SEC, &ev);
-            if (rc != 1) return rc < 0 ? rc : PG_ERR_TIMEOUT;
-
-            if (ev.type == PG_WR_TYPE_SEND_CTRL && ev.qp_dir == PG_QP_DIR_TO_NEXT) {
-                send_done = 1;
-            } else if (ev.type == PG_WR_TYPE_RECV_CTRL) {
-                pg_progress_push_pending(ctx, ev.qp_dir, &ev.msg, ev.eager_buf);
-            }
-        }
+        rc = pg_progress_wait_type(ctx, PG_QP_DIR_TO_NEXT, PG_WR_TYPE_SEND_CTRL,
+                                   PG_CTRL_POLL_TIMEOUT_SEC, NULL);
+        if (rc != PG_SUCCESS) return rc;
     }
 
     return PG_SUCCESS;
@@ -1468,16 +1404,17 @@ static int pg_ring_step_transfer_eager(struct pg_context *ctx, const struct pg_r
                             if (eager_recv_micros == num_recv_micros) {
                                 recv_done = 1;
                             }
-                        } else if (ev.msg.tag == PG_CTRL_TAG) {
-                            pg_progress_push_pending(ctx, ev.qp_dir, &ev.msg, ev.eager_buf);
+                        } else {
+                            pg_progress_buffer_unexpected(ctx, &ev);
                         }
                     } else {
-                        pg_progress_push_pending(ctx, ev.qp_dir, &ev.msg, ev.eager_buf);
+                        pg_progress_buffer_unexpected(ctx, &ev);
                     }
                     break;
                 }
 
                 default:
+                    pg_progress_buffer_unexpected(ctx, &ev);
                     break;
             }
         }
@@ -1718,7 +1655,7 @@ static int pg_ring_step_transfer_rdv(struct pg_context *ctx, const struct pg_rin
                             recv_done = 1;
                         }
                     } else {
-                        pg_progress_push_pending(ctx, ev.qp_dir, &ev.msg, ev.eager_buf);
+                        pg_progress_buffer_unexpected(ctx, &ev);
                     }
                     break;
                 }
