@@ -2216,19 +2216,9 @@ int pg_all_reduce(void *sendbuf, void *recvbuf, int count,
     /* Phase 1: Reduce-Scatter into local owned slice recvbuf[rank] */
     int rc = pg_reduce_scatter(sendbuf, (char *)recvbuf + my_seg_offset,
                                count, datatype, op, pg_handle);
-    if (rc != PG_SUCCESS) {
-        fprintf(stderr, "[pg_all_reduce] Rank %d Reduce-Scatter phase failed with code %d\n",
-                ctx->rank, rc);
-        return rc;
-    }
-
-    /* Phase 2: Distributed barrier before All-Gather phase (ADR-0007) */
-    rc = pg_barrier(pg_handle);
-    if (rc != PG_SUCCESS) {
-        fprintf(stderr, "[pg_all_reduce] Rank %d intermediate barrier failed with code %d\n",
-                ctx->rank, rc);
-        return rc;
-    }
+    if (rc != PG_SUCCESS) return rc;
+    /* Phase 2: Barrierless RS -> AG phase fusion (ADR-0008, Phase 3) */
+    /* Rank immediately begins All-Gather without global barrier dead time */
 
     /* Phase 3: Direct All-Gather distributing reduced segments across ring */
     rc = pg_ring_all_gather_generalized(ctx, recvbuf, count, datatype);
