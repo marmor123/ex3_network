@@ -13,6 +13,7 @@
 #include <arpa/inet.h>
 #include <time.h>
 #include <poll.h>
+#include <sys/mman.h>
 
 /* Global process group arguments initialized from CLI */
 struct pg_args g_pg_args = {0};
@@ -678,10 +679,16 @@ int pg_ensure_internal_buffers(struct pg_context *ctx, size_t count_bytes, size_
             ctx->staging_buf = NULL;
         }
 
-        if (posix_memalign((void **)&ctx->staging_buf, 64, segment_bytes) != 0 || !ctx->staging_buf) {
+        size_t align = (segment_bytes >= 2 * 1024 * 1024) ? (2 * 1024 * 1024) : 64;
+        if (posix_memalign((void **)&ctx->staging_buf, align, segment_bytes) != 0 || !ctx->staging_buf) {
             ctx->staging_capacity = 0;
             return PG_ERR_NOMEM;
         }
+#ifdef MADV_HUGEPAGE
+        if (segment_bytes >= 2 * 1024 * 1024) {
+            madvise(ctx->staging_buf, segment_bytes, MADV_HUGEPAGE);
+        }
+#endif
         ctx->staging_capacity = segment_bytes;
 
         ctx->staging_mr = ibv_reg_mr(ctx->pd, ctx->staging_buf, ctx->staging_capacity,
@@ -707,10 +714,16 @@ int pg_ensure_internal_buffers(struct pg_context *ctx, size_t count_bytes, size_
             ctx->work_buf = NULL;
         }
 
-        if (posix_memalign((void **)&ctx->work_buf, 64, count_bytes) != 0 || !ctx->work_buf) {
+        size_t align = (count_bytes >= 2 * 1024 * 1024) ? (2 * 1024 * 1024) : 64;
+        if (posix_memalign((void **)&ctx->work_buf, align, count_bytes) != 0 || !ctx->work_buf) {
             ctx->work_capacity = 0;
             return PG_ERR_NOMEM;
         }
+#ifdef MADV_HUGEPAGE
+        if (count_bytes >= 2 * 1024 * 1024) {
+            madvise(ctx->work_buf, count_bytes, MADV_HUGEPAGE);
+        }
+#endif
         ctx->work_capacity = count_bytes;
 
         ctx->work_mr = ibv_reg_mr(ctx->pd, ctx->work_buf, ctx->work_capacity,
