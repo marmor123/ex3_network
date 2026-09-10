@@ -17,13 +17,6 @@ else
     CFLAGS += -DPG_MODE_AUTO
 endif
 
-RDV_VARIANT ?= classic
-ifeq ($(RDV_VARIANT),pipeline)
-    CFLAGS += -DPG_RDV_PIPELINE
-else
-    CFLAGS += -DPG_RDV_CLASSIC
-endif
-
 TARGET = test
 SRCS = main_test.c pg.c
 OBJS = $(SRCS:.c=.o)

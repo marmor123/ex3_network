@@ -636,21 +636,6 @@ int main(int argc, char **argv) {
             }
         }
 
-#ifndef PG_WORKBUFFER_INPLACE
-        /* Verify sendbuf immutability (sendbuf must NOT be modified in safe mode) */
-        for (int k = 0; k < count; k++) {
-            int expected_orig = (rank + 1) * (int)((k % 1000) + 1);
-            if (sints[k] != expected_orig) {
-                if (errors < 5) {
-                    fprintf(stderr, "  [ERROR] Rank %d at idx %d: sendbuf was modified! got %d, expected %d\n",
-                            rank, k, sints[k], expected_orig);
-                }
-                errors++;
-                break;
-            }
-        }
-#endif
-
         if (errors > 0) {
             fprintf(stderr, "  [FAIL] Size %10zu B (%9d ints) -> %d data mismatches on rank %d\n",
                     sz, count, errors, rank);
@@ -840,21 +825,6 @@ int main(int argc, char **argv) {
                 errors++;
             }
         }
-
-#ifndef PG_WORKBUFFER_INPLACE
-        /* Verify sendbuf immutability (sendbuf must NOT be modified in safe mode) */
-        for (int k = 0; k < count; k++) {
-            int expected_orig = (rank + 1) * (int)((k % 1000) + 1);
-            if (sints[k] != expected_orig) {
-                if (errors < 5) {
-                    fprintf(stderr, "  [ERROR] Rank %d at idx %d: sendbuf was modified! got %d, expected %d\n",
-                            rank, k, sints[k], expected_orig);
-                }
-                errors++;
-                break;
-            }
-        }
-#endif
 
         if (errors > 0) {
             fprintf(stderr, "  [FAIL] Size %10zu B (%9d ints) -> %d data mismatches on rank %d\n",

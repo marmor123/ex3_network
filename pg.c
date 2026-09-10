@@ -712,8 +712,9 @@ int pg_ensure_internal_buffers(struct pg_context *ctx, size_t count_bytes, size_
         }
     }
 
-    /* 2. Work buffer: needs at least count_bytes (allocated only when count_bytes > 0) */
-    if (count_bytes > 0 && ctx->work_capacity < count_bytes) {
+#ifndef PG_WORKBUFFER_INPLACE
+    /* 2. Work buffer: needs at least count_bytes in safe mode */
+    if (ctx->work_capacity < count_bytes) {
         if (ctx->work_mr) {
             ibv_dereg_mr(ctx->work_mr);
             ctx->work_mr = NULL;
@@ -745,47 +746,16 @@ int pg_ensure_internal_buffers(struct pg_context *ctx, size_t count_bytes, size_
             return PG_ERR_RDMA;
         }
     }
+#else
+    (void)count_bytes;
+#endif
 
     return PG_SUCCESS;
-}
-
-/* Calibrate Invariant Time-Stamp Counter against CLOCK_MONOTONIC */
-static uint64_t pg_calibrate_tsc(void) {
-    struct timespec ts_start, ts_now;
-    clock_gettime(CLOCK_MONOTONIC, &ts_start);
-    uint64_t tsc_start = pg_rdtsc();
-
-    uint64_t elapsed_ns = 0;
-    while (elapsed_ns < 5000000ULL) { /* 5 ms spin calibration */
-        clock_gettime(CLOCK_MONOTONIC, &ts_now);
-        elapsed_ns = (uint64_t)(ts_now.tv_sec - ts_start.tv_sec) * 1000000000ULL +
-                     (uint64_t)(ts_now.tv_nsec - ts_start.tv_nsec);
-    }
-    uint64_t tsc_end = pg_rdtsc();
-    uint64_t tsc_diff = tsc_end - tsc_start;
-    if (elapsed_ns == 0 || tsc_diff == 0) return 2667000000ULL;
-    uint64_t hz = (uint64_t)((double)tsc_diff * 1e9 / (double)elapsed_ns);
-    return (hz > 500000000ULL && hz < 10000000000ULL) ? hz : 2667000000ULL;
 }
 
 /* Initialize Runtime Hyperparameters from Environment with compile-time defaults */
 void pg_init_tuning_params(struct pg_context *ctx) {
     if (!ctx) return;
-
-    /* Calibrate hardware TSC cycle counter (Phase 1) */
-    ctx->tsc_hz = pg_calibrate_tsc();
-    ctx->wc_cache_count = 0;
-    ctx->wc_cache_head = 0;
-
-    /* Pre-link zero-allocation static WR and SGE templates (Phase 1) */
-    memset(ctx->static_wrs, 0, sizeof(ctx->static_wrs));
-    memset(ctx->static_sges, 0, sizeof(ctx->static_sges));
-    for (int i = 0; i < 64; i++) {
-        ctx->static_wrs[i].opcode = IBV_WR_RDMA_WRITE;
-        ctx->static_wrs[i].sg_list = &ctx->static_sges[i];
-        ctx->static_wrs[i].num_sge = 1;
-        ctx->static_wrs[i].next = (i + 1 < 64) ? &ctx->static_wrs[i + 1] : NULL;
-    }
 
     ctx->pipeline_chunk = PG_PIPELINE_CHUNK;
     const char *chunk_env = getenv("PG_PIPELINE_CHUNK");
@@ -907,110 +877,6 @@ void pg_reduce_buffer(void *dest, const void *src, int count,
             PG_REDUCE_OP_CASES(double, __m128d,
                                _mm_loadu_pd, _mm_storeu_pd,
                                _mm_add_pd, _mm_min_pd, _mm_max_pd, _mm_mul_pd, 2);
-            break;
-        }
-
-        default:
-            break;
-    }
-}
-
-#define PG_STREAM_SI128(p, v) _mm_stream_si128((__m128i *)(p), (v))
-#define PG_STREAM_PS(p, v)    _mm_stream_ps((float *)(p), (v))
-#define PG_STREAM_PD(p, v)    _mm_stream_pd((double *)(p), (v))
-
-#define PG_REDUCE_LOOP_3WAY_4X(type, vtype, load_fn, store_fn, stream_fn, vec_op, scalar_expr, step) do { \
-    if (((uintptr_t)d & 15) == 0) { \
-        for (; i + ((step) * 4) <= count; i += ((step) * 4)) { \
-            vtype va0 = load_fn(s1 + i); \
-            vtype va1 = load_fn(s1 + i + (step)); \
-            vtype va2 = load_fn(s1 + i + (step) * 2); \
-            vtype va3 = load_fn(s1 + i + (step) * 3); \
-            vtype vb0 = load_fn(s2 + i); \
-            vtype vb1 = load_fn(s2 + i + (step)); \
-            vtype vb2 = load_fn(s2 + i + (step) * 2); \
-            vtype vb3 = load_fn(s2 + i + (step) * 3); \
-            stream_fn(d + i, vec_op(va0, vb0)); \
-            stream_fn(d + i + (step), vec_op(va1, vb1)); \
-            stream_fn(d + i + (step) * 2, vec_op(va2, vb2)); \
-            stream_fn(d + i + (step) * 3, vec_op(va3, vb3)); \
-        } \
-        for (; i + (step) <= count; i += (step)) { \
-            vtype va = load_fn(s1 + i); \
-            vtype vb = load_fn(s2 + i); \
-            stream_fn(d + i, vec_op(va, vb)); \
-        } \
-        _mm_sfence(); \
-    } else { \
-        for (; i + ((step) * 4) <= count; i += ((step) * 4)) { \
-            vtype va0 = load_fn(s1 + i); \
-            vtype va1 = load_fn(s1 + i + (step)); \
-            vtype va2 = load_fn(s1 + i + (step) * 2); \
-            vtype va3 = load_fn(s1 + i + (step) * 3); \
-            vtype vb0 = load_fn(s2 + i); \
-            vtype vb1 = load_fn(s2 + i + (step)); \
-            vtype vb2 = load_fn(s2 + i + (step) * 2); \
-            vtype vb3 = load_fn(s2 + i + (step) * 3); \
-            store_fn(d + i, vec_op(va0, vb0)); \
-            store_fn(d + i + (step), vec_op(va1, vb1)); \
-            store_fn(d + i + (step) * 2, vec_op(va2, vb2)); \
-            store_fn(d + i + (step) * 3, vec_op(va3, vb3)); \
-        } \
-        for (; i + (step) <= count; i += (step)) { \
-            vtype va = load_fn(s1 + i); \
-            vtype vb = load_fn(s2 + i); \
-            store_fn(d + i, vec_op(va, vb)); \
-        } \
-    } \
-    for (; i < count; i++) { d[i] = scalar_expr; } \
-} while(0)
-
-#define PG_REDUCE_3WAY_OP_CASES(type, vtype, load_fn, store_fn, stream_fn, add_vec, min_vec, max_vec, mul_vec, step) do { \
-    int i = 0; \
-    if (op == PG_SUM) { \
-        PG_REDUCE_LOOP_3WAY_4X(type, vtype, load_fn, store_fn, stream_fn, add_vec, s1[i] + s2[i], step); \
-    } else if (op == PG_MIN) { \
-        PG_REDUCE_LOOP_3WAY_4X(type, vtype, load_fn, store_fn, stream_fn, min_vec, (s1[i] < s2[i] ? s1[i] : s2[i]), step); \
-    } else if (op == PG_MAX) { \
-        PG_REDUCE_LOOP_3WAY_4X(type, vtype, load_fn, store_fn, stream_fn, max_vec, (s1[i] > s2[i] ? s1[i] : s2[i]), step); \
-    } else if (op == PG_PROD) { \
-        PG_REDUCE_LOOP_3WAY_4X(type, vtype, load_fn, store_fn, stream_fn, mul_vec, s1[i] * s2[i], step); \
-    } \
-} while(0)
-
-/* Single-pass 3-way vector reduction computing dest = src1 OP src2 without intermediate copy */
-void pg_reduce_buffer_3way(void *dest, const void *src1, const void *src2, int count,
-                           DATATYPE datatype, OPERATION op) {
-    if (count <= 0 || !dest || !src1 || !src2) return;
-
-    switch (datatype) {
-        case PG_INT: {
-            int32_t *d = (int32_t *)dest;
-            const int32_t *s1 = (const int32_t *)src1;
-            const int32_t *s2 = (const int32_t *)src2;
-            PG_REDUCE_3WAY_OP_CASES(int32_t, __m128i,
-                                    PG_LOAD_SI128, PG_STORE_SI128, PG_STREAM_SI128,
-                                    _mm_add_epi32, _mm_min_epi32, _mm_max_epi32, _mm_mullo_epi32, 4);
-            break;
-        }
-
-        case PG_FLOAT: {
-            float *d = (float *)dest;
-            const float *s1 = (const float *)src1;
-            const float *s2 = (const float *)src2;
-            PG_REDUCE_3WAY_OP_CASES(float, __m128,
-                                    _mm_loadu_ps, _mm_storeu_ps, PG_STREAM_PS,
-                                    _mm_add_ps, _mm_min_ps, _mm_max_ps, _mm_mul_ps, 4);
-            break;
-        }
-
-        case PG_DOUBLE: {
-            double *d = (double *)dest;
-            const double *s1 = (const double *)src1;
-            const double *s2 = (const double *)src2;
-            PG_REDUCE_3WAY_OP_CASES(double, __m128d,
-                                    _mm_loadu_pd, _mm_storeu_pd, PG_STREAM_PD,
-                                    _mm_add_pd, _mm_min_pd, _mm_max_pd, _mm_mul_pd, 2);
             break;
         }
 
@@ -1509,9 +1375,8 @@ static int pg_ring_step_transfer_eager(struct pg_context *ctx, const struct pg_r
     uint32_t eager_completed_micros = 0;
     uint32_t eager_recv_micros = 0;
 
-    uint64_t tsc_hz = (ctx && ctx->tsc_hz > 0) ? ctx->tsc_hz : 2667000000ULL;
-    uint64_t timeout_cycles = (uint64_t)((double)PG_CTRL_POLL_TIMEOUT_SEC * (double)tsc_hz);
-    uint64_t deadline_tsc = pg_rdtsc() + timeout_cycles;
+    struct timespec start, now;
+    clock_gettime(CLOCK_MONOTONIC, &start);
 
     while (!send_done || !recv_done) {
         /* 1. Pop any pending eager payloads for this recv_tag */
@@ -1531,7 +1396,7 @@ static int pg_ring_step_transfer_eager(struct pg_context *ctx, const struct pg_r
             if (eager_recv_micros == num_recv_micros) {
                 recv_done = 1;
             }
-            deadline_tsc = pg_rdtsc() + timeout_cycles;
+            clock_gettime(CLOCK_MONOTONIC, &start);
         }
 
         /* 2. Post eager sends within flow control window */
@@ -1563,7 +1428,7 @@ static int pg_ring_step_transfer_eager(struct pg_context *ctx, const struct pg_r
                 return rc;
             }
             eager_posted_micros++;
-            deadline_tsc = pg_rdtsc() + timeout_cycles;
+            clock_gettime(CLOCK_MONOTONIC, &start);
         }
 
         if (send_done && recv_done) break;
@@ -1573,7 +1438,7 @@ static int pg_ring_step_transfer_eager(struct pg_context *ctx, const struct pg_r
         int rc = pg_progress_poll(ctx, &ev);
         if (rc < 0) return rc;
         if (rc == 1) {
-            deadline_tsc = pg_rdtsc() + timeout_cycles;
+            clock_gettime(CLOCK_MONOTONIC, &start);
             switch (ev.type) {
                 case PG_WR_TYPE_EAGER_SEND: {
                     if (ev.qp_dir == PG_QP_DIR_TO_NEXT) {
@@ -1617,7 +1482,9 @@ static int pg_ring_step_transfer_eager(struct pg_context *ctx, const struct pg_r
             }
         }
 
-        if (pg_rdtsc() >= deadline_tsc) {
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        double elapsed = (now.tv_sec - start.tv_sec) + (now.tv_nsec - start.tv_nsec) / 1e9;
+        if (elapsed >= (double)PG_CTRL_POLL_TIMEOUT_SEC) {
             fprintf(stderr, "[pg_transfer] Rank %d eager timed out on step %u: "
                             "send_done=%d (%u/%u), recv_done=%d (%u/%u)\n",
                     ctx->rank, desc->step_idx, send_done, eager_completed_micros, num_send_micros,
@@ -1666,9 +1533,8 @@ static int pg_ring_step_transfer_rdv(struct pg_context *ctx, const struct pg_rin
         }
     }
 
-    uint64_t tsc_hz = (ctx && ctx->tsc_hz > 0) ? ctx->tsc_hz : 2667000000ULL;
-    uint64_t timeout_cycles = (uint64_t)((double)PG_CTRL_POLL_TIMEOUT_SEC * (double)tsc_hz);
-    uint64_t deadline_tsc = pg_rdtsc() + timeout_cycles;
+    struct timespec start, now;
+    clock_gettime(CLOCK_MONOTONIC, &start);
 
     while (!send_done || !recv_done) {
         /* 1. Check pending RTS messages from prev */
@@ -1690,7 +1556,7 @@ static int pg_ring_step_transfer_rdv(struct pg_context *ctx, const struct pg_rin
                 fprintf(stderr, "[pg_transfer] Rank %d failed to send CTS\n", ctx->rank);
                 return rc;
             }
-            deadline_tsc = pg_rdtsc() + timeout_cycles;
+            clock_gettime(CLOCK_MONOTONIC, &start);
         }
 
         /* 2. Check pending DATA_DONE messages from prev */
@@ -1713,7 +1579,7 @@ static int pg_ring_step_transfer_rdv(struct pg_context *ctx, const struct pg_rin
             if (data_done_recv_micros == num_recv_micros && (send_ctrl_completed_from_prev >= 1 || num_recv_micros == 0)) {
                 recv_done = 1;
             }
-            deadline_tsc = pg_rdtsc() + timeout_cycles;
+            clock_gettime(CLOCK_MONOTONIC, &start);
         }
 
         /* 3. Check pending CTS messages from next */
@@ -1721,7 +1587,7 @@ static int pg_ring_step_transfer_rdv(struct pg_context *ctx, const struct pg_rin
             cts_received = 1;
             remote_target_addr = pmsg.msg.payload.rdv.remote_addr;
             remote_target_rkey = pmsg.msg.payload.rdv.rkey;
-            deadline_tsc = pg_rdtsc() + timeout_cycles;
+            clock_gettime(CLOCK_MONOTONIC, &start);
         }
 
         /* 4. Post batched RDMA Writes within window */
@@ -1734,6 +1600,10 @@ static int pg_ring_step_transfer_rdv(struct pg_context *ctx, const struct pg_rin
             if (to_post > (uint32_t)ctx->batch_size) to_post = (uint32_t)ctx->batch_size;
             if (to_post > 64) to_post = 64;
             if (to_post == 0) break;
+
+            struct ibv_sge sges[64];
+            struct ibv_send_wr wrs[64];
+            memset(wrs, 0, sizeof(struct ibv_send_wr) * to_post);
 
             for (uint32_t b = 0; b < to_post; b++) {
                 uint32_t k = rdma_posted_micros + b;
@@ -1751,24 +1621,27 @@ static int pg_ring_step_transfer_rdv(struct pg_context *ctx, const struct pg_rin
                 if (eff_sig_interval == 0) eff_sig_interval = 1;
                 int is_signaled = ((k + 1) % eff_sig_interval == 0 || (k + 1) == num_send_micros);
 
-                ctx->static_sges[b].addr   = (uintptr_t)local_src;
-                ctx->static_sges[b].length = (uint32_t)micro_len;
-                ctx->static_sges[b].lkey   = desc->send_lkey;
+                sges[b].addr   = (uintptr_t)local_src;
+                sges[b].length = (uint32_t)micro_len;
+                sges[b].lkey   = desc->send_lkey;
 
-                ctx->static_wrs[b].wr_id      = pg_make_wr_slot(PG_QP_DIR_TO_NEXT, PG_WR_TYPE_RDMA_WRITE, k);
-                ctx->static_wrs[b].send_flags = is_signaled ? IBV_SEND_SIGNALED : 0;
-                ctx->static_wrs[b].next       = (b + 1 < to_post) ? &ctx->static_wrs[b + 1] : NULL;
-                ctx->static_wrs[b].wr.rdma.remote_addr = remote_addr;
-                ctx->static_wrs[b].wr.rdma.rkey        = remote_target_rkey;
+                wrs[b].wr_id      = pg_make_wr_slot(PG_QP_DIR_TO_NEXT, PG_WR_TYPE_RDMA_WRITE, k);
+                wrs[b].opcode     = IBV_WR_RDMA_WRITE;
+                wrs[b].send_flags = is_signaled ? IBV_SEND_SIGNALED : 0;
+                wrs[b].sg_list    = &sges[b];
+                wrs[b].num_sge    = 1;
+                wrs[b].next       = (b + 1 < to_post) ? &wrs[b + 1] : NULL;
+                wrs[b].wr.rdma.remote_addr = remote_addr;
+                wrs[b].wr.rdma.rkey        = remote_target_rkey;
             }
 
             struct ibv_send_wr *bad_wr = NULL;
-            if (ibv_post_send(ctx->qp_to_next, &ctx->static_wrs[0], &bad_wr)) {
+            if (ibv_post_send(ctx->qp_to_next, &wrs[0], &bad_wr)) {
                 perror("[pg_transfer] Error: ibv_post_send failed for batched RDMA Write");
                 return PG_ERR_RDMA;
             }
             rdma_posted_micros += to_post;
-            deadline_tsc = pg_rdtsc() + timeout_cycles;
+            clock_gettime(CLOCK_MONOTONIC, &start);
         }
 
         if (send_done && recv_done) break;
@@ -1778,7 +1651,7 @@ static int pg_ring_step_transfer_rdv(struct pg_context *ctx, const struct pg_rin
         int rc = pg_progress_poll(ctx, &ev);
         if (rc < 0) return rc;
         if (rc == 1) {
-            deadline_tsc = pg_rdtsc() + timeout_cycles;
+            clock_gettime(CLOCK_MONOTONIC, &start);
             switch (ev.type) {
                 case PG_WR_TYPE_RECV_CTRL: {
                     if (ev.msg.tag != PG_CTRL_TAG) {
@@ -1907,7 +1780,9 @@ static int pg_ring_step_transfer_rdv(struct pg_context *ctx, const struct pg_rin
             }
         }
 
-        if (pg_rdtsc() >= deadline_tsc) {
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        double elapsed = (now.tv_sec - start.tv_sec) + (now.tv_nsec - start.tv_nsec) / 1e9;
+        if (elapsed >= (double)PG_CTRL_POLL_TIMEOUT_SEC) {
             fprintf(stderr, "[pg_transfer] Rank %d timed out on step %u:\n"
                             "  send_done=%d (cts=%d, rdma_post=%u/%u, rdma_comp=%u/%u, done_sent=%u/%u)\n"
                             "  recv_done=%d (done_recv=%u/%u)\n",
@@ -1928,72 +1803,6 @@ static inline int pg_ring_step_transfer(struct pg_context *ctx, int is_eager, co
     } else {
         return pg_ring_step_transfer_rdv(ctx, desc);
     }
-}
-
-static int pg_reduce_scatter_core(struct pg_context *ctx,
-                                  void *work_ptr, struct ibv_mr *work_mr,
-                                  void *recvbuf, int count,
-                                  DATATYPE datatype, OPERATION op) {
-    (void)count;
-    size_t elem_size = pg_get_datatype_size(datatype);
-    int max_seg_elems = ctx->seg_table[0].count;
-    size_t max_seg_bytes = (size_t)max_seg_elems * elem_size;
-
-    int is_eager = 0;
-#if (PG_ACTIVE_MODE == PG_MODE_TYPE_EAGER)
-    is_eager = 1;
-#elif (PG_ACTIVE_MODE == PG_MODE_TYPE_AUTO)
-    if (max_seg_bytes <= ctx->eager_threshold) {
-        is_eager = 1;
-    }
-#endif
-
-    struct pg_reduce_cb_ctx rctx = {
-        .datatype = datatype,
-        .op = op,
-        .elem_size = (int)elem_size
-    };
-
-    /* Execute size - 1 ring reduction steps */
-    for (int step = 0; step < ctx->size - 1; step++) {
-        int send_seg = (ctx->rank - step - 1 + ctx->size) % ctx->size;
-        int recv_seg = (ctx->rank - step - 2 + ctx->size) % ctx->size;
-
-        size_t send_seg_bytes = (size_t)ctx->seg_table[send_seg].count * elem_size;
-        size_t send_seg_offset = ctx->seg_table[send_seg].offset_bytes;
-
-        size_t recv_seg_bytes = (size_t)ctx->seg_table[recv_seg].count * elem_size;
-        size_t recv_seg_offset = ctx->seg_table[recv_seg].offset_bytes;
-
-        struct pg_ring_step_desc desc;
-        memset(&desc, 0, sizeof(desc));
-        desc.step_idx = (uint32_t)step;
-        desc.send_tag = (uint32_t)send_seg;
-        desc.send_buf = (char *)work_ptr + send_seg_offset;
-        desc.send_bytes = send_seg_bytes;
-        desc.send_lkey = work_mr->lkey;
-
-        desc.recv_tag = (uint32_t)recv_seg;
-        desc.recv_target_addr = ctx->staging_buf;
-        desc.recv_rkey = ctx->staging_mr->rkey;
-        desc.recv_bytes = recv_seg_bytes;
-
-        desc.on_recv_chunk = pg_reduce_chunk_cb;
-        desc.cb_dest = (char *)work_ptr + recv_seg_offset;
-        desc.cb_user_ctx = &rctx;
-
-        int rc = pg_ring_step_transfer(ctx, is_eager, &desc);
-        if (rc != PG_SUCCESS) return rc;
-    }
-
-    /* Deliver locally owned segment to recvbuf */
-    size_t my_seg_bytes = (size_t)ctx->seg_table[ctx->rank].count * elem_size;
-    size_t my_seg_offset = ctx->seg_table[ctx->rank].offset_bytes;
-    if (recvbuf != (char *)work_ptr + my_seg_offset) {
-        memmove(recvbuf, (char *)work_ptr + my_seg_offset, my_seg_bytes);
-    }
-
-    return PG_SUCCESS;
 }
 
 int pg_reduce_scatter(void *sendbuf, void *recvbuf, int count,
@@ -2022,39 +1831,92 @@ int pg_reduce_scatter(void *sendbuf, void *recvbuf, int count,
         return PG_SUCCESS;
     }
 
-    /* Precompute segment sizes and offsets for all ranks (Phase 1) */
-    pg_precompute_seg_table(ctx, count, elem_size);
-
     /* Maximum segment byte size across ranks */
-    int max_seg_elems = ctx->seg_table[0].count;
+    int max_seg_elems = pg_get_seg_count(0, count, ctx->size);
     size_t max_seg_bytes = (size_t)max_seg_elems * elem_size;
 
-#ifdef PG_WORKBUFFER_INPLACE
-    /* Ensure internal staging buffer only (count_bytes=0: work_buf is NOT allocated!) */
-    int rc = pg_ensure_internal_buffers(ctx, 0, max_seg_bytes);
+    /* Ensure internal staging (and safe-mode work) buffers */
+    int rc = pg_ensure_internal_buffers(ctx, total_bytes, max_seg_bytes);
     if (rc != PG_SUCCESS) return rc;
 
-    void *work_ptr = sendbuf;
-    struct ibv_mr *work_mr = pg_get_or_reg_mr(ctx, sendbuf, total_bytes,
-                                              IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
+    void *work_ptr = NULL;
+    struct ibv_mr *work_mr = NULL;
+
+#ifdef PG_WORKBUFFER_INPLACE
+    work_ptr = sendbuf;
+    work_mr = pg_get_or_reg_mr(ctx, sendbuf, total_bytes,
+                               IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
     if (!work_mr) {
         fprintf(stderr, "[pg_reduce_scatter] Rank %d failed to register inplace sendbuf MR\n", ctx->rank);
         return PG_ERR_RDMA;
     }
-    return pg_reduce_scatter_core(ctx, work_ptr, work_mr, recvbuf, count, datatype, op);
 #else
-    /* Ensure internal staging and safe-mode work buffers */
-    int rc = pg_ensure_internal_buffers(ctx, total_bytes, max_seg_bytes);
-    if (rc != PG_SUCCESS) return rc;
-
-    /* Safe mode: caller sendbuf is strictly immutable */
+    /* Safe mode: copy sendbuf into internal working buffer */
     if (sendbuf != ctx->work_buf) {
         memcpy(ctx->work_buf, sendbuf, total_bytes);
     }
-
-    return pg_reduce_scatter_core(ctx, ctx->work_buf, ctx->work_mr,
-                                  recvbuf, count, datatype, op);
+    work_ptr = ctx->work_buf;
+    work_mr = ctx->work_mr;
 #endif
+
+    int is_eager = 0;
+#if (PG_ACTIVE_MODE == PG_MODE_TYPE_EAGER)
+    is_eager = 1;
+#elif (PG_ACTIVE_MODE == PG_MODE_TYPE_AUTO)
+    if (max_seg_bytes <= ctx->eager_threshold) {
+        is_eager = 1;
+    }
+#endif
+
+    struct pg_reduce_cb_ctx rctx = {
+        .datatype = datatype,
+        .op = op,
+        .elem_size = (int)elem_size
+    };
+
+    /* Execute size - 1 ring reduction steps */
+    for (int step = 0; step < ctx->size - 1; step++) {
+        int send_seg = (ctx->rank - step - 1 + ctx->size) % ctx->size;
+        int recv_seg = (ctx->rank - step - 2 + ctx->size) % ctx->size;
+
+        int send_seg_elems = pg_get_seg_count(send_seg, count, ctx->size);
+        size_t send_seg_bytes = (size_t)send_seg_elems * elem_size;
+        size_t send_seg_offset = pg_get_seg_offset_bytes(send_seg, count, ctx->size, elem_size);
+
+        int recv_seg_elems = pg_get_seg_count(recv_seg, count, ctx->size);
+        size_t recv_seg_bytes = (size_t)recv_seg_elems * elem_size;
+        size_t recv_seg_offset = pg_get_seg_offset_bytes(recv_seg, count, ctx->size, elem_size);
+
+        struct pg_ring_step_desc desc;
+        memset(&desc, 0, sizeof(desc));
+        desc.step_idx = (uint32_t)step;
+        desc.send_tag = (uint32_t)send_seg;
+        desc.send_buf = (char *)work_ptr + send_seg_offset;
+        desc.send_bytes = send_seg_bytes;
+        desc.send_lkey = work_mr->lkey;
+
+        desc.recv_tag = (uint32_t)recv_seg;
+        desc.recv_target_addr = ctx->staging_buf;
+        desc.recv_rkey = ctx->staging_mr->rkey;
+        desc.recv_bytes = recv_seg_bytes;
+
+        desc.on_recv_chunk = pg_reduce_chunk_cb;
+        desc.cb_dest = (char *)work_ptr + recv_seg_offset;
+        desc.cb_user_ctx = &rctx;
+
+        rc = pg_ring_step_transfer(ctx, is_eager, &desc);
+        if (rc != PG_SUCCESS) return rc;
+    }
+
+    /* Deliver locally owned segment to recvbuf */
+    int my_seg_elems = pg_get_seg_count(ctx->rank, count, ctx->size);
+    size_t my_seg_bytes = (size_t)my_seg_elems * elem_size;
+    size_t my_seg_offset = pg_get_seg_offset_bytes(ctx->rank, count, ctx->size, elem_size);
+    if (recvbuf != (char *)work_ptr + my_seg_offset) {
+        memmove(recvbuf, (char *)work_ptr + my_seg_offset, my_seg_bytes);
+    }
+
+    return PG_SUCCESS;
 }
 
 /* Ring All-Gather Generalized Engine (Zero-Copy RDMA Write into final recvbuf with Multi-WR Batching) */
@@ -2064,10 +1926,7 @@ int pg_ring_all_gather_generalized(struct pg_context *ctx, void *recvbuf, int co
     if (ctx->size == 1) return PG_SUCCESS;
 
     size_t elem_size = pg_get_datatype_size(datatype);
-    /* Precompute segment sizes and offsets for all ranks (Phase 1) */
-    pg_precompute_seg_table(ctx, count, elem_size);
-
-    int max_seg_elems = ctx->seg_table[0].count;
+    int max_seg_elems = pg_get_seg_count(0, count, ctx->size);
     size_t max_seg_bytes = (size_t)max_seg_elems * elem_size;
     (void)max_seg_bytes;
     size_t total_bytes = (size_t)count * elem_size;
@@ -2093,11 +1952,13 @@ int pg_ring_all_gather_generalized(struct pg_context *ctx, void *recvbuf, int co
         int send_origin = (ctx->rank - step + ctx->size) % ctx->size;
         int recv_origin = (ctx->rank - step - 1 + ctx->size) % ctx->size;
 
-        size_t send_seg_bytes = (size_t)ctx->seg_table[send_origin].count * elem_size;
-        size_t send_seg_offset = ctx->seg_table[send_origin].offset_bytes;
+        int send_seg_elems = pg_get_seg_count(send_origin, count, ctx->size);
+        size_t send_seg_bytes = (size_t)send_seg_elems * elem_size;
+        size_t send_seg_offset = pg_get_seg_offset_bytes(send_origin, count, ctx->size, elem_size);
 
-        size_t recv_seg_bytes = (size_t)ctx->seg_table[recv_origin].count * elem_size;
-        size_t recv_seg_offset = ctx->seg_table[recv_origin].offset_bytes;
+        int recv_seg_elems = pg_get_seg_count(recv_origin, count, ctx->size);
+        size_t recv_seg_bytes = (size_t)recv_seg_elems * elem_size;
+        size_t recv_seg_offset = pg_get_seg_offset_bytes(recv_origin, count, ctx->size, elem_size);
 
         struct pg_ring_step_desc desc;
         memset(&desc, 0, sizeof(desc));
@@ -2158,28 +2019,6 @@ int pg_all_gather(void *sendbuf, void *recvbuf, int count,
     return pg_ring_all_gather_generalized(ctx, recvbuf, count * ctx->size, datatype);
 }
 
-#ifndef PG_WORKBUFFER_INPLACE
-struct pg_allreduce_dual_cb_ctx {
-    const char *sendbuf_slice;
-    char *recvbuf_slice;
-    DATATYPE datatype;
-    OPERATION op;
-    int elem_size;
-};
-
-static void pg_allreduce_dual_chunk_cb(void *dest, const void *src, size_t len, void *user_ctx) {
-    struct pg_allreduce_dual_cb_ctx *dctx = (struct pg_allreduce_dual_cb_ctx *)user_ctx;
-    if (!dctx || !dest || !src || len == 0) return;
-
-    size_t chunk_offset = (size_t)((char *)dest - dctx->recvbuf_slice);
-    int elem_count = (int)(len / dctx->elem_size);
-
-    /* For every step, dest (recvbuf) receives sendbuf[offset] OP staging[offset] via single-pass SIMD */
-    const void *op1 = dctx->sendbuf_slice + chunk_offset;
-    pg_reduce_buffer_3way(dest, op1, src, elem_count, dctx->datatype, dctx->op);
-}
-#endif
-
 int pg_all_reduce(void *sendbuf, void *recvbuf, int count,
                   DATATYPE datatype, OPERATION op,
                   void *pg_handle) {
@@ -2206,19 +2045,25 @@ int pg_all_reduce(void *sendbuf, void *recvbuf, int count,
         return PG_SUCCESS;
     }
 
-    /* Precompute segment table */
-    pg_precompute_seg_table(ctx, count, elem_size);
-
-#ifdef PG_WORKBUFFER_INPLACE
     /* Offset for local owned slice within recvbuf */
-    size_t my_seg_offset = ctx->seg_table[ctx->rank].offset_bytes;
+    size_t my_seg_offset = pg_get_seg_offset_bytes(ctx->rank, count, ctx->size, elem_size);
 
     /* Phase 1: Reduce-Scatter into local owned slice recvbuf[rank] */
     int rc = pg_reduce_scatter(sendbuf, (char *)recvbuf + my_seg_offset,
                                count, datatype, op, pg_handle);
-    if (rc != PG_SUCCESS) return rc;
-    /* Phase 2: Barrierless RS -> AG phase fusion (ADR-0008, Phase 3) */
-    /* Rank immediately begins All-Gather without global barrier dead time */
+    if (rc != PG_SUCCESS) {
+        fprintf(stderr, "[pg_all_reduce] Rank %d Reduce-Scatter phase failed with code %d\n",
+                ctx->rank, rc);
+        return rc;
+    }
+
+    /* Phase 2: Distributed barrier before All-Gather phase (ensures phase synchronization and minimizes CQ jitter) */
+    rc = pg_barrier(pg_handle);
+    if (rc != PG_SUCCESS) {
+        fprintf(stderr, "[pg_all_reduce] Rank %d intermediate barrier failed with code %d\n",
+                ctx->rank, rc);
+        return rc;
+    }
 
     /* Phase 3: Direct All-Gather distributing reduced segments across ring */
     rc = pg_ring_all_gather_generalized(ctx, recvbuf, count, datatype);
@@ -2229,96 +2074,4 @@ int pg_all_reduce(void *sendbuf, void *recvbuf, int count,
     }
 
     return PG_SUCCESS;
-#else
-    int max_seg_elems = ctx->seg_table[0].count;
-    size_t max_seg_bytes = (size_t)max_seg_elems * elem_size;
-
-    /* Ensure staging buffer only (count_bytes=0: work_buf is NOT allocated!) */
-    int rc = pg_ensure_internal_buffers(ctx, 0, max_seg_bytes);
-    if (rc != PG_SUCCESS) return rc;
-
-    /* Register sendbuf and recvbuf MRs in lazy MR cache */
-    struct ibv_mr *send_mr = pg_get_or_reg_mr(ctx, (void *)sendbuf, total_bytes, IBV_ACCESS_LOCAL_WRITE);
-    if (!send_mr) {
-        fprintf(stderr, "[pg_all_reduce] Rank %d failed to register sendbuf MR\n", ctx->rank);
-        return PG_ERR_RDMA;
-    }
-    struct ibv_mr *recv_mr = pg_get_or_reg_mr(ctx, recvbuf, total_bytes,
-                                              IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
-    if (!recv_mr) {
-        fprintf(stderr, "[pg_all_reduce] Rank %d failed to register recvbuf MR\n", ctx->rank);
-        return PG_ERR_RDMA;
-    }
-
-    int is_eager = 0;
-#if (PG_ACTIVE_MODE == PG_MODE_TYPE_EAGER)
-    is_eager = 1;
-#elif (PG_ACTIVE_MODE == PG_MODE_TYPE_AUTO)
-    if (max_seg_bytes <= ctx->eager_threshold) {
-        is_eager = 1;
-    }
-#endif
-
-    /* Phase 1: Dual-buffer in-place Reduce-Scatter directly accumulating into recvbuf (Approach A) */
-    for (int step = 0; step < ctx->size - 1; step++) {
-        int send_seg = (ctx->rank - step - 1 + ctx->size) % ctx->size;
-        int recv_seg = (ctx->rank - step - 2 + ctx->size) % ctx->size;
-
-        size_t send_seg_bytes = (size_t)ctx->seg_table[send_seg].count * elem_size;
-        size_t send_seg_offset = ctx->seg_table[send_seg].offset_bytes;
-
-        size_t recv_seg_bytes = (size_t)ctx->seg_table[recv_seg].count * elem_size;
-        size_t recv_seg_offset = ctx->seg_table[recv_seg].offset_bytes;
-
-        struct pg_ring_step_desc desc;
-        memset(&desc, 0, sizeof(desc));
-        desc.step_idx = (uint32_t)step;
-        desc.send_tag = (uint32_t)send_seg;
-        if (step == 0) {
-            desc.send_buf = (const char *)sendbuf + send_seg_offset;
-            desc.send_lkey = send_mr->lkey;
-        } else {
-            desc.send_buf = (const char *)recvbuf + send_seg_offset;
-            desc.send_lkey = recv_mr->lkey;
-        }
-        desc.send_bytes = send_seg_bytes;
-
-        desc.recv_tag = (uint32_t)recv_seg;
-        desc.recv_target_addr = ctx->staging_buf;
-        desc.recv_rkey = ctx->staging_mr->rkey;
-        desc.recv_bytes = recv_seg_bytes;
-
-        struct pg_allreduce_dual_cb_ctx dctx = {
-            .sendbuf_slice = (const char *)sendbuf + recv_seg_offset,
-            .recvbuf_slice = (char *)recvbuf + recv_seg_offset,
-            .datatype = datatype,
-            .op = op,
-            .elem_size = (int)elem_size
-        };
-
-        desc.on_recv_chunk = pg_allreduce_dual_chunk_cb;
-        desc.cb_dest = (char *)recvbuf + recv_seg_offset;
-        desc.cb_user_ctx = &dctx;
-
-        rc = pg_ring_step_transfer(ctx, is_eager, &desc);
-        if (rc != PG_SUCCESS) {
-            fprintf(stderr, "[pg_all_reduce] Rank %d Reduce-Scatter step %d failed with code %d\n",
-                    ctx->rank, step, rc);
-            return rc;
-        }
-    }
-
-    /* Phase 2: Barrierless RS -> AG phase fusion (ADR-0008, Phase 3) */
-    /* Rank immediately begins All-Gather without global barrier dead time */
-
-    /* Phase 3: Direct All-Gather distributing reduced segments across ring */
-    rc = pg_ring_all_gather_generalized(ctx, recvbuf, count, datatype);
-    if (rc != PG_SUCCESS) {
-        fprintf(stderr, "[pg_all_reduce] Rank %d All-Gather phase failed with code %d\n",
-                ctx->rank, rc);
-        return rc;
-    }
-
-    return PG_SUCCESS;
-#endif
 }

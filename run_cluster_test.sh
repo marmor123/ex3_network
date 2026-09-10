@@ -78,9 +78,8 @@ echo "Syncing local workspace to ${HOSTS[0]}:$CLUSTER_DIR..."
 rsync -avz --exclude '.git' --exclude '*.o' --exclude 'test' "$SCRIPT_DIR/" "${HOSTS[0]}:$CLUSTER_DIR/"
 
 MODE_BUILD="${MODE_BUILD:-${COLLECTIVE_MODE:-auto}}"
-RDV_BUILD="${RDV_BUILD:-${RDV_VARIANT:-classic}}"
-echo "Building on ${HOSTS[0]} (MODE=$MODE_BUILD, RDV_VARIANT=$RDV_BUILD)..."
-ssh $SSH_OPTS "${HOSTS[0]}" "cd $CLUSTER_DIR && make clean && make MODE=$MODE_BUILD RDV_VARIANT=$RDV_BUILD"
+echo "Building on ${HOSTS[0]} (MODE=$MODE_BUILD)..."
+ssh $SSH_OPTS "${HOSTS[0]}" "cd $CLUSTER_DIR && make clean && make MODE=$MODE_BUILD"
 
 PIDS=()
 for i in "${!HOSTS[@]}"; do
@@ -89,7 +88,7 @@ for i in "${!HOSTS[@]}"; do
     HOST="${HOSTS[$i]}"
     
     echo "Starting Rank $RANK (index $INDEX) on host $HOST..."
-    ssh $SSH_OPTS "$HOST" "cd $CLUSTER_DIR && (command -v numactl >/dev/null 2>&1 && numactl --cpunodebind=0 --preferred=0 ./test -myindex $INDEX -list ${HOSTS[*]} || ./test -myindex $INDEX -list ${HOSTS[*]})" &
+    ssh $SSH_OPTS "$HOST" "cd $CLUSTER_DIR && ./test -myindex $INDEX -list ${HOSTS[*]}" &
     PIDS+=($!)
 done
 
