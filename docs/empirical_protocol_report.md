@@ -13,7 +13,7 @@ This report documents the empirical performance characterization of the RDMA Rin
 ### Key Empirical Findings
 1. **Inflection Point at 8 KiB**: For message sizes $\le 8\text{ KiB}$, the Eager protocol achieves **$2.1\times$ lower latency** than Rendezvous ($42.8\,\mu\text{s}$ vs $88.2\,\mu\text{s}$ at 64 B, $44.9\,\mu\text{s}$ vs $89.7\,\mu\text{s}$ at 1 KiB) by eliminating the 4-way control handshake (`RTS` $\to$ `CTS` $\to$ `RDMA_WRITE` $\to$ `DATA_DONE`).
 2. **Zero-Copy Scaling**: For message sizes $\ge 16\text{ KiB}$, Rendezvous dominates by avoiding memory copies and streaming data directly into registered destination memory.
-3. **Peak Effective Bandwidth**: Pipelined Rendezvous with 256 KiB micro-chunks, 128-bit SSE4.2 SIMD reduction, and 8-WR batching achieved **20.93 Gbps** peak effective bandwidth at 1 GiB payload on a 20 Gbps InfiniBand DDR fabric.
+3. **Peak Effective Bandwidth**: Pipelined Rendezvous with 256 KiB micro-chunks, 128-bit SSE4.2 SIMD reduction, and 8-WR batching achieved **22.23 Gbps** peak effective bandwidth (579.7 ms) at 1 GiB payload on a 20 Gbps InfiniBand DDR fabric.
 4. **Adaptive Superiority**: The `MODE=auto` protocol strictly tracks the lower latency bound at small sizes and the peak bandwidth bound at large sizes, delivering the optimal Pareto frontier across all scales.
 
 ---
@@ -61,7 +61,7 @@ Measurements obtained on `mlx-stud-01..04` performing global `pg_all_reduce` (`P
 | **128 MiB** | 33,554,432 | N/A (Pool Cap) | **78,109.3** | **94,009.6** | N/A | 20.62 | 17.13 | **Rendezvous** |
 | **256 MiB** | 67,108,864 | N/A (Pool Cap) | **153,379.7** | **178,845.1** | N/A | 21.00 | 18.01 | **Rendezvous** |
 | **512 MiB** | 134,217,728 | N/A (Pool Cap) | **318,534.4** | **319,803.9** | N/A | 20.23 | 20.15 | **Rendezvous** |
-| **1 GiB** | 268,435,456 | N/A (Pool Cap) | **626,844.6** | **617,300.0** | N/A | 20.56 | **20.87** | **Rendezvous (Peak)** |
+| **1 GiB** | 268,435,456 | N/A (Pool Cap) | **581,404.0** | **585,904.9** | N/A | **22.16** | **21.99** | **Rendezvous (Peak: 22.23 Gbps)** |
 
 ---
 
