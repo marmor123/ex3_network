@@ -889,43 +889,7 @@ void pg_reduce_buffer(void *dest, const void *src, int count,
 /* === MODULE 4: PROGRESS ENGINE & CQ DISPATCH                          === */
 /* ========================================================================= */
 
-/* Post one signaled RDMA_WRITE operation */
-int pg_post_rdma_write(struct pg_context *ctx, int qp_dir, void *local_addr, size_t length,
-                       uint32_t lkey, uint64_t remote_addr, uint32_t rkey) {
-    if (!ctx || !local_addr || length == 0 ||
-        (qp_dir != PG_QP_DIR_TO_NEXT && qp_dir != PG_QP_DIR_FROM_PREV)) {
-        return PG_ERR_INVAL;
-    }
 
-    struct ibv_qp *target_qp = (qp_dir == PG_QP_DIR_TO_NEXT) ? ctx->qp_to_next : ctx->qp_from_prev;
-    struct ibv_sge sge = {
-        .addr   = (uintptr_t)local_addr,
-        .length = (uint32_t)length,
-        .lkey   = lkey
-    };
-    struct ibv_send_wr wr = {
-        .wr_id      = pg_make_wr(qp_dir, PG_WR_TYPE_RDMA_WRITE),
-        .opcode     = IBV_WR_RDMA_WRITE,
-        .send_flags = IBV_SEND_SIGNALED,
-        .sg_list    = &sge,
-        .num_sge    = 1,
-        .next       = NULL,
-        .wr         = {
-            .rdma = {
-                .remote_addr = remote_addr,
-                .rkey        = rkey
-            }
-        }
-    };
-    struct ibv_send_wr *bad_wr = NULL;
-
-    if (ibv_post_send(target_qp, &wr, &bad_wr)) {
-        perror("[pg_rdma] Error: ibv_post_send failed for RDMA_WRITE");
-        return PG_ERR_RDMA;
-    }
-
-    return PG_SUCCESS;
-}
 
 /* Edge-ordered ring-only TCP bootstrap exchanging real QP metadata */
 int pg_tcp_bootstrap(struct pg_context *ctx) {
@@ -1435,7 +1399,9 @@ static int pg_ring_step_transfer_eager(struct pg_context *ctx, const struct pg_r
 /* Rendezvous Multi-WR Pipelined Ring Step Transfer Engine */
 static int pg_ring_step_transfer_rdv(struct pg_context *ctx, const struct pg_ring_step_desc *desc) {
     size_t chunk_size = ctx->pipeline_chunk;
-    size_t seg_bytes = desc->send_bytes > desc->recv_bytes ? desc->send_bytes : desc->recv_bytes;
+    size_t max_seg_bytes = desc->total_bytes ?
+        ((desc->total_bytes + ctx->size - 1) / ctx->size) :
+        (desc->send_bytes > desc->recv_bytes ? desc->send_bytes : desc->recv_bytes);
     /*
      * Adaptive Micro-Chunk Granularity:
      * For transfers < 256 MiB total tensor (segment size < 64 MiB in 4-node ring),
@@ -1444,7 +1410,7 @@ static int pg_ring_step_transfer_rdv(struct pg_context *ctx, const struct pg_rin
      * For large transfers >= 256 MiB up to 1 GiB, 256 KiB chunks minimize work request
      * descriptor posting overhead to saturate the 20 Gbps link rate (achieving 22.23 Gbps).
      */
-    if (seg_bytes < (64ULL * 1024ULL * 1024ULL) && !getenv("PG_PIPELINE_CHUNK")) {
+    if (max_seg_bytes < (64ULL * 1024ULL * 1024ULL) && !getenv("PG_PIPELINE_CHUNK")) {
         chunk_size = (64 * 1024);
     }
 
@@ -1748,8 +1714,7 @@ static int pg_ring_step_transfer_rdv(struct pg_context *ctx, const struct pg_rin
 
 /* Dispatch transfer step to Eager or Rendezvous engine (Transfer Seam #2 Encapsulation) */
 static inline int pg_ring_step_transfer(struct pg_context *ctx, const struct pg_ring_step_desc *desc) {
-    size_t seg_bytes = desc->send_bytes > desc->recv_bytes ? desc->send_bytes : desc->recv_bytes;
-    if (pg_is_eager(ctx, seg_bytes)) {
+    if (pg_is_eager(ctx, desc)) {
         return pg_ring_step_transfer_eager(ctx, desc);
     } else {
         return pg_ring_step_transfer_rdv(ctx, desc);
@@ -1832,6 +1797,7 @@ int pg_reduce_scatter(void *sendbuf, void *recvbuf, int count,
         struct pg_ring_step_desc desc;
         memset(&desc, 0, sizeof(desc));
         desc.step_idx = (uint32_t)step;
+        desc.total_bytes = total_bytes;
         desc.send_tag = (uint32_t)send_seg;
         desc.send_buf = (char *)work_ptr + send_seg_offset;
         desc.send_bytes = send_seg_bytes;
@@ -1893,6 +1859,7 @@ int pg_ring_all_gather_generalized(struct pg_context *ctx, void *recvbuf, int co
         struct pg_ring_step_desc desc;
         memset(&desc, 0, sizeof(desc));
         desc.step_idx = (uint32_t)step;
+        desc.total_bytes = total_bytes;
         desc.send_tag = (uint32_t)send_origin;
         desc.send_buf = (char *)recvbuf + send_seg_offset;
         desc.send_bytes = send_seg_bytes;

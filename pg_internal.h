@@ -258,11 +258,14 @@ static inline void pg_pending_push(struct pg_context *ctx, int qp_dir, const str
         if (elen > (PG_EAGER_BUF_SIZE + PG_CTRL_MSG_LEN)) elen = PG_EAGER_BUF_SIZE + PG_CTRL_MSG_LEN;
         if (!q->pool[slot].eager_buf) {
             q->pool[slot].eager_buf = (char *)malloc(PG_EAGER_SLOT_SIZE);
+            if (!q->pool[slot].eager_buf) {
+                fprintf(stderr, "[pg] Fatal: OOM allocating eager buffer in pending queue\n");
+                q->pool[slot].in_use = 0;
+                return;
+            }
         }
-        if (q->pool[slot].eager_buf) {
-            memcpy(q->pool[slot].eager_buf, slot_buf, elen);
-            q->pool[slot].eager_len = elen;
-        }
+        memcpy(q->pool[slot].eager_buf, slot_buf, elen);
+        q->pool[slot].eager_len = elen;
     }
 
     q->ring[q->tail] = slot;
@@ -592,6 +595,7 @@ typedef void (*pg_chunk_handler_fn)(void *dest, const void *src, size_t len, voi
 
 struct pg_ring_step_desc {
     uint32_t step_idx;          /* 0-indexed ring step */
+    size_t total_bytes;         /* Total collective tensor size in bytes (uniform across ring) */
 
     /* Outbound */
     uint32_t send_tag;          /* Segment index or rank origin tag */
@@ -612,14 +616,17 @@ struct pg_ring_step_desc {
 };
 
 /* Protocol selection helper: determines whether micro-chunk transfer uses Eager Send/Recv or Rendezvous RDMA Write */
-static inline int pg_is_eager(struct pg_context *ctx, size_t seg_bytes) {
+static inline int pg_is_eager(struct pg_context *ctx, const struct pg_ring_step_desc *desc) {
 #if (PG_ACTIVE_MODE == PG_MODE_TYPE_EAGER)
-    (void)ctx; (void)seg_bytes;
+    (void)ctx; (void)desc;
     return 1;
 #elif (PG_ACTIVE_MODE == PG_MODE_TYPE_AUTO)
-    return seg_bytes <= ctx->eager_threshold;
+    size_t max_seg_bytes = desc->total_bytes ?
+        ((desc->total_bytes + ctx->size - 1) / ctx->size) :
+        (desc->send_bytes > desc->recv_bytes ? desc->send_bytes : desc->recv_bytes);
+    return max_seg_bytes <= ctx->eager_threshold;
 #else
-    (void)ctx; (void)seg_bytes;
+    (void)ctx; (void)desc;
     return 0;
 #endif
 }
@@ -645,10 +652,6 @@ int pg_ensure_internal_buffers(struct pg_context *ctx, size_t count_bytes, size_
 /* Vectorized Reduction Math Engine */
 void pg_reduce_buffer(void *dest, const void *src, int count,
                       DATATYPE datatype, OPERATION op);
-
-/* RDMA Operation Helpers */
-int pg_post_rdma_write(struct pg_context *ctx, int qp_dir, void *local_addr, size_t length,
-                       uint32_t lkey, uint64_t remote_addr, uint32_t rkey);
 
 /* Distributed Ring Barrier */
 int pg_barrier(void *pg_handle);
