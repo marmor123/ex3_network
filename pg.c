@@ -2029,6 +2029,20 @@ int pg_reduce_scatter(void *sendbuf, void *recvbuf, int count,
     int max_seg_elems = ctx->seg_table[0].count;
     size_t max_seg_bytes = (size_t)max_seg_elems * elem_size;
 
+#ifdef PG_WORKBUFFER_INPLACE
+    /* Ensure internal staging buffer only (count_bytes=0: work_buf is NOT allocated!) */
+    int rc = pg_ensure_internal_buffers(ctx, 0, max_seg_bytes);
+    if (rc != PG_SUCCESS) return rc;
+
+    void *work_ptr = sendbuf;
+    struct ibv_mr *work_mr = pg_get_or_reg_mr(ctx, sendbuf, total_bytes,
+                                              IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
+    if (!work_mr) {
+        fprintf(stderr, "[pg_reduce_scatter] Rank %d failed to register inplace sendbuf MR\n", ctx->rank);
+        return PG_ERR_RDMA;
+    }
+    return pg_reduce_scatter_core(ctx, work_ptr, work_mr, recvbuf, count, datatype, op);
+#else
     /* Ensure internal staging and safe-mode work buffers */
     int rc = pg_ensure_internal_buffers(ctx, total_bytes, max_seg_bytes);
     if (rc != PG_SUCCESS) return rc;
@@ -2040,6 +2054,7 @@ int pg_reduce_scatter(void *sendbuf, void *recvbuf, int count,
 
     return pg_reduce_scatter_core(ctx, ctx->work_buf, ctx->work_mr,
                                   recvbuf, count, datatype, op);
+#endif
 }
 
 /* Ring All-Gather Generalized Engine (Zero-Copy RDMA Write into final recvbuf with Multi-WR Batching) */
@@ -2143,6 +2158,7 @@ int pg_all_gather(void *sendbuf, void *recvbuf, int count,
     return pg_ring_all_gather_generalized(ctx, recvbuf, count * ctx->size, datatype);
 }
 
+#ifndef PG_WORKBUFFER_INPLACE
 struct pg_allreduce_dual_cb_ctx {
     const char *sendbuf_slice;
     char *recvbuf_slice;
@@ -2162,6 +2178,7 @@ static void pg_allreduce_dual_chunk_cb(void *dest, const void *src, size_t len, 
     const void *op1 = dctx->sendbuf_slice + chunk_offset;
     pg_reduce_buffer_3way(dest, op1, src, elem_count, dctx->datatype, dctx->op);
 }
+#endif
 
 int pg_all_reduce(void *sendbuf, void *recvbuf, int count,
                   DATATYPE datatype, OPERATION op,
@@ -2192,6 +2209,37 @@ int pg_all_reduce(void *sendbuf, void *recvbuf, int count,
     /* Precompute segment table */
     pg_precompute_seg_table(ctx, count, elem_size);
 
+#ifdef PG_WORKBUFFER_INPLACE
+    /* Offset for local owned slice within recvbuf */
+    size_t my_seg_offset = ctx->seg_table[ctx->rank].offset_bytes;
+
+    /* Phase 1: Reduce-Scatter into local owned slice recvbuf[rank] */
+    int rc = pg_reduce_scatter(sendbuf, (char *)recvbuf + my_seg_offset,
+                               count, datatype, op, pg_handle);
+    if (rc != PG_SUCCESS) {
+        fprintf(stderr, "[pg_all_reduce] Rank %d Reduce-Scatter phase failed with code %d\n",
+                ctx->rank, rc);
+        return rc;
+    }
+
+    /* Phase 2: Distributed barrier before All-Gather phase (ADR-0007) */
+    rc = pg_barrier(pg_handle);
+    if (rc != PG_SUCCESS) {
+        fprintf(stderr, "[pg_all_reduce] Rank %d intermediate barrier failed with code %d\n",
+                ctx->rank, rc);
+        return rc;
+    }
+
+    /* Phase 3: Direct All-Gather distributing reduced segments across ring */
+    rc = pg_ring_all_gather_generalized(ctx, recvbuf, count, datatype);
+    if (rc != PG_SUCCESS) {
+        fprintf(stderr, "[pg_all_reduce] Rank %d All-Gather phase failed with code %d\n",
+                ctx->rank, rc);
+        return rc;
+    }
+
+    return PG_SUCCESS;
+#else
     int max_seg_elems = ctx->seg_table[0].count;
     size_t max_seg_bytes = (size_t)max_seg_elems * elem_size;
 
@@ -2282,4 +2330,5 @@ int pg_all_reduce(void *sendbuf, void *recvbuf, int count,
     }
 
     return PG_SUCCESS;
+#endif
 }

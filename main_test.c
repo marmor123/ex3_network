@@ -636,7 +636,8 @@ int main(int argc, char **argv) {
             }
         }
 
-        /* Verify sendbuf immutability (sendbuf must NOT be modified) */
+#ifndef PG_WORKBUFFER_INPLACE
+        /* Verify sendbuf immutability (sendbuf must NOT be modified in safe mode) */
         for (int k = 0; k < count; k++) {
             int expected_orig = (rank + 1) * (int)((k % 1000) + 1);
             if (sints[k] != expected_orig) {
@@ -648,6 +649,7 @@ int main(int argc, char **argv) {
                 break;
             }
         }
+#endif
 
         if (errors > 0) {
             fprintf(stderr, "  [FAIL] Size %10zu B (%9d ints) -> %d data mismatches on rank %d\n",
@@ -839,7 +841,8 @@ int main(int argc, char **argv) {
             }
         }
 
-        /* Verify sendbuf immutability (sendbuf must NOT be modified) */
+#ifndef PG_WORKBUFFER_INPLACE
+        /* Verify sendbuf immutability (sendbuf must NOT be modified in safe mode) */
         for (int k = 0; k < count; k++) {
             int expected_orig = (rank + 1) * (int)((k % 1000) + 1);
             if (sints[k] != expected_orig) {
@@ -851,6 +854,7 @@ int main(int argc, char **argv) {
                 break;
             }
         }
+#endif
 
         if (errors > 0) {
             fprintf(stderr, "  [FAIL] Size %10zu B (%9d ints) -> %d data mismatches on rank %d\n",

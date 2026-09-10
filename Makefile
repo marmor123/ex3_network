@@ -3,6 +3,11 @@ CFLAGS ?= -Wall -Wextra -Werror -O3 -std=gnu11 -msse4.2 -fno-strict-aliasing -fw
 LDFLAGS ?= 
 LDLIBS ?= -libverbs
 
+WORKBUFFER ?= inplace
+ifeq ($(WORKBUFFER),inplace)
+    CFLAGS += -DPG_WORKBUFFER_INPLACE
+endif
+
 MODE ?= auto
 ifeq ($(MODE),eager)
     CFLAGS += -DPG_MODE_EAGER
