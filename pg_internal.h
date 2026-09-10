@@ -508,7 +508,7 @@ int pg_rdma_connect_qp(struct ibv_qp *qp, const struct pg_tcp_qp_info *remote,
 int pg_tcp_bootstrap(struct pg_context *ctx);
 int pg_post_ctrl_send(struct pg_context *ctx, int qp_dir, const struct pg_ctrl_msg *msg);
 int pg_post_eager_send(struct pg_context *ctx, int qp_dir, const struct pg_ctrl_msg *hdr,
-                       void *payload_addr, uint32_t payload_len, uint32_t lkey, int signaled, int slot);
+                       void *payload_addr, uint32_t payload_len, uint32_t lkey, int signaled, uint32_t slot);
 int pg_rdma_ring_ping(struct pg_context *ctx);
 void pg_rdma_cleanup(struct pg_context *ctx);
 

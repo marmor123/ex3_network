@@ -485,13 +485,13 @@ int pg_rdma_init_resources(struct pg_context *ctx) {
 
 /* Post one 2-SGE eager payload SEND message (ADR-0002) */
 int pg_post_eager_send(struct pg_context *ctx, int qp_dir, const struct pg_ctrl_msg *hdr,
-                       void *payload_addr, uint32_t payload_len, uint32_t lkey, int signaled, int slot) {
+                       void *payload_addr, uint32_t payload_len, uint32_t lkey, int signaled, uint32_t slot) {
     if (!ctx || !hdr || (qp_dir != PG_QP_DIR_TO_NEXT && qp_dir != PG_QP_DIR_FROM_PREV)) {
         return PG_ERR_INVAL;
     }
 
     struct ibv_qp *target_qp = (qp_dir == PG_QP_DIR_TO_NEXT) ? ctx->qp_to_next : ctx->qp_from_prev;
-    int s = slot % PG_CTRL_POOL_DEPTH;
+    uint32_t s = slot % PG_CTRL_POOL_DEPTH;
 
     /* Copy header into dedicated slot in registered eager_send_hdr_buf */
     memcpy(ctx->eager_send_hdr_buf[qp_dir][s], hdr, sizeof(*hdr));
@@ -1609,9 +1609,10 @@ static int pg_ring_step_transfer_eager(struct pg_context *ctx, const struct pg_r
             ehdr.payload.rdv.micro_idx = k;
             ehdr.payload.rdv.length = (uint32_t)micro_len;
 
+            uint32_t slot = (uint32_t)(desc->step_idx * (num_send_micros > 0 ? num_send_micros : 1) + k);
             int rc = pg_post_eager_send(ctx, PG_QP_DIR_TO_NEXT, &ehdr, local_src,
                                         (uint32_t)micro_len, desc->send_lkey, 1,
-                                        (int)(desc->step_idx * (num_send_micros > 0 ? num_send_micros : 1) + k));
+                                        slot);
             if (rc != PG_SUCCESS) {
                 fprintf(stderr, "[pg_transfer] Rank %d failed to post eager SEND for micro %u\n", ctx->rank, k);
                 return rc;
