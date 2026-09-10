@@ -800,6 +800,46 @@ void pg_init_tuning_params(struct pg_context *ctx) {
 /* === MODULE 5: SSE4.2 VECTOR REDUCTION COMPUTE KERNELS                === */
 /* ========================================================================= */
 
+/* Macro helpers for 4x unrolled SSE4.2 SIMD vector reduction */
+#define PG_LOAD_SI128(p) _mm_loadu_si128((const __m128i *)(p))
+#define PG_STORE_SI128(p, v) _mm_storeu_si128((__m128i *)(p), (v))
+
+#define PG_REDUCE_LOOP_4X(type, vtype, load_fn, store_fn, vec_op, scalar_op, step) do { \
+    for (; i + ((step) * 4) <= count; i += ((step) * 4)) { \
+        vtype vd0 = load_fn(d + i); \
+        vtype vd1 = load_fn(d + i + (step)); \
+        vtype vd2 = load_fn(d + i + (step) * 2); \
+        vtype vd3 = load_fn(d + i + (step) * 3); \
+        vtype vs0 = load_fn(s + i); \
+        vtype vs1 = load_fn(s + i + (step)); \
+        vtype vs2 = load_fn(s + i + (step) * 2); \
+        vtype vs3 = load_fn(s + i + (step) * 3); \
+        store_fn(d + i, vec_op(vd0, vs0)); \
+        store_fn(d + i + (step), vec_op(vd1, vs1)); \
+        store_fn(d + i + (step) * 2, vec_op(vd2, vs2)); \
+        store_fn(d + i + (step) * 3, vec_op(vd3, vs3)); \
+    } \
+    for (; i + (step) <= count; i += (step)) { \
+        vtype vd = load_fn(d + i); \
+        vtype vs = load_fn(s + i); \
+        store_fn(d + i, vec_op(vd, vs)); \
+    } \
+    for (; i < count; i++) { scalar_op; } \
+} while(0)
+
+#define PG_REDUCE_OP_CASES(type, vtype, load_fn, store_fn, add_vec, min_vec, max_vec, mul_vec, step) do { \
+    int i = 0; \
+    if (op == PG_SUM) { \
+        PG_REDUCE_LOOP_4X(type, vtype, load_fn, store_fn, add_vec, d[i] += s[i], step); \
+    } else if (op == PG_MIN) { \
+        PG_REDUCE_LOOP_4X(type, vtype, load_fn, store_fn, min_vec, if (s[i] < d[i]) d[i] = s[i], step); \
+    } else if (op == PG_MAX) { \
+        PG_REDUCE_LOOP_4X(type, vtype, load_fn, store_fn, max_vec, if (s[i] > d[i]) d[i] = s[i], step); \
+    } else if (op == PG_PROD) { \
+        PG_REDUCE_LOOP_4X(type, vtype, load_fn, store_fn, mul_vec, d[i] *= s[i], step); \
+    } \
+} while(0)
+
 /* Vectorized CPU reduction engine with SSE4.2 and 4x loop unrolling */
 void pg_reduce_buffer(void *dest, const void *src, int count,
                       DATATYPE datatype, OPERATION op, int use_streaming) {
@@ -810,279 +850,27 @@ void pg_reduce_buffer(void *dest, const void *src, int count,
         case PG_INT: {
             int32_t *d = (int32_t *)dest;
             const int32_t *s = (const int32_t *)src;
-            int i = 0;
-
-            if (op == PG_SUM) {
-                for (; i + 16 <= count; i += 16) {
-                    __m128i vd0 = _mm_loadu_si128((const __m128i *)(d + i));
-                    __m128i vd1 = _mm_loadu_si128((const __m128i *)(d + i + 4));
-                    __m128i vd2 = _mm_loadu_si128((const __m128i *)(d + i + 8));
-                    __m128i vd3 = _mm_loadu_si128((const __m128i *)(d + i + 12));
-                    __m128i vs0 = _mm_loadu_si128((const __m128i *)(s + i));
-                    __m128i vs1 = _mm_loadu_si128((const __m128i *)(s + i + 4));
-                    __m128i vs2 = _mm_loadu_si128((const __m128i *)(s + i + 8));
-                    __m128i vs3 = _mm_loadu_si128((const __m128i *)(s + i + 12));
-                    _mm_storeu_si128((__m128i *)(d + i), _mm_add_epi32(vd0, vs0));
-                    _mm_storeu_si128((__m128i *)(d + i + 4), _mm_add_epi32(vd1, vs1));
-                    _mm_storeu_si128((__m128i *)(d + i + 8), _mm_add_epi32(vd2, vs2));
-                    _mm_storeu_si128((__m128i *)(d + i + 12), _mm_add_epi32(vd3, vs3));
-                }
-                for (; i + 4 <= count; i += 4) {
-                    __m128i vd = _mm_loadu_si128((const __m128i *)(d + i));
-                    __m128i vs = _mm_loadu_si128((const __m128i *)(s + i));
-                    _mm_storeu_si128((__m128i *)(d + i), _mm_add_epi32(vd, vs));
-                }
-                for (; i < count; i++) d[i] += s[i];
-            } else if (op == PG_MIN) {
-                for (; i + 16 <= count; i += 16) {
-                    __m128i vd0 = _mm_loadu_si128((const __m128i *)(d + i));
-                    __m128i vd1 = _mm_loadu_si128((const __m128i *)(d + i + 4));
-                    __m128i vd2 = _mm_loadu_si128((const __m128i *)(d + i + 8));
-                    __m128i vd3 = _mm_loadu_si128((const __m128i *)(d + i + 12));
-                    __m128i vs0 = _mm_loadu_si128((const __m128i *)(s + i));
-                    __m128i vs1 = _mm_loadu_si128((const __m128i *)(s + i + 4));
-                    __m128i vs2 = _mm_loadu_si128((const __m128i *)(s + i + 8));
-                    __m128i vs3 = _mm_loadu_si128((const __m128i *)(s + i + 12));
-                    _mm_storeu_si128((__m128i *)(d + i), _mm_min_epi32(vd0, vs0));
-                    _mm_storeu_si128((__m128i *)(d + i + 4), _mm_min_epi32(vd1, vs1));
-                    _mm_storeu_si128((__m128i *)(d + i + 8), _mm_min_epi32(vd2, vs2));
-                    _mm_storeu_si128((__m128i *)(d + i + 12), _mm_min_epi32(vd3, vs3));
-                }
-                for (; i + 4 <= count; i += 4) {
-                    __m128i vd = _mm_loadu_si128((const __m128i *)(d + i));
-                    __m128i vs = _mm_loadu_si128((const __m128i *)(s + i));
-                    _mm_storeu_si128((__m128i *)(d + i), _mm_min_epi32(vd, vs));
-                }
-                for (; i < count; i++) { if (s[i] < d[i]) d[i] = s[i]; }
-            } else if (op == PG_MAX) {
-                for (; i + 16 <= count; i += 16) {
-                    __m128i vd0 = _mm_loadu_si128((const __m128i *)(d + i));
-                    __m128i vd1 = _mm_loadu_si128((const __m128i *)(d + i + 4));
-                    __m128i vd2 = _mm_loadu_si128((const __m128i *)(d + i + 8));
-                    __m128i vd3 = _mm_loadu_si128((const __m128i *)(d + i + 12));
-                    __m128i vs0 = _mm_loadu_si128((const __m128i *)(s + i));
-                    __m128i vs1 = _mm_loadu_si128((const __m128i *)(s + i + 4));
-                    __m128i vs2 = _mm_loadu_si128((const __m128i *)(s + i + 8));
-                    __m128i vs3 = _mm_loadu_si128((const __m128i *)(s + i + 12));
-                    _mm_storeu_si128((__m128i *)(d + i), _mm_max_epi32(vd0, vs0));
-                    _mm_storeu_si128((__m128i *)(d + i + 4), _mm_max_epi32(vd1, vs1));
-                    _mm_storeu_si128((__m128i *)(d + i + 8), _mm_max_epi32(vd2, vs2));
-                    _mm_storeu_si128((__m128i *)(d + i + 12), _mm_max_epi32(vd3, vs3));
-                }
-                for (; i + 4 <= count; i += 4) {
-                    __m128i vd = _mm_loadu_si128((const __m128i *)(d + i));
-                    __m128i vs = _mm_loadu_si128((const __m128i *)(s + i));
-                    _mm_storeu_si128((__m128i *)(d + i), _mm_max_epi32(vd, vs));
-                }
-                for (; i < count; i++) { if (s[i] > d[i]) d[i] = s[i]; }
-            } else if (op == PG_PROD) {
-                for (; i + 16 <= count; i += 16) {
-                    __m128i vd0 = _mm_loadu_si128((const __m128i *)(d + i));
-                    __m128i vd1 = _mm_loadu_si128((const __m128i *)(d + i + 4));
-                    __m128i vd2 = _mm_loadu_si128((const __m128i *)(d + i + 8));
-                    __m128i vd3 = _mm_loadu_si128((const __m128i *)(d + i + 12));
-                    __m128i vs0 = _mm_loadu_si128((const __m128i *)(s + i));
-                    __m128i vs1 = _mm_loadu_si128((const __m128i *)(s + i + 4));
-                    __m128i vs2 = _mm_loadu_si128((const __m128i *)(s + i + 8));
-                    __m128i vs3 = _mm_loadu_si128((const __m128i *)(s + i + 12));
-                    _mm_storeu_si128((__m128i *)(d + i), _mm_mullo_epi32(vd0, vs0));
-                    _mm_storeu_si128((__m128i *)(d + i + 4), _mm_mullo_epi32(vd1, vs1));
-                    _mm_storeu_si128((__m128i *)(d + i + 8), _mm_mullo_epi32(vd2, vs2));
-                    _mm_storeu_si128((__m128i *)(d + i + 12), _mm_mullo_epi32(vd3, vs3));
-                }
-                for (; i + 4 <= count; i += 4) {
-                    __m128i vd = _mm_loadu_si128((const __m128i *)(d + i));
-                    __m128i vs = _mm_loadu_si128((const __m128i *)(s + i));
-                    _mm_storeu_si128((__m128i *)(d + i), _mm_mullo_epi32(vd, vs));
-                }
-                for (; i < count; i++) d[i] *= s[i];
-            }
+            PG_REDUCE_OP_CASES(int32_t, __m128i,
+                               PG_LOAD_SI128, PG_STORE_SI128,
+                               _mm_add_epi32, _mm_min_epi32, _mm_max_epi32, _mm_mullo_epi32, 4);
             break;
         }
 
         case PG_FLOAT: {
             float *d = (float *)dest;
             const float *s = (const float *)src;
-            int i = 0;
-
-            if (op == PG_SUM) {
-                for (; i + 16 <= count; i += 16) {
-                    __m128 vd0 = _mm_loadu_ps(d + i);
-                    __m128 vd1 = _mm_loadu_ps(d + i + 4);
-                    __m128 vd2 = _mm_loadu_ps(d + i + 8);
-                    __m128 vd3 = _mm_loadu_ps(d + i + 12);
-                    __m128 vs0 = _mm_loadu_ps(s + i);
-                    __m128 vs1 = _mm_loadu_ps(s + i + 4);
-                    __m128 vs2 = _mm_loadu_ps(s + i + 8);
-                    __m128 vs3 = _mm_loadu_ps(s + i + 12);
-                    _mm_storeu_ps(d + i, _mm_add_ps(vd0, vs0));
-                    _mm_storeu_ps(d + i + 4, _mm_add_ps(vd1, vs1));
-                    _mm_storeu_ps(d + i + 8, _mm_add_ps(vd2, vs2));
-                    _mm_storeu_ps(d + i + 12, _mm_add_ps(vd3, vs3));
-                }
-                for (; i + 4 <= count; i += 4) {
-                    __m128 vd = _mm_loadu_ps(d + i);
-                    __m128 vs = _mm_loadu_ps(s + i);
-                    _mm_storeu_ps(d + i, _mm_add_ps(vd, vs));
-                }
-                for (; i < count; i++) d[i] += s[i];
-            } else if (op == PG_MIN) {
-                for (; i + 16 <= count; i += 16) {
-                    __m128 vd0 = _mm_loadu_ps(d + i);
-                    __m128 vd1 = _mm_loadu_ps(d + i + 4);
-                    __m128 vd2 = _mm_loadu_ps(d + i + 8);
-                    __m128 vd3 = _mm_loadu_ps(d + i + 12);
-                    __m128 vs0 = _mm_loadu_ps(s + i);
-                    __m128 vs1 = _mm_loadu_ps(s + i + 4);
-                    __m128 vs2 = _mm_loadu_ps(s + i + 8);
-                    __m128 vs3 = _mm_loadu_ps(s + i + 12);
-                    _mm_storeu_ps(d + i, _mm_min_ps(vd0, vs0));
-                    _mm_storeu_ps(d + i + 4, _mm_min_ps(vd1, vs1));
-                    _mm_storeu_ps(d + i + 8, _mm_min_ps(vd2, vs2));
-                    _mm_storeu_ps(d + i + 12, _mm_min_ps(vd3, vs3));
-                }
-                for (; i + 4 <= count; i += 4) {
-                    __m128 vd = _mm_loadu_ps(d + i);
-                    __m128 vs = _mm_loadu_ps(s + i);
-                    _mm_storeu_ps(d + i, _mm_min_ps(vd, vs));
-                }
-                for (; i < count; i++) { if (s[i] < d[i]) d[i] = s[i]; }
-            } else if (op == PG_MAX) {
-                for (; i + 16 <= count; i += 16) {
-                    __m128 vd0 = _mm_loadu_ps(d + i);
-                    __m128 vd1 = _mm_loadu_ps(d + i + 4);
-                    __m128 vd2 = _mm_loadu_ps(d + i + 8);
-                    __m128 vd3 = _mm_loadu_ps(d + i + 12);
-                    __m128 vs0 = _mm_loadu_ps(s + i);
-                    __m128 vs1 = _mm_loadu_ps(s + i + 4);
-                    __m128 vs2 = _mm_loadu_ps(s + i + 8);
-                    __m128 vs3 = _mm_loadu_ps(s + i + 12);
-                    _mm_storeu_ps(d + i, _mm_max_ps(vd0, vs0));
-                    _mm_storeu_ps(d + i + 4, _mm_max_ps(vd1, vs1));
-                    _mm_storeu_ps(d + i + 8, _mm_max_ps(vd2, vs2));
-                    _mm_storeu_ps(d + i + 12, _mm_max_ps(vd3, vs3));
-                }
-                for (; i + 4 <= count; i += 4) {
-                    __m128 vd = _mm_loadu_ps(d + i);
-                    __m128 vs = _mm_loadu_ps(s + i);
-                    _mm_storeu_ps(d + i, _mm_max_ps(vd, vs));
-                }
-                for (; i < count; i++) { if (s[i] > d[i]) d[i] = s[i]; }
-            } else if (op == PG_PROD) {
-                for (; i + 16 <= count; i += 16) {
-                    __m128 vd0 = _mm_loadu_ps(d + i);
-                    __m128 vd1 = _mm_loadu_ps(d + i + 4);
-                    __m128 vd2 = _mm_loadu_ps(d + i + 8);
-                    __m128 vd3 = _mm_loadu_ps(d + i + 12);
-                    __m128 vs0 = _mm_loadu_ps(s + i);
-                    __m128 vs1 = _mm_loadu_ps(s + i + 4);
-                    __m128 vs2 = _mm_loadu_ps(s + i + 8);
-                    __m128 vs3 = _mm_loadu_ps(s + i + 12);
-                    _mm_storeu_ps(d + i, _mm_mul_ps(vd0, vs0));
-                    _mm_storeu_ps(d + i + 4, _mm_mul_ps(vd1, vs1));
-                    _mm_storeu_ps(d + i + 8, _mm_mul_ps(vd2, vs2));
-                    _mm_storeu_ps(d + i + 12, _mm_mul_ps(vd3, vs3));
-                }
-                for (; i + 4 <= count; i += 4) {
-                    __m128 vd = _mm_loadu_ps(d + i);
-                    __m128 vs = _mm_loadu_ps(s + i);
-                    _mm_storeu_ps(d + i, _mm_mul_ps(vd, vs));
-                }
-                for (; i < count; i++) d[i] *= s[i];
-            }
+            PG_REDUCE_OP_CASES(float, __m128,
+                               _mm_loadu_ps, _mm_storeu_ps,
+                               _mm_add_ps, _mm_min_ps, _mm_max_ps, _mm_mul_ps, 4);
             break;
         }
 
         case PG_DOUBLE: {
             double *d = (double *)dest;
             const double *s = (const double *)src;
-            int i = 0;
-
-            if (op == PG_SUM) {
-                for (; i + 8 <= count; i += 8) {
-                    __m128d vd0 = _mm_loadu_pd(d + i);
-                    __m128d vd1 = _mm_loadu_pd(d + i + 2);
-                    __m128d vd2 = _mm_loadu_pd(d + i + 4);
-                    __m128d vd3 = _mm_loadu_pd(d + i + 6);
-                    __m128d vs0 = _mm_loadu_pd(s + i);
-                    __m128d vs1 = _mm_loadu_pd(s + i + 2);
-                    __m128d vs2 = _mm_loadu_pd(s + i + 4);
-                    __m128d vs3 = _mm_loadu_pd(s + i + 6);
-                    _mm_storeu_pd(d + i, _mm_add_pd(vd0, vs0));
-                    _mm_storeu_pd(d + i + 2, _mm_add_pd(vd1, vs1));
-                    _mm_storeu_pd(d + i + 4, _mm_add_pd(vd2, vs2));
-                    _mm_storeu_pd(d + i + 6, _mm_add_pd(vd3, vs3));
-                }
-                for (; i + 2 <= count; i += 2) {
-                    __m128d vd = _mm_loadu_pd(d + i);
-                    __m128d vs = _mm_loadu_pd(s + i);
-                    _mm_storeu_pd(d + i, _mm_add_pd(vd, vs));
-                }
-                for (; i < count; i++) d[i] += s[i];
-            } else if (op == PG_MIN) {
-                for (; i + 8 <= count; i += 8) {
-                    __m128d vd0 = _mm_loadu_pd(d + i);
-                    __m128d vd1 = _mm_loadu_pd(d + i + 2);
-                    __m128d vd2 = _mm_loadu_pd(d + i + 4);
-                    __m128d vd3 = _mm_loadu_pd(d + i + 6);
-                    __m128d vs0 = _mm_loadu_pd(s + i);
-                    __m128d vs1 = _mm_loadu_pd(s + i + 2);
-                    __m128d vs2 = _mm_loadu_pd(s + i + 4);
-                    __m128d vs3 = _mm_loadu_pd(s + i + 6);
-                    _mm_storeu_pd(d + i, _mm_min_pd(vd0, vs0));
-                    _mm_storeu_pd(d + i + 2, _mm_min_pd(vd1, vs1));
-                    _mm_storeu_pd(d + i + 4, _mm_min_pd(vd2, vs2));
-                    _mm_storeu_pd(d + i + 6, _mm_min_pd(vd3, vs3));
-                }
-                for (; i + 2 <= count; i += 2) {
-                    __m128d vd = _mm_loadu_pd(d + i);
-                    __m128d vs = _mm_loadu_pd(s + i);
-                    _mm_storeu_pd(d + i, _mm_min_pd(vd, vs));
-                }
-                for (; i < count; i++) { if (s[i] < d[i]) d[i] = s[i]; }
-            } else if (op == PG_MAX) {
-                for (; i + 8 <= count; i += 8) {
-                    __m128d vd0 = _mm_loadu_pd(d + i);
-                    __m128d vd1 = _mm_loadu_pd(d + i + 2);
-                    __m128d vd2 = _mm_loadu_pd(d + i + 4);
-                    __m128d vd3 = _mm_loadu_pd(d + i + 6);
-                    __m128d vs0 = _mm_loadu_pd(s + i);
-                    __m128d vs1 = _mm_loadu_pd(s + i + 2);
-                    __m128d vs2 = _mm_loadu_pd(s + i + 4);
-                    __m128d vs3 = _mm_loadu_pd(s + i + 6);
-                    _mm_storeu_pd(d + i, _mm_max_pd(vd0, vs0));
-                    _mm_storeu_pd(d + i + 2, _mm_max_pd(vd1, vs1));
-                    _mm_storeu_pd(d + i + 4, _mm_max_pd(vd2, vs2));
-                    _mm_storeu_pd(d + i + 6, _mm_max_pd(vd3, vs3));
-                }
-                for (; i + 2 <= count; i += 2) {
-                    __m128d vd = _mm_loadu_pd(d + i);
-                    __m128d vs = _mm_loadu_pd(s + i);
-                    _mm_storeu_pd(d + i, _mm_max_pd(vd, vs));
-                }
-                for (; i < count; i++) { if (s[i] > d[i]) d[i] = s[i]; }
-            } else if (op == PG_PROD) {
-                for (; i + 8 <= count; i += 8) {
-                    __m128d vd0 = _mm_loadu_pd(d + i);
-                    __m128d vd1 = _mm_loadu_pd(d + i + 2);
-                    __m128d vd2 = _mm_loadu_pd(d + i + 4);
-                    __m128d vd3 = _mm_loadu_pd(d + i + 6);
-                    __m128d vs0 = _mm_loadu_pd(s + i);
-                    __m128d vs1 = _mm_loadu_pd(s + i + 2);
-                    __m128d vs2 = _mm_loadu_pd(s + i + 4);
-                    __m128d vs3 = _mm_loadu_pd(s + i + 6);
-                    _mm_storeu_pd(d + i, _mm_mul_pd(vd0, vs0));
-                    _mm_storeu_pd(d + i + 2, _mm_mul_pd(vd1, vs1));
-                    _mm_storeu_pd(d + i + 4, _mm_mul_pd(vd2, vs2));
-                    _mm_storeu_pd(d + i + 6, _mm_mul_pd(vd3, vs3));
-                }
-                for (; i + 2 <= count; i += 2) {
-                    __m128d vd = _mm_loadu_pd(d + i);
-                    __m128d vs = _mm_loadu_pd(s + i);
-                    _mm_storeu_pd(d + i, _mm_mul_pd(vd, vs));
-                }
-                for (; i < count; i++) d[i] *= s[i];
-            }
+            PG_REDUCE_OP_CASES(double, __m128d,
+                               _mm_loadu_pd, _mm_storeu_pd,
+                               _mm_add_pd, _mm_min_pd, _mm_max_pd, _mm_mul_pd, 2);
             break;
         }
 
