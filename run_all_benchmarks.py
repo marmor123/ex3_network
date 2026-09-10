@@ -37,7 +37,8 @@ def run_single_sweep(env_overrides=None):
     
     for rank, host in enumerate(HOSTS):
         idx = f"{rank + 1:02d}"
-        cmd = f"cd {CLUSTER_DIR} && {env_str} ./test -myindex {idx} -list {' '.join(HOSTS)}"
+        prefix = f"export {env_str}; " if env_str else ""
+        cmd = f"{prefix}cd {CLUSTER_DIR} && (command -v numactl >/dev/null 2>&1 && numactl --cpunodebind=0 --preferred=0 ./test -myindex {idx} -list {' '.join(HOSTS)} || ./test -myindex {idx} -list {' '.join(HOSTS)})"
         p = subprocess.Popen(["ssh", host, cmd], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         procs.append(p)
     
@@ -53,6 +54,9 @@ def run_single_sweep(env_overrides=None):
             print(f"[ERROR] Rank {rank} on {HOSTS[rank]} failed:\n{err}")
     
     if not success:
+        for h in HOSTS:
+            subprocess.run(["ssh", h, "pkill -u ateret.tabib -9 -f './test -myindex' 2>/dev/null || true"],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         return {}
     
     rank0_out = outs[0]
