@@ -19,7 +19,7 @@ A single phase of pipelined data movement between adjacent ring neighbors during
 A major slice of the collective payload assigned to or owned by a specific rank. For non-divisible buffer sizes, segment lengths and byte offsets are calculated using MPI-style remainder distribution ($(Q+1)/Q$ distribution where rank $i < R$ receives $Q+1$ elements and rank $i \ge R$ receives $Q$ elements).
 
 ### Micro-Chunk
-A pipelined subdivision of a segment (256 KiB optimal on cluster) used to overlap RDMA network transfer with CPU vector computation. Micro-chunks flow through a sliding window (`rdma_window = 32`) with selective CQ completion signaling (`PG_RDMA_SIGNAL_INTERVAL = 8`, dynamically bounded by $\min(\text{signal\_interval}, \text{window})$).
+A pipelined subdivision of a segment (adaptive 64 KiB for transfers $< 256\text{ MiB}$ to eliminate pipeline startup/drain bubbles, and 256 KiB for large payloads $\ge 256\text{ MiB}$ to minimize descriptor overhead). Micro-chunks flow through a sliding window (`rdma_window = 32`) with selective CQ completion signaling (`PG_RDMA_SIGNAL_INTERVAL = 8`, dynamically bounded by $\min(\text{signal\_interval}, \text{window})$).
 
 ### Staging Buffer
 An internal, 64-byte cache-aligned (and 2 MB hugepage-aligned for buffers $\ge 2\text{ MB}$) memory buffer registered with `IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE` used as the target for incoming RDMA Write operations during the Reduce-Scatter phase.
@@ -30,7 +30,7 @@ An internal staging area used in safe mode (`WORKBUFFER=safe`) to perform out-of
 ### Collective Operations
 - **Reduce-Scatter**: Reduces an array of data across all processes and distributes the reduced slices across the ranks.
 - **All-Gather**: Gathers distributed slices from all ranks so that every rank ends up with the complete contiguous array (zero-copy RDMA Write).
-- **All-Reduce**: Performs a full global reduction and distributes the complete reduced result to all ranks (implemented as Reduce-Scatter &rarr; 3-Phase Distributed Barrier &rarr; All-Gather).
+- **All-Reduce**: Performs a full global reduction and distributes the complete reduced result to all ranks (implemented as Reduce-Scatter &rarr; Conditional Phase Barrier &rarr; All-Gather, where single-packet Eager transfers bypass the barrier for sub-$16\,\mu\text{s}$ latency).
 
 ---
 
@@ -50,7 +50,7 @@ An internal staging area used in safe mode (`WORKBUFFER=safe`) to perform out-of
 1. **Progress Seam**: All CQ interactions, `wr_id` decoding, and receive pool refills are strictly encapsulated inside the Progress Engine module. Collective routines never interact directly with raw CQ polling.
 2. **Transfer Seam**: Protocol selection (Eager Send/Recv vs Rendezvous RDMA Write) is encapsulated behind the step transfer engine (`pg_step_transfer_*`), keeping collective routines focused purely on segment permutation and compute kernels.
 3. **Memory Registration Invariant**: Application and staging memory are lazily registered in the MR cache and persist until `pg_close`, avoiding registration churn in the hot timed path.
-4. **Barrier Isolation Invariant**: Collective phases (Reduce-Scatter and All-Gather) are decoupled by a 3-phase distributed ring barrier (`COLLECT` $\to$ `RELEASE` $\to$ `ACK`), with unexpected subsequent-iteration traffic preserved in `pending_q` rather than purged.
+4. **Barrier Isolation Invariant**: Collective phases (Reduce-Scatter and All-Gather) for Rendezvous transfers are decoupled by a 3-phase distributed ring barrier (`COLLECT` $\to$ `RELEASE` $\to$ `ACK`), while Eager mode safely bypasses it to minimize latency. Unexpected subsequent-iteration traffic is preserved in `pending_q` rather than purged.
 
 ---
 

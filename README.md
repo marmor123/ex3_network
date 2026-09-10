@@ -2,7 +2,7 @@
 
 High-performance, single-threaded RDMA collective communication library implementing **Reduce-Scatter**, **All-Gather**, and **All-Reduce** over InfiniBand Reliable Connected (RC) Queue Pairs using the `libibverbs` API.
 
-Designed and tuned on a 4-node InfiniBand cluster (`mlx-stud-01..04`), achieving **20.93 Gbps** peak effective bandwidth (and sub-$45\,\mu\text{s}$ small-message 4-rank all-reduce latency) with automatic Eager/Rendezvous switching and pipelined zero-copy RDMA execution.
+Designed and tuned on a 4-node InfiniBand cluster (`mlx-stud-01..04`), achieving **22.23 Gbps** peak effective bandwidth (and sub-$16\,\mu\text{s}$ small-message 4-rank all-reduce latency) with automatic Eager/Rendezvous switching, pipelined zero-copy RDMA execution, and NUMA node 0 local PCIe affinity.
 
 ---
 
@@ -17,7 +17,7 @@ Designed and tuned on a 4-node InfiniBand cluster (`mlx-stud-01..04`), achieving
                                         |
 +---------------------------------------v---------------------------------------+
 |                    COLLECTIVE ORCHESTRATION ENGINE                            |
-|   - MPI Remainder Slicing ((Q+1)/Q)       - 3-Phase Distributed Barrier       |
+|   - MPI Remainder Slicing ((Q+1)/Q)       - Conditional Phase Barrier         |
 |   - Ring Permutation Step Math            - Safe Workbuf / Zero-Copy Staging  |
 +-------------------+---------------------------------------+-------------------+
                     |                                       |
@@ -40,8 +40,8 @@ Designed and tuned on a 4-node InfiniBand cluster (`mlx-stud-01..04`), achieving
 
 ### Core Design Principles
 1. **Zero-Copy Memory Placement**: All-Gather writes directly into the caller's registered `recvbuf` via RDMA Write.
-2. **Compute-Communication Overlap**: 256 KiB micro-chunks pipeline network transmission with 128-bit SSE4.2 SIMD vector reduction.
-3. **Adaptive Protocol Switching**: Automatically switches between Eager Send/Recv ($\le 8\text{ KiB}$) for low latency and Pipelined Rendezvous ($> 8\text{ KiB}$) for line-rate throughput.
+2. **Compute-Communication Overlap**: Adaptive 64 KiB / 256 KiB micro-chunks pipeline network transmission with 128-bit SSE4.2 SIMD vector reduction.
+3. **Adaptive Protocol Switching**: Automatically switches between Eager Send/Recv ($\le 64\text{ KiB}$ segment / $\le 256\text{ KiB}$ tensor) for low latency and Pipelined Rendezvous ($> 64\text{ KiB}$) for line-rate throughput.
 4. **Deadlock-Free Bootstrap**: Edge-ordered TCP connection initialization ensures deterministic ring setup across arbitrary rank counts.
 
 ---
@@ -75,7 +75,7 @@ sequenceDiagram
 ---
 
 ### 2.2 Four-Way Rendezvous Control Handshake
-Used for large transfers ($> 8\text{ KiB}$) to grant remote write permissions directly into registered destination memory:
+Used for large transfers ($> 64\text{ KiB}$ segment) to grant remote write permissions directly into registered destination memory:
 
 ```mermaid
 sequenceDiagram
@@ -100,7 +100,7 @@ sequenceDiagram
 ---
 
 ### 2.3 Eager 2-SGE Scatter-Gather Protocol
-Used for small transfers ($\le 8\text{ KiB}$) to eliminate the 2-RTT handshake overhead:
+Used for small/medium transfers ($\le 64\text{ KiB}$ segment / $\le 256\text{ KiB}$ tensor) to eliminate both the 2-RTT handshake and intermediate barrier overhead:
 
 ```mermaid
 sequenceDiagram
@@ -190,13 +190,17 @@ Data is written directly into `recvbuf + offset(s_in)` with zero memory copies. 
 
 | Size | Eager Latency | Rendezvous Latency | Auto Latency | Auto Bandwidth | Crossover Verdict |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| **64 B** | **$47.4\,\mu\text{s}$** | $93.4\,\mu\text{s}$ | **$43.3\,\mu\text{s}$** | 0.02 Gbps | **Eager ($2.0\times$ faster)** |
-| **1 KiB** | **$43.7\,\mu\text{s}$** | $93.5\,\mu\text{s}$ | **$43.9\,\mu\text{s}$** | 0.28 Gbps | **Eager ($2.1\times$ faster)** |
-| **8 KiB** | **$54.1\,\mu\text{s}$** | $93.4\,\mu\text{s}$ | **$52.8\,\mu\text{s}$** | 1.86 Gbps | **Eager ($1.7\times$ faster)** |
-| **16 KiB** | **$59.8\,\mu\text{s}$** | $101.3\,\mu\text{s}$ | **$60.8\,\mu\text{s}$** | 3.24 Gbps | **Eager ($1.7\times$ faster)** |
-| **1 MiB** | $860.2\,\mu\text{s}$ | **$817.1\,\mu\text{s}$** | $880.4\,\mu\text{s}$ | 15.40 Gbps | **Rendezvous ($1.1\times$ faster)** |
-| **64 MiB** | N/A | **$39.9\,\text{ms}$** | $54.1\,\text{ms}$ | **20.19 Gbps** | **Rendezvous** |
-| **1 GiB** | N/A | $626.8\,\text{ms}$ | **$617.3\,\text{ms}$** | **20.87 Gbps** | **Peak Line-Rate Throughput** |
+| **64 B** | **$15.7\,\mu\text{s}$** | $92.0\,\mu\text{s}$ | **$16.6\,\mu\text{s}$** | 0.05 Gbps | **Eager ($2.7\times$ faster)** |
+| **256 B** | **$15.7\,\mu\text{s}$** | $91.2\,\mu\text{s}$ | **$16.2\,\mu\text{s}$** | 0.19 Gbps | **Eager ($2.8\times$ faster)** |
+| **1 KiB** | **$17.0\,\mu\text{s}$** | $98.7\,\mu\text{s}$ | **$18.0\,\mu\text{s}$** | 0.68 Gbps | **Eager ($2.5\times$ faster)** |
+| **8 KiB** | **$26.9\,\mu\text{s}$** | $94.7\,\mu\text{s}$ | **$27.7\,\mu\text{s}$** | 3.56 Gbps | **Eager ($1.9\times$ faster)** |
+| **16 KiB** | **$34.7\,\mu\text{s}$** | $101.4\,\mu\text{s}$ | **$35.4\,\mu\text{s}$** | 5.61 Gbps | **Eager ($1.7\times$ faster)** |
+| **64 KiB** | **$89.8\,\mu\text{s}$** | $137.1\,\mu\text{s}$ | **$89.8\,\mu\text{s}$** | **8.80 Gbps** | **Eager ($1.6\times$ faster)** |
+| **128 KiB** | **$139.3\,\mu\text{s}$** | $185.2\,\mu\text{s}$ | **$139.3\,\mu\text{s}$** | **11.36 Gbps** | **Eager ($1.35\times$ faster)** |
+| **256 KiB** | **$232.7\,\mu\text{s}$** | $274.5\,\mu\text{s}$ | **$232.7\,\mu\text{s}$** | **13.50 Gbps** | **Eager ($1.16\times$ faster)** |
+| **1 MiB** | $878.2\,\mu\text{s}$ | **$823.2\,\mu\text{s}$** | **$823.2\,\mu\text{s}$** | **15.42 Gbps** | **Rendezvous ($1.1\times$ faster)** |
+| **64 MiB** | N/A | **$37.2\,\text{ms}$** | **$37.2\,\text{ms}$** | **21.60 Gbps** | **Rendezvous (Adaptive 64K Chunks)** |
+| **1 GiB** | N/A | **$579.7\,\text{ms}$** | **$579.7\,\text{ms}$** | **22.23 Gbps** | **Rendezvous (Peak Line-Rate)** |
 
 > [!TIP]
 > For the complete dataset, hyperparameter sensitivity sweeps (chunk size, window depth, batching, SIMD vs scalar), and the **Tested vs. Not-Tested Boundary Matrix**, refer to the full [Empirical Protocol Evaluation Report](file:///c:/Users/marmo/ateret/ex3_network/docs/empirical_protocol_report.md).
@@ -255,7 +259,7 @@ The library compiles cleanly with `gcc` under `-Wall -Wextra -Werror -O3 -std=gn
 make
 
 # Compile with Specific Protocol Mode
-make MODE=auto       # Dynamic Eager (<=8 KiB) and Rendezvous (>8 KiB) [Default]
+make MODE=auto       # Dynamic Eager (<=64 KiB segment / <=256 KiB tensor) and Rendezvous (>64 KiB) [Default]
 make MODE=rendezvous # Pure Rendezvous RDMA Write
 make MODE=eager      # Pure Eager Send/Recv
 
