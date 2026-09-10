@@ -1218,9 +1218,6 @@ int pg_barrier(void *pg_handle) {
     rc = pg_barrier_token_pass(ctx, PG_CTRL_MSG_BARRIER_ACK);
     if (rc != PG_SUCCESS) return rc;
 
-    /* Drain lingering completions across collective boundary (ADR-0007) */
-    pg_progress_drain(ctx);
-
     return PG_SUCCESS;
 }
 
