@@ -788,12 +788,6 @@ void pg_init_tuning_params(struct pg_context *ctx) {
         int val = atoi(ewin_env);
         if (val > 0) ctx->eager_window = val;
     }
-
-    ctx->use_streaming_stores = 1;
-    const char *stream_env = getenv("PG_USE_STREAMING_STORES");
-    if (stream_env && *stream_env) {
-        ctx->use_streaming_stores = atoi(stream_env);
-    }
 }
 
 /* ========================================================================= */
@@ -842,8 +836,7 @@ void pg_init_tuning_params(struct pg_context *ctx) {
 
 /* Vectorized CPU reduction engine with SSE4.2 and 4x loop unrolling */
 void pg_reduce_buffer(void *dest, const void *src, int count,
-                      DATATYPE datatype, OPERATION op, int use_streaming) {
-    (void)use_streaming;
+                      DATATYPE datatype, OPERATION op) {
     if (count <= 0 || !dest || !src) return;
 
     switch (datatype) {
@@ -1344,14 +1337,13 @@ struct pg_context *ctx = (struct pg_context *)pg_handle;
 struct pg_reduce_cb_ctx {
     DATATYPE datatype;
     OPERATION op;
-    int use_streaming_stores;
     int elem_size;
 };
 
 static void pg_reduce_chunk_cb(void *dest, const void *src, size_t len, void *user_ctx) {
     struct pg_reduce_cb_ctx *rctx = (struct pg_reduce_cb_ctx *)user_ctx;
     int micro_elems = (int)(len / (size_t)rctx->elem_size);
-    pg_reduce_buffer(dest, src, micro_elems, rctx->datatype, rctx->op, rctx->use_streaming_stores);
+    pg_reduce_buffer(dest, src, micro_elems, rctx->datatype, rctx->op);
 }
 
 static void pg_allgather_eager_cb(void *dest, const void *src, size_t len, void *user_ctx) {
@@ -1861,7 +1853,6 @@ int pg_reduce_scatter(void *sendbuf, void *recvbuf, int count,
     struct pg_reduce_cb_ctx rctx = {
         .datatype = datatype,
         .op = op,
-        .use_streaming_stores = ctx->use_streaming_stores,
         .elem_size = (int)elem_size
     };
 
