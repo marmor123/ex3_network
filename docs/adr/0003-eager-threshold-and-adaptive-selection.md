@@ -9,17 +9,17 @@ We needed to establish the optimal crossover threshold empirically on the live 4
 
 ## Decision
 
-### 1. Empirical Threshold Determination: 8 KiB
-A coordinate sweep on the 4-node cluster across thresholds from 1 KiB to 64 KiB revealed:
-- Payloads $\le 8\text{ KiB}$: Eager protocol provides **2.1$\times$ lower latency** compared to Rendezvous ($42.8\,\mu\text{s}$ vs $88.2\,\mu\text{s}$ at 64 B, $44.9\,\mu\text{s}$ vs $89.7\,\mu\text{s}$ at 1 KiB).
-- Payloads $\ge 16\text{ KiB}$: Rendezvous protocol overtakes Eager in effective bandwidth due to zero-copy memory transfers and pipelined micro-chunk overlap.
-- We set `PG_EAGER_THRESHOLD = (8 * 1024)` (8 KiB) as the default crossover boundary.
+### 1. Empirical Threshold Determination: 64 KiB
+A coordinate sweep on the 4-node cluster across thresholds from 1 KiB to 256 KiB revealed:
+- Payloads $\le 64\text{ KiB}$ segment ($\le 256\text{ KiB}$ tensor): Eager protocol provides **$1.4\times\text{--}2.8\times$ lower latency** compared to Rendezvous ($15.7\,\mu\text{s}$ vs $92.0\,\mu\text{s}$ at 64 B, $89.8\,\mu\text{s}$ vs $139.8\,\mu\text{s}$ at 64 KiB) by eliminating both the 4-way RTS/CTS control handshake and the intermediate distributed barrier.
+- Payloads $> 64\text{ KiB}$ segment: Rendezvous protocol overtakes Eager in effective bandwidth due to zero-copy direct memory transfers and pipelined micro-chunk overlap.
+- We set `PG_EAGER_THRESHOLD = (64 * 1024)` (64 KiB) as the optimal crossover boundary.
 
 ### 2. Protocol Modes
 We support three compilation modes via `Makefile MODE=<mode>`:
 - `MODE=rendezvous` (`PG_MODE_RENDEZVOUS`): All sizes use pipelined RDMA Write rendezvous.
 - `MODE=eager` (`PG_MODE_EAGER`): All sizes (up to 16 MiB pool capacity) use Eager SEND.
-- `MODE=auto` (`PG_MODE_AUTO`): Dynamically selects Eager for transfer sizes $\le 8\text{ KiB}$ and Rendezvous for $> 8\text{ KiB}$.
+- `MODE=auto` (`PG_MODE_AUTO`): Dynamically selects Eager for segment sizes $\le 64\text{ KiB}$ and Rendezvous for $> 64\text{ KiB}$.
 
 ### 3. Unified Pre-Posted Receive Pool
 - A pre-allocated pool of 32 receive buffers per QP direction (`PG_EAGER_POOL_DEPTH = 32`), sized to $\max(\text{threshold}, \text{pipeline\_chunk})$.

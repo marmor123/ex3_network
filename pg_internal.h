@@ -41,7 +41,7 @@
 #endif
 
 /* Eager Protocol Constants (ADR-0003) */
-#define PG_EAGER_THRESHOLD      (8 * 1024)   /* 8 KiB */
+#define PG_EAGER_THRESHOLD      (64 * 1024)  /* 64 KiB optimal crossover */
 #define PG_EAGER_POOL_DEPTH     32           /* 32 pre-posted buffers per QP */
 #define PG_EAGER_WINDOW         8            /* In-flight send flow control window */
 #define PG_EAGER_BUF_SIZE       (PG_PIPELINE_CHUNK > PG_EAGER_THRESHOLD ? PG_PIPELINE_CHUNK : PG_EAGER_THRESHOLD)

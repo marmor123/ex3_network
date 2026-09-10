@@ -1498,8 +1498,14 @@ static int pg_ring_step_transfer_eager(struct pg_context *ctx, const struct pg_r
 
 /* Rendezvous Multi-WR Pipelined Ring Step Transfer Engine */
 static int pg_ring_step_transfer_rdv(struct pg_context *ctx, const struct pg_ring_step_desc *desc) {
-    uint32_t num_send_micros = (uint32_t)((desc->send_bytes + ctx->pipeline_chunk - 1) / ctx->pipeline_chunk);
-    uint32_t num_recv_micros = (uint32_t)((desc->recv_bytes + ctx->pipeline_chunk - 1) / ctx->pipeline_chunk);
+    size_t chunk_size = ctx->pipeline_chunk;
+    size_t seg_bytes = desc->send_bytes > desc->recv_bytes ? desc->send_bytes : desc->recv_bytes;
+    if (seg_bytes < (64ULL * 1024ULL * 1024ULL) && !getenv("PG_PIPELINE_CHUNK")) {
+        chunk_size = (64 * 1024);
+    }
+
+    uint32_t num_send_micros = (uint32_t)((desc->send_bytes + chunk_size - 1) / chunk_size);
+    uint32_t num_recv_micros = (uint32_t)((desc->recv_bytes + chunk_size - 1) / chunk_size);
 
     int send_done = (num_send_micros == 0) ? 1 : 0;
     int recv_done = (num_recv_micros == 0) ? 1 : 0;
@@ -1565,9 +1571,9 @@ static int pg_ring_step_transfer_rdv(struct pg_context *ctx, const struct pg_rin
             if (target_micros > num_recv_micros) target_micros = num_recv_micros;
             while (data_done_recv_micros < target_micros) {
                 uint32_t k = data_done_recv_micros;
-                size_t offset = (size_t)k * ctx->pipeline_chunk;
+                size_t offset = (size_t)k * chunk_size;
                 size_t micro_len = desc->recv_bytes - offset;
-                if (micro_len > ctx->pipeline_chunk) micro_len = ctx->pipeline_chunk;
+                if (micro_len > chunk_size) micro_len = chunk_size;
 
                 if (desc->on_recv_chunk) {
                     void *dest = (char *)desc->cb_dest + offset;
@@ -1607,9 +1613,9 @@ static int pg_ring_step_transfer_rdv(struct pg_context *ctx, const struct pg_rin
 
             for (uint32_t b = 0; b < to_post; b++) {
                 uint32_t k = rdma_posted_micros + b;
-                size_t offset = (size_t)k * ctx->pipeline_chunk;
+                size_t offset = (size_t)k * chunk_size;
                 size_t micro_len = desc->send_bytes - offset;
-                if (micro_len > ctx->pipeline_chunk) micro_len = ctx->pipeline_chunk;
+                if (micro_len > chunk_size) micro_len = chunk_size;
 
                 void *local_src = (char *)desc->send_buf + offset;
                 uint64_t remote_addr = remote_target_addr + offset;
@@ -1689,9 +1695,9 @@ static int pg_ring_step_transfer_rdv(struct pg_context *ctx, const struct pg_rin
                         if (target_micros > num_recv_micros) target_micros = num_recv_micros;
                         while (data_done_recv_micros < target_micros) {
                             uint32_t k = data_done_recv_micros;
-                            size_t offset = (size_t)k * ctx->pipeline_chunk;
+                            size_t offset = (size_t)k * chunk_size;
                             size_t micro_len = desc->recv_bytes - offset;
-                            if (micro_len > ctx->pipeline_chunk) micro_len = ctx->pipeline_chunk;
+                            if (micro_len > chunk_size) micro_len = chunk_size;
 
                             if (desc->on_recv_chunk) {
                                 void *dest = (char *)desc->cb_dest + offset;
@@ -2057,12 +2063,25 @@ int pg_all_reduce(void *sendbuf, void *recvbuf, int count,
         return rc;
     }
 
-    /* Phase 2: Distributed barrier before All-Gather phase (ensures phase synchronization and minimizes CQ jitter) */
-    rc = pg_barrier(pg_handle);
-    if (rc != PG_SUCCESS) {
-        fprintf(stderr, "[pg_all_reduce] Rank %d intermediate barrier failed with code %d\n",
-                ctx->rank, rc);
-        return rc;
+    int max_seg_elems = pg_get_seg_count(0, count, ctx->size);
+    size_t max_seg_bytes = (size_t)max_seg_elems * elem_size;
+    int is_eager = 0;
+#if (PG_ACTIVE_MODE == PG_MODE_TYPE_EAGER)
+    is_eager = 1;
+#elif (PG_ACTIVE_MODE == PG_MODE_TYPE_AUTO)
+    if (max_seg_bytes <= ctx->eager_threshold) {
+        is_eager = 1;
+    }
+#endif
+
+    /* Phase 2: Distributed barrier before All-Gather phase (for Rendezvous mode to prevent QP collisions) */
+    if (!is_eager) {
+        rc = pg_barrier(pg_handle);
+        if (rc != PG_SUCCESS) {
+            fprintf(stderr, "[pg_all_reduce] Rank %d intermediate barrier failed with code %d\n",
+                    ctx->rank, rc);
+            return rc;
+        }
     }
 
     /* Phase 3: Direct All-Gather distributing reduced segments across ring */

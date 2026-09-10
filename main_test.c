@@ -547,7 +547,7 @@ int main(int argc, char **argv) {
 #if (PG_ACTIVE_MODE == PG_MODE_TYPE_EAGER)
            "MODE=EAGER",
 #elif (PG_ACTIVE_MODE == PG_MODE_TYPE_AUTO)
-           "MODE=AUTO (<=8KiB eager, >8KiB rdv)",
+           "MODE=AUTO (<=64KiB eager, >64KiB rdv)",
 #else
            "MODE=RENDEZVOUS",
 #endif
