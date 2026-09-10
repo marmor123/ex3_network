@@ -712,9 +712,8 @@ int pg_ensure_internal_buffers(struct pg_context *ctx, size_t count_bytes, size_
         }
     }
 
-#ifndef PG_WORKBUFFER_INPLACE
-    /* 2. Work buffer: needs at least count_bytes in safe mode */
-    if (ctx->work_capacity < count_bytes) {
+    /* 2. Work buffer: needs at least count_bytes (allocated only when count_bytes > 0) */
+    if (count_bytes > 0 && ctx->work_capacity < count_bytes) {
         if (ctx->work_mr) {
             ibv_dereg_mr(ctx->work_mr);
             ctx->work_mr = NULL;
@@ -746,9 +745,6 @@ int pg_ensure_internal_buffers(struct pg_context *ctx, size_t count_bytes, size_
             return PG_ERR_RDMA;
         }
     }
-#else
-    (void)count_bytes;
-#endif
 
     return PG_SUCCESS;
 }
@@ -911,6 +907,112 @@ void pg_reduce_buffer(void *dest, const void *src, int count,
             PG_REDUCE_OP_CASES(double, __m128d,
                                _mm_loadu_pd, _mm_storeu_pd,
                                _mm_add_pd, _mm_min_pd, _mm_max_pd, _mm_mul_pd, 2);
+            break;
+        }
+
+        default:
+            break;
+    }
+}
+
+#define PG_STREAM_SI128(p, v) _mm_stream_si128((__m128i *)(p), (v))
+#define PG_STREAM_PS(p, v)    _mm_stream_ps((float *)(p), (v))
+#define PG_STREAM_PD(p, v)    _mm_stream_pd((double *)(p), (v))
+
+#define PG_REDUCE_LOOP_3WAY_4X(type, vtype, load_fn, store_fn, stream_fn, vec_op, scalar_expr, step) do { \
+    if (((uintptr_t)d & 15) == 0) { \
+        for (; i + ((step) * 4) <= count; i += ((step) * 4)) { \
+            _mm_prefetch((const char *)(s1 + i + (step) * 8), _MM_HINT_T0); \
+            _mm_prefetch((const char *)(s2 + i + (step) * 8), _MM_HINT_T0); \
+            vtype va0 = load_fn(s1 + i); \
+            vtype va1 = load_fn(s1 + i + (step)); \
+            vtype va2 = load_fn(s1 + i + (step) * 2); \
+            vtype va3 = load_fn(s1 + i + (step) * 3); \
+            vtype vb0 = load_fn(s2 + i); \
+            vtype vb1 = load_fn(s2 + i + (step)); \
+            vtype vb2 = load_fn(s2 + i + (step) * 2); \
+            vtype vb3 = load_fn(s2 + i + (step) * 3); \
+            stream_fn(d + i, vec_op(va0, vb0)); \
+            stream_fn(d + i + (step), vec_op(va1, vb1)); \
+            stream_fn(d + i + (step) * 2, vec_op(va2, vb2)); \
+            stream_fn(d + i + (step) * 3, vec_op(va3, vb3)); \
+        } \
+        for (; i + (step) <= count; i += (step)) { \
+            vtype va = load_fn(s1 + i); \
+            vtype vb = load_fn(s2 + i); \
+            stream_fn(d + i, vec_op(va, vb)); \
+        } \
+        _mm_sfence(); \
+    } else { \
+        for (; i + ((step) * 4) <= count; i += ((step) * 4)) { \
+            vtype va0 = load_fn(s1 + i); \
+            vtype va1 = load_fn(s1 + i + (step)); \
+            vtype va2 = load_fn(s1 + i + (step) * 2); \
+            vtype va3 = load_fn(s1 + i + (step) * 3); \
+            vtype vb0 = load_fn(s2 + i); \
+            vtype vb1 = load_fn(s2 + i + (step)); \
+            vtype vb2 = load_fn(s2 + i + (step) * 2); \
+            vtype vb3 = load_fn(s2 + i + (step) * 3); \
+            store_fn(d + i, vec_op(va0, vb0)); \
+            store_fn(d + i + (step), vec_op(va1, vb1)); \
+            store_fn(d + i + (step) * 2, vec_op(va2, vb2)); \
+            store_fn(d + i + (step) * 3, vec_op(va3, vb3)); \
+        } \
+        for (; i + (step) <= count; i += (step)) { \
+            vtype va = load_fn(s1 + i); \
+            vtype vb = load_fn(s2 + i); \
+            store_fn(d + i, vec_op(va, vb)); \
+        } \
+    } \
+    for (; i < count; i++) { d[i] = scalar_expr; } \
+} while(0)
+
+#define PG_REDUCE_3WAY_OP_CASES(type, vtype, load_fn, store_fn, stream_fn, add_vec, min_vec, max_vec, mul_vec, step) do { \
+    int i = 0; \
+    if (op == PG_SUM) { \
+        PG_REDUCE_LOOP_3WAY_4X(type, vtype, load_fn, store_fn, stream_fn, add_vec, s1[i] + s2[i], step); \
+    } else if (op == PG_MIN) { \
+        PG_REDUCE_LOOP_3WAY_4X(type, vtype, load_fn, store_fn, stream_fn, min_vec, (s1[i] < s2[i] ? s1[i] : s2[i]), step); \
+    } else if (op == PG_MAX) { \
+        PG_REDUCE_LOOP_3WAY_4X(type, vtype, load_fn, store_fn, stream_fn, max_vec, (s1[i] > s2[i] ? s1[i] : s2[i]), step); \
+    } else if (op == PG_PROD) { \
+        PG_REDUCE_LOOP_3WAY_4X(type, vtype, load_fn, store_fn, stream_fn, mul_vec, s1[i] * s2[i], step); \
+    } \
+} while(0)
+
+/* Single-pass 3-way vector reduction computing dest = src1 OP src2 without intermediate copy */
+void pg_reduce_buffer_3way(void *dest, const void *src1, const void *src2, int count,
+                           DATATYPE datatype, OPERATION op) {
+    if (count <= 0 || !dest || !src1 || !src2) return;
+
+    switch (datatype) {
+        case PG_INT: {
+            int32_t *d = (int32_t *)dest;
+            const int32_t *s1 = (const int32_t *)src1;
+            const int32_t *s2 = (const int32_t *)src2;
+            PG_REDUCE_3WAY_OP_CASES(int32_t, __m128i,
+                                    PG_LOAD_SI128, PG_STORE_SI128, PG_STREAM_SI128,
+                                    _mm_add_epi32, _mm_min_epi32, _mm_max_epi32, _mm_mullo_epi32, 4);
+            break;
+        }
+
+        case PG_FLOAT: {
+            float *d = (float *)dest;
+            const float *s1 = (const float *)src1;
+            const float *s2 = (const float *)src2;
+            PG_REDUCE_3WAY_OP_CASES(float, __m128,
+                                    _mm_loadu_ps, _mm_storeu_ps, PG_STREAM_PS,
+                                    _mm_add_ps, _mm_min_ps, _mm_max_ps, _mm_mul_ps, 4);
+            break;
+        }
+
+        case PG_DOUBLE: {
+            double *d = (double *)dest;
+            const double *s1 = (const double *)src1;
+            const double *s2 = (const double *)src2;
+            PG_REDUCE_3WAY_OP_CASES(double, __m128d,
+                                    _mm_loadu_pd, _mm_storeu_pd, PG_STREAM_PD,
+                                    _mm_add_pd, _mm_min_pd, _mm_max_pd, _mm_mul_pd, 2);
             break;
         }
 
@@ -1649,7 +1751,7 @@ static int pg_ring_step_transfer_rdv(struct pg_context *ctx, const struct pg_rin
                     eff_sig_interval = (uint32_t)ctx->rdma_window;
                 }
                 if (eff_sig_interval == 0) eff_sig_interval = 1;
-                int is_signaled = ((k + 1) % eff_sig_interval == 0 || (k + 1) == num_send_micros);
+                int is_signaled = (k == 0 || (k + 1) % eff_sig_interval == 0 || (k + 1) == num_send_micros);
 
                 ctx->static_sges[b].addr   = (uintptr_t)local_src;
                 ctx->static_sges[b].length = (uint32_t)micro_len;
@@ -1830,62 +1932,14 @@ static inline int pg_ring_step_transfer(struct pg_context *ctx, int is_eager, co
     }
 }
 
-int pg_reduce_scatter(void *sendbuf, void *recvbuf, int count,
-                      DATATYPE datatype, OPERATION op,
-                      void *pg_handle) {
-    if (!pg_handle || !sendbuf || !recvbuf || count <= 0) {
-        return PG_ERR_INVAL;
-    }
-    struct pg_context *ctx = (struct pg_context *)pg_handle;
-
-    if (datatype != PG_INT && datatype != PG_FLOAT && datatype != PG_DOUBLE) {
-        return PG_ERR_UNSUPPORTED;
-    }
-    if (op != PG_SUM && op != PG_MIN && op != PG_MAX && op != PG_PROD) {
-        return PG_ERR_UNSUPPORTED;
-    }
-
+static int pg_reduce_scatter_core(struct pg_context *ctx,
+                                  void *work_ptr, struct ibv_mr *work_mr,
+                                  void *recvbuf, int count,
+                                  DATATYPE datatype, OPERATION op) {
+    (void)count;
     size_t elem_size = pg_get_datatype_size(datatype);
-    size_t total_bytes = (size_t)count * elem_size;
-
-    /* Single rank degenerate ring: copy input directly to output */
-    if (ctx->size == 1) {
-        if (recvbuf != sendbuf) {
-            memcpy(recvbuf, sendbuf, total_bytes);
-        }
-        return PG_SUCCESS;
-    }
-
-    /* Precompute segment sizes and offsets for all ranks (Phase 1) */
-    pg_precompute_seg_table(ctx, count, elem_size);
-
-    /* Maximum segment byte size across ranks */
     int max_seg_elems = ctx->seg_table[0].count;
     size_t max_seg_bytes = (size_t)max_seg_elems * elem_size;
-
-    /* Ensure internal staging (and safe-mode work) buffers */
-    int rc = pg_ensure_internal_buffers(ctx, total_bytes, max_seg_bytes);
-    if (rc != PG_SUCCESS) return rc;
-
-    void *work_ptr = NULL;
-    struct ibv_mr *work_mr = NULL;
-
-#ifdef PG_WORKBUFFER_INPLACE
-    work_ptr = sendbuf;
-    work_mr = pg_get_or_reg_mr(ctx, sendbuf, total_bytes,
-                               IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
-    if (!work_mr) {
-        fprintf(stderr, "[pg_reduce_scatter] Rank %d failed to register inplace sendbuf MR\n", ctx->rank);
-        return PG_ERR_RDMA;
-    }
-#else
-    /* Safe mode: copy sendbuf into internal working buffer */
-    if (sendbuf != ctx->work_buf) {
-        memcpy(ctx->work_buf, sendbuf, total_bytes);
-    }
-    work_ptr = ctx->work_buf;
-    work_mr = ctx->work_mr;
-#endif
 
     int is_eager = 0;
 #if (PG_ACTIVE_MODE == PG_MODE_TYPE_EAGER)
@@ -1930,7 +1984,7 @@ int pg_reduce_scatter(void *sendbuf, void *recvbuf, int count,
         desc.cb_dest = (char *)work_ptr + recv_seg_offset;
         desc.cb_user_ctx = &rctx;
 
-        rc = pg_ring_step_transfer(ctx, is_eager, &desc);
+        int rc = pg_ring_step_transfer(ctx, is_eager, &desc);
         if (rc != PG_SUCCESS) return rc;
     }
 
@@ -1942,6 +1996,52 @@ int pg_reduce_scatter(void *sendbuf, void *recvbuf, int count,
     }
 
     return PG_SUCCESS;
+}
+
+int pg_reduce_scatter(void *sendbuf, void *recvbuf, int count,
+                      DATATYPE datatype, OPERATION op,
+                      void *pg_handle) {
+    if (!pg_handle || !sendbuf || !recvbuf || count <= 0) {
+        return PG_ERR_INVAL;
+    }
+    struct pg_context *ctx = (struct pg_context *)pg_handle;
+
+    if (datatype != PG_INT && datatype != PG_FLOAT && datatype != PG_DOUBLE) {
+        return PG_ERR_UNSUPPORTED;
+    }
+    if (op != PG_SUM && op != PG_MIN && op != PG_MAX && op != PG_PROD) {
+        return PG_ERR_UNSUPPORTED;
+    }
+
+    size_t elem_size = pg_get_datatype_size(datatype);
+    size_t total_bytes = (size_t)count * elem_size;
+
+    /* Single rank degenerate ring: copy input directly to output */
+    if (ctx->size == 1) {
+        if (recvbuf != sendbuf) {
+            memcpy(recvbuf, sendbuf, total_bytes);
+        }
+        return PG_SUCCESS;
+    }
+
+    /* Precompute segment sizes and offsets for all ranks (Phase 1) */
+    pg_precompute_seg_table(ctx, count, elem_size);
+
+    /* Maximum segment byte size across ranks */
+    int max_seg_elems = ctx->seg_table[0].count;
+    size_t max_seg_bytes = (size_t)max_seg_elems * elem_size;
+
+    /* Ensure internal staging and safe-mode work buffers */
+    int rc = pg_ensure_internal_buffers(ctx, total_bytes, max_seg_bytes);
+    if (rc != PG_SUCCESS) return rc;
+
+    /* Safe mode: caller sendbuf is strictly immutable */
+    if (sendbuf != ctx->work_buf) {
+        memcpy(ctx->work_buf, sendbuf, total_bytes);
+    }
+
+    return pg_reduce_scatter_core(ctx, ctx->work_buf, ctx->work_mr,
+                                  recvbuf, count, datatype, op);
 }
 
 /* Ring All-Gather Generalized Engine (Zero-Copy RDMA Write into final recvbuf with Multi-WR Batching) */
@@ -2045,6 +2145,26 @@ int pg_all_gather(void *sendbuf, void *recvbuf, int count,
     return pg_ring_all_gather_generalized(ctx, recvbuf, count * ctx->size, datatype);
 }
 
+struct pg_allreduce_dual_cb_ctx {
+    const char *sendbuf_slice;
+    char *recvbuf_slice;
+    DATATYPE datatype;
+    OPERATION op;
+    int elem_size;
+};
+
+static void pg_allreduce_dual_chunk_cb(void *dest, const void *src, size_t len, void *user_ctx) {
+    struct pg_allreduce_dual_cb_ctx *dctx = (struct pg_allreduce_dual_cb_ctx *)user_ctx;
+    if (!dctx || !dest || !src || len == 0) return;
+
+    size_t chunk_offset = (size_t)((char *)dest - dctx->recvbuf_slice);
+    int elem_count = (int)(len / dctx->elem_size);
+
+    /* For every step, dest (recvbuf) receives sendbuf[offset] OP staging[offset] via single-pass SIMD */
+    const void *op1 = dctx->sendbuf_slice + chunk_offset;
+    pg_reduce_buffer_3way(dest, op1, src, elem_count, dctx->datatype, dctx->op);
+}
+
 int pg_all_reduce(void *sendbuf, void *recvbuf, int count,
                   DATATYPE datatype, OPERATION op,
                   void *pg_handle) {
@@ -2074,25 +2194,86 @@ int pg_all_reduce(void *sendbuf, void *recvbuf, int count,
     /* Precompute segment table */
     pg_precompute_seg_table(ctx, count, elem_size);
 
-    /* Offset for local owned slice within recvbuf */
-    size_t my_seg_offset = ctx->seg_table[ctx->rank].offset_bytes;
+    int max_seg_elems = ctx->seg_table[0].count;
+    size_t max_seg_bytes = (size_t)max_seg_elems * elem_size;
 
-    /* Phase 1: Reduce-Scatter into local owned slice recvbuf[rank] */
-    int rc = pg_reduce_scatter(sendbuf, (char *)recvbuf + my_seg_offset,
-                               count, datatype, op, pg_handle);
-    if (rc != PG_SUCCESS) {
-        fprintf(stderr, "[pg_all_reduce] Rank %d Reduce-Scatter phase failed with code %d\n",
-                ctx->rank, rc);
-        return rc;
+    /* Ensure staging buffer only (count_bytes=0: work_buf is NOT allocated!) */
+    int rc = pg_ensure_internal_buffers(ctx, 0, max_seg_bytes);
+    if (rc != PG_SUCCESS) return rc;
+
+    /* Register sendbuf and recvbuf MRs in lazy MR cache */
+    struct ibv_mr *send_mr = pg_get_or_reg_mr(ctx, (void *)sendbuf, total_bytes, IBV_ACCESS_LOCAL_WRITE);
+    if (!send_mr) {
+        fprintf(stderr, "[pg_all_reduce] Rank %d failed to register sendbuf MR\n", ctx->rank);
+        return PG_ERR_RDMA;
+    }
+    struct ibv_mr *recv_mr = pg_get_or_reg_mr(ctx, recvbuf, total_bytes,
+                                              IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
+    if (!recv_mr) {
+        fprintf(stderr, "[pg_all_reduce] Rank %d failed to register recvbuf MR\n", ctx->rank);
+        return PG_ERR_RDMA;
     }
 
-    /* Phase 2: Distributed barrier before All-Gather phase (ensures phase synchronization and minimizes CQ jitter) */
-    rc = pg_barrier(pg_handle);
-    if (rc != PG_SUCCESS) {
-        fprintf(stderr, "[pg_all_reduce] Rank %d intermediate barrier failed with code %d\n",
-                ctx->rank, rc);
-        return rc;
+    int is_eager = 0;
+#if (PG_ACTIVE_MODE == PG_MODE_TYPE_EAGER)
+    is_eager = 1;
+#elif (PG_ACTIVE_MODE == PG_MODE_TYPE_AUTO)
+    if (max_seg_bytes <= ctx->eager_threshold) {
+        is_eager = 1;
     }
+#endif
+
+    /* Phase 1: Dual-buffer in-place Reduce-Scatter directly accumulating into recvbuf (Approach A) */
+    for (int step = 0; step < ctx->size - 1; step++) {
+        int send_seg = (ctx->rank - step - 1 + ctx->size) % ctx->size;
+        int recv_seg = (ctx->rank - step - 2 + ctx->size) % ctx->size;
+
+        size_t send_seg_bytes = (size_t)ctx->seg_table[send_seg].count * elem_size;
+        size_t send_seg_offset = ctx->seg_table[send_seg].offset_bytes;
+
+        size_t recv_seg_bytes = (size_t)ctx->seg_table[recv_seg].count * elem_size;
+        size_t recv_seg_offset = ctx->seg_table[recv_seg].offset_bytes;
+
+        struct pg_ring_step_desc desc;
+        memset(&desc, 0, sizeof(desc));
+        desc.step_idx = (uint32_t)step;
+        desc.send_tag = (uint32_t)send_seg;
+        if (step == 0) {
+            desc.send_buf = (const char *)sendbuf + send_seg_offset;
+            desc.send_lkey = send_mr->lkey;
+        } else {
+            desc.send_buf = (const char *)recvbuf + send_seg_offset;
+            desc.send_lkey = recv_mr->lkey;
+        }
+        desc.send_bytes = send_seg_bytes;
+
+        desc.recv_tag = (uint32_t)recv_seg;
+        desc.recv_target_addr = ctx->staging_buf;
+        desc.recv_rkey = ctx->staging_mr->rkey;
+        desc.recv_bytes = recv_seg_bytes;
+
+        struct pg_allreduce_dual_cb_ctx dctx = {
+            .sendbuf_slice = (const char *)sendbuf + recv_seg_offset,
+            .recvbuf_slice = (char *)recvbuf + recv_seg_offset,
+            .datatype = datatype,
+            .op = op,
+            .elem_size = (int)elem_size
+        };
+
+        desc.on_recv_chunk = pg_allreduce_dual_chunk_cb;
+        desc.cb_dest = (char *)recvbuf + recv_seg_offset;
+        desc.cb_user_ctx = &dctx;
+
+        rc = pg_ring_step_transfer(ctx, is_eager, &desc);
+        if (rc != PG_SUCCESS) {
+            fprintf(stderr, "[pg_all_reduce] Rank %d Reduce-Scatter step %d failed with code %d\n",
+                    ctx->rank, step, rc);
+            return rc;
+        }
+    }
+
+    /* Phase 2: Barrierless RS -> AG phase fusion (ADR-0008, Phase 3) */
+    /* Rank immediately begins All-Gather without global barrier dead time */
 
     /* Phase 3: Direct All-Gather distributing reduced segments across ring */
     rc = pg_ring_all_gather_generalized(ctx, recvbuf, count, datatype);

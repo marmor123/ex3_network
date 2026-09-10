@@ -63,3 +63,4 @@ An internal staging area used in safe mode (`WORKBUFFER=safe`) to perform out-of
 - [ADR-0005: MPI remainder partitioning and ring step permutations](docs/adr/0005-mpi-remainder-and-ring-step-permutation.md)
 - [ADR-0006: Pipelined windowing and selective CQ signaling](docs/adr/0006-pipelined-windowing-and-selective-signaling.md)
 - [ADR-0007: Three-phase distributed ring barrier](docs/adr/0007-three-phase-distributed-barrier.md)
+- [ADR-0008: Rendezvous protocol variants (classical RTS/CTS vs pre-negotiated mailbox)](docs/adr/0008-rendezvous-protocol-variants.md)

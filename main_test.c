@@ -636,6 +636,19 @@ int main(int argc, char **argv) {
             }
         }
 
+        /* Verify sendbuf immutability (sendbuf must NOT be modified) */
+        for (int k = 0; k < count; k++) {
+            int expected_orig = (rank + 1) * (int)((k % 1000) + 1);
+            if (sints[k] != expected_orig) {
+                if (errors < 5) {
+                    fprintf(stderr, "  [ERROR] Rank %d at idx %d: sendbuf was modified! got %d, expected %d\n",
+                            rank, k, sints[k], expected_orig);
+                }
+                errors++;
+                break;
+            }
+        }
+
         if (errors > 0) {
             fprintf(stderr, "  [FAIL] Size %10zu B (%9d ints) -> %d data mismatches on rank %d\n",
                     sz, count, errors, rank);
@@ -823,6 +836,19 @@ int main(int argc, char **argv) {
                             rank, k, actual, expected);
                 }
                 errors++;
+            }
+        }
+
+        /* Verify sendbuf immutability (sendbuf must NOT be modified) */
+        for (int k = 0; k < count; k++) {
+            int expected_orig = (rank + 1) * (int)((k % 1000) + 1);
+            if (sints[k] != expected_orig) {
+                if (errors < 5) {
+                    fprintf(stderr, "  [ERROR] Rank %d at idx %d: sendbuf was modified! got %d, expected %d\n",
+                            rank, k, sints[k], expected_orig);
+                }
+                errors++;
+                break;
             }
         }
 
