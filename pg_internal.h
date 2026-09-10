@@ -214,7 +214,8 @@ struct pg_context {
     struct ibv_mr *recv_slot_mr[2];
 
     /* Control & Eager Send Header Buffers */
-    char ctrl_send_buf[2][PG_CTRL_MSG_LEN];
+    char ctrl_send_buf[2][PG_CTRL_POOL_DEPTH][PG_CTRL_MSG_LEN];
+    uint32_t ctrl_send_slot[2];
     struct ibv_mr *ctrl_send_mr[2];
     char eager_send_hdr_buf[2][PG_CTRL_POOL_DEPTH][PG_CTRL_MSG_LEN];
     struct ibv_mr *eager_send_hdr_mr[2];

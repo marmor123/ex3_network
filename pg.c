@@ -607,8 +607,9 @@ int pg_post_ctrl_send(struct pg_context *ctx, int qp_dir, const struct pg_ctrl_m
     if (ctx->max_inline_data[qp_dir] >= (uint32_t)sizeof(*msg)) {
         wr.send_flags |= IBV_SEND_INLINE;
     } else {
-        memcpy(ctx->ctrl_send_buf[qp_dir], msg, sizeof(*msg));
-        sge.addr = (uintptr_t)ctx->ctrl_send_buf[qp_dir];
+        uint32_t s = (ctx->ctrl_send_slot[qp_dir]++) % PG_CTRL_POOL_DEPTH;
+        memcpy(ctx->ctrl_send_buf[qp_dir][s], msg, sizeof(*msg));
+        sge.addr = (uintptr_t)ctx->ctrl_send_buf[qp_dir][s];
         sge.lkey = ctx->ctrl_send_mr[qp_dir]->lkey;
     }
 
