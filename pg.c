@@ -229,6 +229,10 @@ static int pg_tcp_accept_timeout(int listener_fd, int timeout_sec) {
     return connfd;
 }
 
+/* ========================================================================= */
+/* === MODULE 2: VERBS HARDWARE & QP LIFECYCLE                          === */
+/* ========================================================================= */
+
 /* Cleanup InfiniBand resources in reverse order */
 void pg_rdma_cleanup(struct pg_context *ctx) {
     if (!ctx) return;
@@ -315,10 +319,6 @@ void pg_rdma_cleanup(struct pg_context *ctx) {
         }
     }
 }
-
-/* ========================================================================= */
-/* === MODULE 2: VERBS HARDWARE & QP LIFECYCLE                          === */
-/* ========================================================================= */
 
 /* Open first IB device, query capabilities, allocate PD, CQ, QPs, and pre-post receive pool */
 int pg_rdma_init_resources(struct pg_context *ctx) {
@@ -472,7 +472,7 @@ int pg_rdma_init_resources(struct pg_context *ctx) {
             return PG_ERR_RDMA;
         }
 
-        /* Pre-post 32 unified 2-SGE receive WRs (header + eager payload buffer) */
+        /* Pre-post 32 unified single-SGE receive WRs (header + eager payload buffer) */
         for (int slot = 0; slot < PG_CTRL_POOL_DEPTH; slot++) {
             if (pg_repost_recv_slot(ctx, dir, slot)) {
                 fprintf(stderr, "[pg_rdma] Error: Failed to pre-post recv slot %d on QP %d\n", slot, dir);
@@ -576,9 +576,9 @@ int pg_rdma_connect_qp(struct ibv_qp *qp, const struct pg_tcp_qp_info *remote,
     /* 2. Transition to RTS */
     memset(&attr, 0, sizeof(attr));
     attr.qp_state       = IBV_QPS_RTS;
-    attr.timeout        = 14;
-    attr.retry_cnt      = 7;
-    attr.rnr_retry      = 7;
+    attr.timeout        = PG_IB_QP_TIMEOUT;
+    attr.retry_cnt      = PG_IB_QP_RETRY_CNT;
+    attr.rnr_retry      = PG_IB_QP_RNR_RETRY;
     attr.sq_psn         = my_psn;
     attr.max_rd_atomic  = 1;
 
@@ -689,13 +689,13 @@ int pg_ensure_internal_buffers(struct pg_context *ctx, size_t count_bytes, size_
             ctx->staging_buf = NULL;
         }
 
-        size_t align = (segment_bytes >= 2 * 1024 * 1024) ? (2 * 1024 * 1024) : 64;
+        size_t align = (segment_bytes >= PG_HUGEPAGE_ALIGN_BYTES) ? PG_HUGEPAGE_ALIGN_BYTES : PG_CACHELINE_ALIGN_BYTES;
         if (posix_memalign((void **)&ctx->staging_buf, align, segment_bytes) != 0 || !ctx->staging_buf) {
             ctx->staging_capacity = 0;
             return PG_ERR_NOMEM;
         }
 #ifdef MADV_HUGEPAGE
-        if (segment_bytes >= 2 * 1024 * 1024) {
+        if (segment_bytes >= PG_HUGEPAGE_ALIGN_BYTES) {
             madvise(ctx->staging_buf, segment_bytes, MADV_HUGEPAGE);
         }
 #endif
@@ -724,13 +724,13 @@ int pg_ensure_internal_buffers(struct pg_context *ctx, size_t count_bytes, size_
             ctx->work_buf = NULL;
         }
 
-        size_t align = (count_bytes >= 2 * 1024 * 1024) ? (2 * 1024 * 1024) : 64;
+        size_t align = (count_bytes >= PG_HUGEPAGE_ALIGN_BYTES) ? PG_HUGEPAGE_ALIGN_BYTES : PG_CACHELINE_ALIGN_BYTES;
         if (posix_memalign((void **)&ctx->work_buf, align, count_bytes) != 0 || !ctx->work_buf) {
             ctx->work_capacity = 0;
             return PG_ERR_NOMEM;
         }
 #ifdef MADV_HUGEPAGE
-        if (count_bytes >= 2 * 1024 * 1024) {
+        if (count_bytes >= PG_HUGEPAGE_ALIGN_BYTES) {
             madvise(ctx->work_buf, count_bytes, MADV_HUGEPAGE);
         }
 #endif
@@ -767,15 +767,15 @@ void pg_init_tuning_params(struct pg_context *ctx) {
     ctx->rdma_window = PG_RDMA_WINDOW;
     const char *win_env = getenv("PG_RDMA_WINDOW");
     if (win_env && *win_env) {
-        int val = atoi(win_env);
-        if (val > 0) ctx->rdma_window = val;
+        unsigned long val = strtoul(win_env, NULL, 10);
+        if (val > 0) ctx->rdma_window = (uint32_t)val;
     }
 
     ctx->rdma_signal_interval = PG_RDMA_SIGNAL_INTERVAL;
     const char *sig_env = getenv("PG_RDMA_SIGNAL_INTERVAL");
     if (sig_env && *sig_env) {
-        int val = atoi(sig_env);
-        if (val > 0) ctx->rdma_signal_interval = val;
+        unsigned long val = strtoul(sig_env, NULL, 10);
+        if (val > 0) ctx->rdma_signal_interval = (uint32_t)val;
     }
     if (ctx->rdma_signal_interval > ctx->rdma_window) {
         ctx->rdma_signal_interval = ctx->rdma_window;
@@ -784,8 +784,8 @@ void pg_init_tuning_params(struct pg_context *ctx) {
     ctx->batch_size = PG_DEFAULT_BATCH_SIZE;
     const char *batch_env = getenv("PG_BATCH_SIZE");
     if (batch_env && *batch_env) {
-        int val = atoi(batch_env);
-        if (val > 0) ctx->batch_size = val;
+        unsigned long val = strtoul(batch_env, NULL, 10);
+        if (val > 0) ctx->batch_size = (uint32_t)val;
     }
 
     ctx->eager_threshold = PG_EAGER_THRESHOLD;
@@ -798,8 +798,8 @@ void pg_init_tuning_params(struct pg_context *ctx) {
     ctx->eager_window = PG_EAGER_WINDOW;
     const char *ewin_env = getenv("PG_EAGER_WINDOW");
     if (ewin_env && *ewin_env) {
-        int val = atoi(ewin_env);
-        if (val > 0) ctx->eager_window = val;
+        unsigned long val = strtoul(ewin_env, NULL, 10);
+        if (val > 0) ctx->eager_window = (uint32_t)val;
     }
 }
 
@@ -811,7 +811,7 @@ void pg_init_tuning_params(struct pg_context *ctx) {
 #define PG_LOAD_SI128(p) _mm_loadu_si128((const __m128i *)(p))
 #define PG_STORE_SI128(p, v) _mm_storeu_si128((__m128i *)(p), (v))
 
-#define PG_REDUCE_LOOP_4X(type, vtype, load_fn, store_fn, vec_op, scalar_op, step) do { \
+#define PG_REDUCE_LOOP_4X(vtype, load_fn, store_fn, vec_op, scalar_op, step) do { \
     for (; i + ((step) * 4) <= count; i += ((step) * 4)) { \
         vtype vd0 = load_fn(d + i); \
         vtype vd1 = load_fn(d + i + (step)); \
@@ -834,16 +834,16 @@ void pg_init_tuning_params(struct pg_context *ctx) {
     for (; i < count; i++) { scalar_op; } \
 } while(0)
 
-#define PG_REDUCE_OP_CASES(type, vtype, load_fn, store_fn, add_vec, min_vec, max_vec, mul_vec, step) do { \
+#define PG_REDUCE_OP_CASES(vtype, load_fn, store_fn, add_vec, min_vec, max_vec, mul_vec, step) do { \
     int i = 0; \
     if (op == PG_SUM) { \
-        PG_REDUCE_LOOP_4X(type, vtype, load_fn, store_fn, add_vec, d[i] += s[i], step); \
+        PG_REDUCE_LOOP_4X(vtype, load_fn, store_fn, add_vec, d[i] += s[i], step); \
     } else if (op == PG_MIN) { \
-        PG_REDUCE_LOOP_4X(type, vtype, load_fn, store_fn, min_vec, if (s[i] < d[i]) d[i] = s[i], step); \
+        PG_REDUCE_LOOP_4X(vtype, load_fn, store_fn, min_vec, if (s[i] < d[i]) d[i] = s[i], step); \
     } else if (op == PG_MAX) { \
-        PG_REDUCE_LOOP_4X(type, vtype, load_fn, store_fn, max_vec, if (s[i] > d[i]) d[i] = s[i], step); \
+        PG_REDUCE_LOOP_4X(vtype, load_fn, store_fn, max_vec, if (s[i] > d[i]) d[i] = s[i], step); \
     } else if (op == PG_PROD) { \
-        PG_REDUCE_LOOP_4X(type, vtype, load_fn, store_fn, mul_vec, d[i] *= s[i], step); \
+        PG_REDUCE_LOOP_4X(vtype, load_fn, store_fn, mul_vec, d[i] *= s[i], step); \
     } \
 } while(0)
 
@@ -856,7 +856,7 @@ void pg_reduce_buffer(void *dest, const void *src, int count,
         case PG_INT: {
             int32_t *d = (int32_t *)dest;
             const int32_t *s = (const int32_t *)src;
-            PG_REDUCE_OP_CASES(int32_t, __m128i,
+            PG_REDUCE_OP_CASES(__m128i,
                                PG_LOAD_SI128, PG_STORE_SI128,
                                _mm_add_epi32, _mm_min_epi32, _mm_max_epi32, _mm_mullo_epi32, 4);
             break;
@@ -865,7 +865,7 @@ void pg_reduce_buffer(void *dest, const void *src, int count,
         case PG_FLOAT: {
             float *d = (float *)dest;
             const float *s = (const float *)src;
-            PG_REDUCE_OP_CASES(float, __m128,
+            PG_REDUCE_OP_CASES(__m128,
                                _mm_loadu_ps, _mm_storeu_ps,
                                _mm_add_ps, _mm_min_ps, _mm_max_ps, _mm_mul_ps, 4);
             break;
@@ -874,7 +874,7 @@ void pg_reduce_buffer(void *dest, const void *src, int count,
         case PG_DOUBLE: {
             double *d = (double *)dest;
             const double *s = (const double *)src;
-            PG_REDUCE_OP_CASES(double, __m128d,
+            PG_REDUCE_OP_CASES(__m128d,
                                _mm_loadu_pd, _mm_storeu_pd,
                                _mm_add_pd, _mm_min_pd, _mm_max_pd, _mm_mul_pd, 2);
             break;
@@ -886,7 +886,8 @@ void pg_reduce_buffer(void *dest, const void *src, int count,
 }
 
 /* ========================================================================= */
-/* === MODULE 4: PROGRESS ENGINE & CQ DISPATCH                          === */
+/* === PROCESS GROUP LIFECYCLE & RING BARRIER (ADR-0007)                === */
+/* === (Note: Module 4 Progress Engine is implemented in pg_internal.h)  === */
 /* ========================================================================= */
 
 
@@ -1300,7 +1301,7 @@ static int pg_ring_step_transfer_eager(struct pg_context *ctx, const struct pg_r
 
         /* 2. Post eager sends within flow control window */
         while (eager_posted_micros < num_send_micros &&
-               (eager_posted_micros - eager_completed_micros) < (uint32_t)ctx->eager_window) {
+               (eager_posted_micros - eager_completed_micros) < ctx->eager_window) {
             uint32_t k = eager_posted_micros;
             size_t offset = (size_t)k * ctx->pipeline_chunk;
             size_t micro_len = desc->send_bytes - offset;
@@ -1410,8 +1411,8 @@ static int pg_ring_step_transfer_rdv(struct pg_context *ctx, const struct pg_rin
      * For large transfers >= 256 MiB up to 1 GiB, 256 KiB chunks minimize work request
      * descriptor posting overhead to saturate the 20 Gbps link rate (achieving 22.23 Gbps).
      */
-    if (max_seg_bytes < (64ULL * 1024ULL * 1024ULL) && !getenv("PG_PIPELINE_CHUNK")) {
-        chunk_size = (64 * 1024);
+    if (max_seg_bytes < PG_ADAPTIVE_CHUNK_THRESHOLD && !getenv("PG_PIPELINE_CHUNK")) {
+        chunk_size = PG_SMALL_PIPELINE_CHUNK;
     }
 
     uint32_t num_send_micros = (uint32_t)((desc->send_bytes + chunk_size - 1) / chunk_size);
@@ -1508,12 +1509,12 @@ static int pg_ring_step_transfer_rdv(struct pg_context *ctx, const struct pg_rin
 
         /* 4. Post batched RDMA Writes within window */
         while (cts_received && rdma_posted_micros < num_send_micros &&
-               (rdma_posted_micros - rdma_completed_micros) < (uint32_t)ctx->rdma_window) {
+               (rdma_posted_micros - rdma_completed_micros) < ctx->rdma_window) {
             uint32_t in_flight = rdma_posted_micros - rdma_completed_micros;
-            uint32_t win_avail = (uint32_t)ctx->rdma_window - in_flight;
+            uint32_t win_avail = ctx->rdma_window - in_flight;
             uint32_t remaining = num_send_micros - rdma_posted_micros;
             uint32_t to_post = win_avail < remaining ? win_avail : remaining;
-            if (to_post > (uint32_t)ctx->batch_size) to_post = (uint32_t)ctx->batch_size;
+            if (to_post > ctx->batch_size) to_post = ctx->batch_size;
             if (to_post > 64) to_post = 64;
             if (to_post == 0) break;
 
@@ -1530,9 +1531,9 @@ static int pg_ring_step_transfer_rdv(struct pg_context *ctx, const struct pg_rin
                 void *local_src = (char *)desc->send_buf + offset;
                 uint64_t remote_addr = remote_target_addr + offset;
 
-                uint32_t eff_sig_interval = (uint32_t)ctx->rdma_signal_interval;
-                if (eff_sig_interval > (uint32_t)ctx->rdma_window) {
-                    eff_sig_interval = (uint32_t)ctx->rdma_window;
+                uint32_t eff_sig_interval = ctx->rdma_signal_interval;
+                if (eff_sig_interval > ctx->rdma_window) {
+                    eff_sig_interval = ctx->rdma_window;
                 }
                 if (eff_sig_interval == 0) eff_sig_interval = 1;
                 int is_signaled = ((k + 1) % eff_sig_interval == 0 || (k + 1) == num_send_micros);
@@ -1676,6 +1677,11 @@ static int pg_ring_step_transfer_rdv(struct pg_context *ctx, const struct pg_rin
                 case PG_WR_TYPE_SEND_CTRL: {
                     if (ev.qp_dir == PG_QP_DIR_TO_NEXT) {
                         send_ctrl_completed_to_next++;
+                        /*
+                         * Outbound send completes when all RDMA writes completed,
+                         * all micro-chunks were signaled with DATA_DONE, and all outbound
+                         * control sends (1 initial RTS + data_done_sent_count DATA_DONE) completed.
+                         */
                         if (rdma_completed_micros == num_send_micros &&
                             data_done_sent_micros == num_send_micros &&
                             send_ctrl_completed_to_next >= (1 + data_done_sent_count)) {
@@ -1683,6 +1689,10 @@ static int pg_ring_step_transfer_rdv(struct pg_context *ctx, const struct pg_rin
                         }
                     } else if (ev.qp_dir == PG_QP_DIR_FROM_PREV) {
                         send_ctrl_completed_from_prev++;
+                        /*
+                         * Inbound receive completes when all micro-chunks were processed
+                         * and our 1 CTS reply send WR on qp_from_prev has completed.
+                         */
                         if (data_done_recv_micros == num_recv_micros &&
                             send_ctrl_completed_from_prev >= 1) {
                             recv_done = 1;

@@ -23,6 +23,11 @@
 #define PG_CTRL_MSG_LEN         64
 #define PG_CTRL_POLL_TIMEOUT_SEC 10
 #define PG_MAX_INLINE_DECLARE   1024
+#define PG_IB_QP_TIMEOUT        14           /* ~67.1 ms (4.096us * 2^14) */
+#define PG_IB_QP_RETRY_CNT      7            /* Maximum 3-bit retry count */
+#define PG_IB_QP_RNR_RETRY      7            /* Infinite RNR retry */
+#define PG_HUGEPAGE_ALIGN_BYTES (2 * 1024 * 1024) /* 2 MiB hugepage alignment */
+#define PG_CACHELINE_ALIGN_BYTES 64          /* 64-byte L1/L2 cacheline alignment */
 
 /* Protocol Modes */
 #define PG_MODE_TYPE_RENDEZVOUS 1
@@ -45,6 +50,8 @@
 
 /* Pipelining Constants (256 KiB chunk, 32 in-flight window, 8 signal interval) */
 #define PG_PIPELINE_CHUNK        (256 * 1024)  /* 256 KiB optimal sweet spot */
+#define PG_SMALL_PIPELINE_CHUNK  (64 * 1024)   /* 64 KiB chunk for sub-256 MiB tensors */
+#define PG_ADAPTIVE_CHUNK_THRESHOLD (64ULL * 1024ULL * 1024ULL) /* 64 MiB segment threshold */
 #define PG_RDMA_WINDOW           32            /* 32 in-flight micro-chunks */
 #define PG_RDMA_SIGNAL_INTERVAL  8             /* Signal every 8 WRs (2 MiB pipeline step) */
 
@@ -174,11 +181,11 @@ struct pg_context {
 
     /* Runtime Hyperparameters & Tuning (V10) */
     size_t pipeline_chunk;
-    int rdma_window;
-    int rdma_signal_interval;
-    int batch_size;
+    uint32_t rdma_window;
+    uint32_t rdma_signal_interval;
+    uint32_t batch_size;
     size_t eager_threshold;
-    int eager_window;
+    uint32_t eager_window;
 
     /* InfiniBand Verbs Resources */
     struct ibv_context *ib_ctx;
@@ -360,7 +367,7 @@ static inline int pg_repost_recv_slot(struct pg_context *ctx, int qp_dir, int sl
 #define pg_recv_slot_payload(ctx, dir, slot)      ((void *)((char *)ctx->recv_slot_buf[dir][slot] + PG_CTRL_MSG_LEN))
 
 /* ========================================================================= */
-/* Deep Progress Engine Module (ADR-0001, CONTEXT.md)                        */
+/* === MODULE 4: PROGRESS ENGINE & CQ DISPATCH (ADR-0001, CONTEXT.md)   === */
 /* Encapsulates CQ polling, wr_id decoding, automatic receive buffer        */
 /* replenishment, and pending FIFO message queue matching.                   */
 /* ========================================================================= */
@@ -410,6 +417,9 @@ static inline int pg_progress_poll(struct pg_context *ctx, struct pg_progress_ev
     if (ne == 0) {
         return 0; /* No completion ready */
     }
+
+    /* Compiler memory barrier ensuring strict DMA completion visibility before reading wc/payload */
+    asm volatile("" ::: "memory");
 
     if (wc.status != IBV_WC_SUCCESS) {
         fprintf(stderr, "[pg_progress] Error: CQ completion error %s (%d) on wr_id 0x%lx\n",
