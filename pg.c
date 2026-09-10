@@ -1177,10 +1177,9 @@ int connect_process_group(char *servername, void **pg_handle) {
         return PG_ERR_INVAL;
     }
 
-    /* Validate servername matches our host list at rank */
-    if (strncmp(servername, g_pg_args.hosts[g_pg_args.rank], PG_MAX_HOST_LEN) != 0) {
-        fprintf(stderr, "[pg] Error: servername '%s' does not match list[%d] ('%s')\n",
-                servername, g_pg_args.rank, g_pg_args.hosts[g_pg_args.rank]);
+    /* Validate servername is non-empty */
+    if (strlen(servername) == 0) {
+        fprintf(stderr, "[pg] Error: servername must be non-empty\n");
         return PG_ERR_INVAL;
     }
 
@@ -1520,7 +1519,7 @@ static int pg_ring_step_transfer_rdv(struct pg_context *ctx, const struct pg_rin
                 size_t micro_len = desc->recv_bytes - offset;
                 if (micro_len > chunk_size) micro_len = chunk_size;
 
-                if (desc->on_recv_chunk) {
+                if (desc->on_recv_chunk && desc->cb_dest != desc->recv_target_addr) {
                     void *dest = (char *)desc->cb_dest + offset;
                     const void *src = (char *)desc->recv_target_addr + offset;
                     desc->on_recv_chunk(dest, src, micro_len, desc->cb_user_ctx);
@@ -1644,7 +1643,7 @@ static int pg_ring_step_transfer_rdv(struct pg_context *ctx, const struct pg_rin
                             size_t micro_len = desc->recv_bytes - offset;
                             if (micro_len > chunk_size) micro_len = chunk_size;
 
-                            if (desc->on_recv_chunk) {
+                            if (desc->on_recv_chunk && desc->cb_dest != desc->recv_target_addr) {
                                 void *dest = (char *)desc->cb_dest + offset;
                                 const void *src = (char *)desc->recv_target_addr + offset;
                                 desc->on_recv_chunk(dest, src, micro_len, desc->cb_user_ctx);
@@ -1747,9 +1746,10 @@ static int pg_ring_step_transfer_rdv(struct pg_context *ctx, const struct pg_rin
     return PG_SUCCESS;
 }
 
-/* Dispatch transfer step to Eager or Rendezvous engine */
-static inline int pg_ring_step_transfer(struct pg_context *ctx, int is_eager, const struct pg_ring_step_desc *desc) {
-    if (is_eager) {
+/* Dispatch transfer step to Eager or Rendezvous engine (Transfer Seam #2 Encapsulation) */
+static inline int pg_ring_step_transfer(struct pg_context *ctx, const struct pg_ring_step_desc *desc) {
+    size_t seg_bytes = desc->send_bytes > desc->recv_bytes ? desc->send_bytes : desc->recv_bytes;
+    if (pg_is_eager(ctx, seg_bytes)) {
         return pg_ring_step_transfer_eager(ctx, desc);
     } else {
         return pg_ring_step_transfer_rdv(ctx, desc);
@@ -1810,15 +1810,6 @@ int pg_reduce_scatter(void *sendbuf, void *recvbuf, int count,
     work_mr = ctx->work_mr;
 #endif
 
-    int is_eager = 0;
-#if (PG_ACTIVE_MODE == PG_MODE_TYPE_EAGER)
-    is_eager = 1;
-#elif (PG_ACTIVE_MODE == PG_MODE_TYPE_AUTO)
-    if (max_seg_bytes <= ctx->eager_threshold) {
-        is_eager = 1;
-    }
-#endif
-
     struct pg_reduce_cb_ctx rctx = {
         .datatype = datatype,
         .op = op,
@@ -1855,7 +1846,7 @@ int pg_reduce_scatter(void *sendbuf, void *recvbuf, int count,
         desc.cb_dest = (char *)work_ptr + recv_seg_offset;
         desc.cb_user_ctx = &rctx;
 
-        rc = pg_ring_step_transfer(ctx, is_eager, &desc);
+        rc = pg_ring_step_transfer(ctx, &desc);
         if (rc != PG_SUCCESS) return rc;
     }
 
@@ -1877,9 +1868,6 @@ int pg_ring_all_gather_generalized(struct pg_context *ctx, void *recvbuf, int co
     if (ctx->size == 1) return PG_SUCCESS;
 
     size_t elem_size = pg_get_datatype_size(datatype);
-    int max_seg_elems = pg_get_seg_count(0, count, ctx->size);
-    size_t max_seg_bytes = (size_t)max_seg_elems * elem_size;
-    (void)max_seg_bytes;
     size_t total_bytes = (size_t)count * elem_size;
 
     struct ibv_mr *recv_mr = pg_get_or_reg_mr(ctx, recvbuf, total_bytes,
@@ -1888,15 +1876,6 @@ int pg_ring_all_gather_generalized(struct pg_context *ctx, void *recvbuf, int co
         fprintf(stderr, "[pg_all_gather] Rank %d failed to register recvbuf MR\n", ctx->rank);
         return PG_ERR_RDMA;
     }
-
-    int is_eager = 0;
-#if (PG_ACTIVE_MODE == PG_MODE_TYPE_EAGER)
-    is_eager = 1;
-#elif (PG_ACTIVE_MODE == PG_MODE_TYPE_AUTO)
-    if (max_seg_bytes <= ctx->eager_threshold) {
-        is_eager = 1;
-    }
-#endif
 
     /* Execute size - 1 ring gathering steps */
     for (int step = 0; step < ctx->size - 1; step++) {
@@ -1925,11 +1904,11 @@ int pg_ring_all_gather_generalized(struct pg_context *ctx, void *recvbuf, int co
         desc.recv_bytes = recv_seg_bytes;
 
         /* Eager mode uses memcpy; Rendezvous mode does Zero-Copy RDMA Write directly into recvbuf */
-        desc.on_recv_chunk = is_eager ? pg_allgather_eager_cb : NULL;
+        desc.on_recv_chunk = pg_allgather_eager_cb;
         desc.cb_dest = (char *)recvbuf + recv_seg_offset;
         desc.cb_user_ctx = NULL;
 
-        int rc = pg_ring_step_transfer(ctx, is_eager, &desc);
+        int rc = pg_ring_step_transfer(ctx, &desc);
         if (rc != PG_SUCCESS) return rc;
     }
 

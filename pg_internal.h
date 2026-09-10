@@ -8,9 +8,6 @@
 #include <infiniband/verbs.h>
 #include <emmintrin.h>
 #include <smmintrin.h>
-#if defined(__AVX2__) || defined(__AVX512F__)
-#include <immintrin.h>
-#endif
 
 /* TCP Bootstrap Constants */
 #define PG_TCP_BASE_PORT        19000
@@ -613,6 +610,19 @@ struct pg_ring_step_desc {
     void *cb_dest;                     /* Destination buffer pointer for callback */
     void *cb_user_ctx;                 /* User context passed into callback */
 };
+
+/* Protocol selection helper: determines whether micro-chunk transfer uses Eager Send/Recv or Rendezvous RDMA Write */
+static inline int pg_is_eager(struct pg_context *ctx, size_t seg_bytes) {
+#if (PG_ACTIVE_MODE == PG_MODE_TYPE_EAGER)
+    (void)ctx; (void)seg_bytes;
+    return 1;
+#elif (PG_ACTIVE_MODE == PG_MODE_TYPE_AUTO)
+    return seg_bytes <= ctx->eager_threshold;
+#else
+    (void)ctx; (void)seg_bytes;
+    return 0;
+#endif
+}
 
 /* Internal RDMA and TCP bootstrap helper functions */
 int pg_rdma_init_resources(struct pg_context *ctx);
