@@ -8,6 +8,7 @@ parses the latency & effective bandwidth metrics, and produces a comparative ana
 import os
 import sys
 import re
+import time
 import subprocess
 import argparse
 
@@ -26,6 +27,10 @@ def sync_and_build(hosts, mode):
         ["ssh", hosts[0], f"cd {CLUSTER_DIR} && make clean && make MODE={mode}"],
         check=True
     )
+    # Force NFS attribute cache revalidation across all cluster nodes
+    for h in hosts:
+        subprocess.run(["ssh", h, f"stat {CLUSTER_DIR}/test"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    time.sleep(1)
 
 def run_sweep(hosts, env_overrides=None):
     if env_overrides is None:
