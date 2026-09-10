@@ -8,9 +8,29 @@
 #include <infiniband/verbs.h>
 #include <emmintrin.h>
 #include <smmintrin.h>
+#include <x86intrin.h>
 #if defined(__AVX2__) || defined(__AVX512F__)
 #include <immintrin.h>
 #endif
+
+/* Low-Overhead Hardware Invariant Time-Stamp Counter */
+static inline uint64_t pg_rdtsc(void) {
+#if defined(__x86_64__) || defined(_M_X64)
+    return __rdtsc();
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+#endif
+}
+
+/* Precomputed Segment Lookup Information (Phase 1) */
+struct pg_seg_info {
+    int count;
+    size_t offset_elems;
+    size_t offset_bytes;
+};
+
 
 /* TCP Bootstrap Constants */
 #define PG_TCP_BASE_PORT        19000
@@ -234,6 +254,15 @@ struct pg_context {
     struct pg_tcp_qp_info local_from_prev;         /* Local QP info for prev rank */
     struct pg_tcp_qp_info remote_to_next;          /* Received QP info from next rank */
     struct pg_tcp_qp_info remote_from_prev;        /* Received QP info from prev rank */
+
+    /* Microarchitecture Optimizations (Phase 1) */
+    uint64_t tsc_hz;                               /* Calibrated TSC frequency in Hz */
+    struct ibv_wc wc_cache[16];                    /* 16-entry batched CQ completion cache */
+    int wc_cache_count;
+    int wc_cache_head;
+    struct ibv_send_wr static_wrs[64] __attribute__((aligned(64))); /* Pre-linked WQE template ring */
+    struct ibv_sge static_sges[64] __attribute__((aligned(64)));    /* Pre-linked SGE templates */
+    struct pg_seg_info seg_table[PG_MAX_RANKS];    /* Precomputed segment lookup table */
 };
 
 static inline void pg_pending_push(struct pg_context *ctx, int qp_dir, const struct pg_ctrl_msg *msg, const void *slot_buf) {
@@ -336,6 +365,21 @@ static inline size_t pg_get_seg_offset_bytes(int rank, int count, int size, size
     return pg_get_seg_offset_elems(rank, count, size) * elem_size;
 }
 
+/* Precomputes segment counts and offsets across all ranks to eliminate runtime idiv */
+static inline void pg_precompute_seg_table(struct pg_context *ctx, int count, size_t elem_size) {
+    if (!ctx || ctx->size <= 0) return;
+    int q = count / ctx->size;
+    int r = count % ctx->size;
+    size_t off_elems = 0;
+    for (int i = 0; i < ctx->size; i++) {
+        int cnt = q + (i < r ? 1 : 0);
+        ctx->seg_table[i].count = cnt;
+        ctx->seg_table[i].offset_elems = off_elems;
+        ctx->seg_table[i].offset_bytes = off_elems * elem_size;
+        off_elems += cnt;
+    }
+}
+
 /* Unified 1-SGE receive buffer slot repost (ADR-0001, ADR-0002) */
 static inline int pg_repost_recv_slot(struct pg_context *ctx, int qp_dir, int slot) {
     struct ibv_sge sge = {
@@ -397,20 +441,24 @@ static inline void pg_progress_push_pending(struct pg_context *ctx, int qp_dir, 
     pg_pending_push(ctx, qp_dir, msg, slot_buf);
 }
 
-/* Non-blocking single CQ poll and event decoder with auto receive slot replenishment */
+/* Non-blocking batched CQ poll (up to 16 entries) and event decoder with auto receive slot replenishment */
 static inline int pg_progress_poll(struct pg_context *ctx, struct pg_progress_event *out_event) {
     if (!ctx || !out_event) return PG_ERR_INVAL;
 
-    struct ibv_wc wc;
-    int ne = ibv_poll_cq(ctx->cq, 1, &wc);
-    if (ne < 0) {
-        fprintf(stderr, "[pg_progress] Error: ibv_poll_cq failed with code %d\n", ne);
-        return PG_ERR_RDMA;
-    }
-    if (ne == 0) {
-        return 0; /* No completion ready */
+    if (ctx->wc_cache_head >= ctx->wc_cache_count) {
+        int ne = ibv_poll_cq(ctx->cq, 16, ctx->wc_cache);
+        if (ne < 0) {
+            fprintf(stderr, "[pg_progress] Error: ibv_poll_cq failed with code %d\n", ne);
+            return PG_ERR_RDMA;
+        }
+        if (ne == 0) {
+            return 0; /* No completion ready */
+        }
+        ctx->wc_cache_count = ne;
+        ctx->wc_cache_head = 0;
     }
 
+    struct ibv_wc wc = ctx->wc_cache[ctx->wc_cache_head++];
     if (wc.status != IBV_WC_SUCCESS) {
         fprintf(stderr, "[pg_progress] Error: CQ completion error %s (%d) on wr_id 0x%lx\n",
                 ibv_wc_status_str(wc.status), wc.status, (unsigned long)wc.wr_id);
@@ -453,20 +501,19 @@ static inline int pg_progress_poll(struct pg_context *ctx, struct pg_progress_ev
     return 1;
 }
 
-/* Watchdog-timed progress event waiter (polls until completion or timeout) */
+/* Zero-syscall watchdog-timed progress event waiter using __rdtsc() */
 static inline int pg_progress_wait(struct pg_context *ctx, double timeout_sec, struct pg_progress_event *out_event) {
-    struct timespec start, now;
-    clock_gettime(CLOCK_MONOTONIC, &start);
+    uint64_t tsc_hz = (ctx && ctx->tsc_hz > 0) ? ctx->tsc_hz : 2667000000ULL;
+    uint64_t timeout_cycles = (uint64_t)(timeout_sec * (double)tsc_hz);
+    uint64_t deadline = pg_rdtsc() + timeout_cycles;
 
     while (1) {
         int rc = pg_progress_poll(ctx, out_event);
         if (rc < 0) return rc;
         if (rc == 1) return 1;
 
-        clock_gettime(CLOCK_MONOTONIC, &now);
-        double elapsed = (now.tv_sec - start.tv_sec) + (now.tv_nsec - start.tv_nsec) / 1e9;
-        if (elapsed >= timeout_sec) {
-            fprintf(stderr, "[pg_progress] Error: Timed out after %.2f s waiting for CQ event\n", elapsed);
+        if (pg_rdtsc() >= deadline) {
+            fprintf(stderr, "[pg_progress] Error: Timed out after %.2f s waiting for CQ event\n", timeout_sec);
             return PG_ERR_TIMEOUT;
         }
     }
