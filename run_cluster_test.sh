@@ -65,6 +65,14 @@ fi
 echo "Launching ring across: ${HOSTS[*]}"
 echo "Remote working directory: $CLUSTER_DIR"
 
+cleanup_remote() {
+    echo "Ensuring remote cluster ranks are terminated..."
+    for h in "${HOSTS[@]}"; do
+        ssh $SSH_OPTS "$h" "pkill -u ateret.tabib -9 -f './test -myindex' 2>/dev/null || true" 2>/dev/null || true
+    done
+}
+trap cleanup_remote EXIT INT TERM
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 echo "Syncing local workspace to ${HOSTS[0]}:$CLUSTER_DIR..."
 rsync -avz --exclude '.git' --exclude '*.o' --exclude 'test' "$SCRIPT_DIR/" "${HOSTS[0]}:$CLUSTER_DIR/"
@@ -91,6 +99,7 @@ for pid in "${PIDS[@]}"; do
 done
 
 if [ "$FAIL" -eq 0 ]; then
+    trap - EXIT INT TERM
     echo "=================================================================="
     echo "  CLUSTER TEST SUCCESS: All $NUM_NODES nodes completed collective test suite! "
     echo "=================================================================="

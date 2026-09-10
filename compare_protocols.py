@@ -52,6 +52,9 @@ def run_sweep(hosts, env_overrides=None):
             print(f"[ERROR] Rank {rank} on {hosts[rank]} failed (rc={p.returncode}):\n{err}")
     
     if not success:
+        for host in hosts:
+            subprocess.run(["ssh", host, "pkill -u ateret.tabib -9 -f './test -myindex' 2>/dev/null || true"],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         return None
     
     rank0_out = outs[0]
