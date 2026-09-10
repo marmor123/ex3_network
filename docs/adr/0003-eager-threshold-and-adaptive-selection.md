@@ -26,12 +26,19 @@ We support three compilation modes via `Makefile MODE=<mode>`:
 - Buffers are registered with `IBV_ACCESS_LOCAL_WRITE` at `connect_process_group` and continuously reposted upon consumption.
 - Control messages and small eager messages are unified through `pg_ctrl_msg` headers with 2-SGE scatter-gather sends.
 
+### 4. Symmetric Protocol Decisions in Remainder Distribution
+When buffer counts are non-divisible by rank count ($C \bmod N \ne 0$), segment sizes across adjacent ranks can differ by 1 element ($Q$ vs $Q+1$). If segment sizes span the 64 KiB crossover boundary, checking local segment sizes independently would cause Rank $i$ to choose Eager while Rank $i-1$ chooses Rendezvous, deadlocking the transfer.
+To prevent this, `pg_is_eager` evaluates the maximum possible segment across the ring:
+$$\text{max\_seg\_bytes} = \frac{\text{total\_bytes} + N - 1}{N}$$
+This derives from `desc->total_bytes`, ensuring all ranks make mathematically identical protocol decisions.
+
 ## Consequences
 - Small-message operations (e.g. metadata sync, small tensor all-reduces) achieve near-wire latency.
 - Large-message operations achieve peak link bandwidth without buffer copy bottlenecks.
 - `MODE=auto` provides the superior Pareto frontier across all buffer sizes from 64 B to 1 GiB.
+- Guaranteed ring-wide symmetry across non-divisible remainder boundaries.
 
 ## References
 - `assignment.txt`: Lecture #2 Eager vs. Rendezvous requirements.
 - `docs/empirical_protocol_report.md`: Sweep data on `mlx-stud-01..04`.
-- Commit `3b33127` & `5e33aad`.
+- Commit `3b33127`, `5e33aad` & `88f62d7`.

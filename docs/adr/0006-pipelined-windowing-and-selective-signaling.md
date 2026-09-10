@@ -8,16 +8,18 @@ In large-scale RDMA collectives (up to 1 GiB payloads), transferring entire ring
 ### 1. Pipelined Micro-Chunk Slicing & Adaptive Granularity
 - Segments are partitioned into pipelined micro-chunks.
 - **Adaptive Micro-Chunk Granularity**:
-  - For transfers $< 256\text{ MiB}$ tensor (segment $< 64\text{ MiB}$), micro-chunk size is set to **64 KiB**. This accelerates initial pipeline filling and eliminates pipeline bubbles, providing a **+1.6 to +2.8 Gbps bandwidth boost** on 4 MiB to 64 MiB transfers.
+  - For transfers $< 256\text{ MiB}$ tensor (segment $< 64\text{ MiB}$ `PG_ADAPTIVE_CHUNK_THRESHOLD`), micro-chunk size is set to **64 KiB** (`PG_SMALL_PIPELINE_CHUNK`). This accelerates initial pipeline filling and eliminates pipeline bubbles, providing a **+1.6 to +2.8 Gbps bandwidth boost** on 4 MiB to 64 MiB transfers.
   - For large transfers $\ge 256\text{ MiB}$ up to 1 GiB, micro-chunk size defaults to **256 KiB** (`PG_PIPELINE_CHUNK = 262144`), minimizing work request descriptor overhead.
+  - **Symmetric Remainder Granularity**: Both sender and receiver derive chunk size from `desc->total_bytes` via `((total_bytes + size - 1) / size)`, guaranteeing identical chunk granularity across remainder boundaries where segment sizes differ.
 - Transfer and computation are pipelined: as micro-chunk $m$ arrives in staging memory from `prev_rank`, the CPU begins SSE4.2 vector reduction on micro-chunk $m$ while the NIC concurrently receives micro-chunk $m+1$.
 
-### 2. Sliding Window Flow Control
-- We maintain a sliding window of at most 32 in-flight micro-chunks (`PG_RDMA_WINDOW = 32`).
+### 2. Sliding Window Flow Control & Type Hygiene
+- We maintain a sliding window of at most 32 in-flight micro-chunks (`PG_RDMA_WINDOW = 32`, typed `uint32_t`).
+- Up to `PG_DEFAULT_BATCH_SIZE = 8` chained WRs are posted per `ibv_post_send` call.
 - The sender transmits up to the window capacity without stalling. If the window is full, the sender yields to the progress engine to drain completed work requests before posting new ones.
 
 ### 3. Selective CQ Signaling & Dynamic Credit Bounding
-- Instead of signaling every RDMA Write, only 1 out of every 8 Work Requests (`PG_RDMA_SIGNAL_INTERVAL = 8`) sets `IBV_SEND_SIGNALED`.
+- Instead of signaling every RDMA Write, only 1 out of every 8 Work Requests (`PG_RDMA_SIGNAL_INTERVAL = 8`, typed `uint32_t`) sets `IBV_SEND_SIGNALED`.
 - The final Work Request of a segment transfer always sets `IBV_SEND_SIGNALED` to guarantee completion before advancing to the next ring step.
 - Polling frequency is reduced by $8\times$, drastically reducing CPU CQ inspection cycles.
 - **Dynamic Credit Bounding**: To prevent completion starvation when running with narrow sliding windows (`rdma_window < rdma_signal_interval`), the effective signaling interval is dynamically bounded:
@@ -28,7 +30,8 @@ In large-scale RDMA collectives (up to 1 GiB payloads), transferring entire ring
 - Full overlap of network transmission and SIMD reduction for all payload sizes $\ge 1\text{ MiB}$.
 - Sustained line-rate throughput reaching **21.82–22.23 Gbps** peak on 20 Gbps InfiniBand DDR interconnect.
 - Narrow window configurations (e.g. `Window = 1` or `Window = 16`) run cleanly without credit exhaustion deadlocks.
+- Zero risk of micro-chunk granularity mismatch across remainder boundaries.
 
 ## References
-- `pg_internal.h` (`PG_PIPELINE_CHUNK`, `PG_RDMA_WINDOW`, `PG_RDMA_SIGNAL_INTERVAL`).
-- Commit `d643a3a`, `d264ca3` & `d3cd90c`.
+- `pg_internal.h` (`PG_PIPELINE_CHUNK`, `PG_SMALL_PIPELINE_CHUNK`, `PG_ADAPTIVE_CHUNK_THRESHOLD`, `PG_RDMA_WINDOW`, `PG_RDMA_SIGNAL_INTERVAL`).
+- Commit `d643a3a`, `88f62d7` & `add1f2f`.

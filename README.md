@@ -221,13 +221,14 @@ Data is written directly into `recvbuf + offset(s_in)` with zero memory copies. 
 │
 ├── pg.h                          # Public C API and CLI structures
 ├── pg_internal.h                 # Internal wire protocols, SIMD dispatch & constants
-├── pg.c                          # Core implementation organized in 6 modular sections:
+├── pg.c                          # Core implementation organized in modular sections:
 │   ├── MODULE 1: TCP Bootstrap & CLI Topology
 │   ├── MODULE 2: Verbs Hardware & QP Lifecycle
 │   ├── MODULE 3: Memory Registration & Staging Cache
-│   ├── MODULE 4: Progress Engine & CQ Dispatch
 │   ├── MODULE 5: SSE4.2 Vector Reduction Compute Kernels
+│   ├── Group Lifecycle & Distributed Ring Barrier (ADR-0007)
 │   └── MODULE 6: Ring Step Transfer & Collectives Orchestration
+│   (Note: MODULE 4 Progress Engine & CQ Dispatch is implemented inline in pg_internal.h)
 │
 ├── main_test.c                   # Validation & benchmark test harness
 │

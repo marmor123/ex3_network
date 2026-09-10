@@ -28,14 +28,16 @@ We needed a low-overhead, deterministic completion routing mechanism that distin
 - Unexpected or future-step control messages are automatically diverted into an internal FIFO queue (`pending_q`) via `pg_progress_buffer_unexpected` rather than leaking queue maintenance to callers.
 - Callers declaratively wait on expected control messages or completion types without manual pushback loops.
 - **Dynamic Pointer Indirection**: In `struct pg_pending_entry` and `struct pg_progress_event`, eager message payloads are referenced via dynamic pointers backed by a single 64-byte cacheline-aligned context buffer (`ctx->eager_rx_buf`) rather than embedding 262 KB arrays in each struct.
+- **Strict DMA Memory Barrier**: `pg_progress_poll` issues an explicit compiler memory barrier (`asm volatile("" ::: "memory");`) immediately upon detecting a non-zero completion count from `ibv_poll_cq`, preventing compiler reordering of memory loads before DMA completion validation.
 
 ## Consequences
 - Single-cycle $O(1)$ decoding of completion queue entries with zero memory overhead.
 - Total decoupling of higher-level collective routines from raw Verbs CQ polling.
 - `sizeof(struct pg_context)` slashed by **99.0% (from ~33.6 MB down to ~340 KB)**.
 - Stack frame size during polling reduced from **262 KB to 88 bytes**, eliminating stack frame allocation overhead and L1/L2 data cache eviction.
+- Guaranteed memory visibility across asynchronous NIC DMA operations.
 
 ## References
 - `pg_internal.h` (`pg_make_wr`, `pg_progress_poll`, `pg_progress_wait`, `pg_pending_queue`).
 - `CONTEXT.md` (Progress Seam #1).
-- Commit `c1b79ac` (Ticket #18).
+- Commit `c1b79ac` (Ticket #18) & `add1f2f`.
