@@ -24,6 +24,10 @@ def sync_and_build(mode="auto"):
         ["ssh", HOSTS[0], f"cd {CLUSTER_DIR} && make clean && make MODE={mode}"],
         check=True
     )
+    # Force NFS attribute cache revalidation across all cluster nodes
+    for h in HOSTS:
+        subprocess.run(["ssh", h, f"stat {CLUSTER_DIR}/test"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    time.sleep(1)
 
 def run_single_sweep(env_overrides=None):
     if env_overrides is None:
