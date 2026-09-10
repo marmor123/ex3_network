@@ -232,7 +232,23 @@ static int pg_tcp_accept_timeout(int listener_fd, int timeout_sec) {
 void pg_rdma_cleanup(struct pg_context *ctx) {
     if (!ctx) return;
 
-    /* Deregister all application MRs in the lazy cache (ADR-0002) */
+    /* 1. Destroy Queue Pairs first so no in-flight or posted WRs reference MRs */
+    if (ctx->qp_to_next) {
+        ibv_destroy_qp(ctx->qp_to_next);
+        ctx->qp_to_next = NULL;
+    }
+    if (ctx->qp_from_prev) {
+        ibv_destroy_qp(ctx->qp_from_prev);
+        ctx->qp_from_prev = NULL;
+    }
+
+    /* 2. Destroy CQ after QPs are destroyed */
+    if (ctx->cq) {
+        ibv_destroy_cq(ctx->cq);
+        ctx->cq = NULL;
+    }
+
+    /* 3. Deregister all application MRs in the lazy cache (ADR-0002) */
     for (int i = 0; i < ctx->mr_cache_count; i++) {
         if (ctx->mr_cache[i].mr) {
             ibv_dereg_mr(ctx->mr_cache[i].mr);
@@ -241,7 +257,7 @@ void pg_rdma_cleanup(struct pg_context *ctx) {
     }
     ctx->mr_cache_count = 0;
 
-    /* Clean up internal staging and working buffers */
+    /* 4. Clean up internal staging and working buffers */
     if (ctx->staging_mr) {
         ibv_dereg_mr(ctx->staging_mr);
         ctx->staging_mr = NULL;
@@ -261,19 +277,6 @@ void pg_rdma_cleanup(struct pg_context *ctx) {
         ctx->work_buf = NULL;
     }
     ctx->work_capacity = 0;
-
-    if (ctx->qp_to_next) {
-        ibv_destroy_qp(ctx->qp_to_next);
-        ctx->qp_to_next = NULL;
-    }
-    if (ctx->qp_from_prev) {
-        ibv_destroy_qp(ctx->qp_from_prev);
-        ctx->qp_from_prev = NULL;
-    }
-    if (ctx->cq) {
-        ibv_destroy_cq(ctx->cq);
-        ctx->cq = NULL;
-    }
     for (int dir = 0; dir < 2; dir++) {
         if (ctx->recv_slot_mr[dir]) {
             ibv_dereg_mr(ctx->recv_slot_mr[dir]);
