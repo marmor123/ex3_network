@@ -19,13 +19,13 @@ A single phase of pipelined data movement between adjacent ring neighbors during
 A major slice of the collective payload assigned to or owned by a specific rank. For non-divisible buffer sizes, segment lengths and byte offsets are calculated using MPI-style remainder distribution ($(Q+1)/Q$ distribution where rank $i < R$ receives $Q+1$ elements and rank $i \ge R$ receives $Q$ elements).
 
 ### Micro-Chunk
-A pipelined subdivision of a segment (256 KiB optimal on cluster) used to overlap RDMA network transfer with CPU vector computation. Micro-chunks flow through a sliding window (`rdma_window = 32`) with selective CQ completion signaling (`PG_RDMA_SIGNAL_INTERVAL = 8`).
+A pipelined subdivision of a segment (256 KiB optimal on cluster) used to overlap RDMA network transfer with CPU vector computation. Micro-chunks flow through a sliding window (`rdma_window = 32`) with selective CQ completion signaling (`PG_RDMA_SIGNAL_INTERVAL = 8`, dynamically bounded by $\min(\text{signal\_interval}, \text{window})$).
 
 ### Staging Buffer
-An internal, 64-byte cache-aligned memory buffer registered with `IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE` used as the target for incoming RDMA Write operations during the Reduce-Scatter phase.
+An internal, 64-byte cache-aligned (and 2 MB hugepage-aligned for buffers $\ge 2\text{ MB}$) memory buffer registered with `IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE` used as the target for incoming RDMA Write operations during the Reduce-Scatter phase.
 
 ### Work Buffer
-An internal staging area used in safe mode (`WORKBUFFER=safe`) to perform out-of-place vector reduction without mutating the caller's input `sendbuf` until the collective completes.
+An internal staging area used in safe mode (`WORKBUFFER=safe`) to perform out-of-place vector reduction without mutating the caller's input `sendbuf` until the collective completes (aligned to 2 MB boundaries when $\ge 2\text{ MB}$).
 
 ### Collective Operations
 - **Reduce-Scatter**: Reduces an array of data across all processes and distributes the reduced slices across the ranks.
@@ -38,8 +38,8 @@ An internal staging area used in safe mode (`WORKBUFFER=safe`) to perform out-of
 
 1. **Module 1: TCP Bootstrap & CLI Topology**: Command-line argument parsing, edge-ordered non-blocking TCP handshake, and peer QP parameter exchange.
 2. **Module 2: Verbs Hardware & QP Lifecycle**: InfiniBand device context opening, Protection Domain (PD), shared Completion Queue (CQ), RC Queue Pair initialization with inline stepdown probing, and transition to RTS.
-3. **Module 3: Memory Registration & Staging Cache**: Lazy MR registration cache (`pg_mr_cache`), grow-only staging buffer allocation, and safe work buffer lifecycle.
-4. **Module 4: Progress Engine & CQ Dispatch**: Unified CQ polling, `wr_id` bit-packing/decoding, unexpected control message queueing, and receive pool replenishment.
+3. **Module 3: Memory Registration & Staging Cache**: Lazy MR registration cache (`pg_mr_cache`), grow-only staging buffer allocation, 2 MB hugepage alignment, and safe work buffer lifecycle.
+4. **Module 4: Progress Engine & CQ Dispatch**: Unified CQ polling, `wr_id` bit-packing/decoding, unexpected control message queueing via dynamic pointers, and receive pool replenishment.
 5. **Module 5: SSE4.2 Vector Reduction Compute Kernels**: 128-bit SIMD reduction kernels with 4x loop unrolling across 12 datatype $\times$ operation combinations on Intel Nehalem CPUs.
 6. **Module 6: Ring Step Transfer & Collectives Orchestration**: Pipelined Rendezvous / Eager step transmission, 3-phase distributed barrier synchronization, and `pg_reduce_scatter`, `pg_all_gather`, `pg_all_reduce` API implementations.
 
@@ -50,7 +50,7 @@ An internal staging area used in safe mode (`WORKBUFFER=safe`) to perform out-of
 1. **Progress Seam**: All CQ interactions, `wr_id` decoding, and receive pool refills are strictly encapsulated inside the Progress Engine module. Collective routines never interact directly with raw CQ polling.
 2. **Transfer Seam**: Protocol selection (Eager Send/Recv vs Rendezvous RDMA Write) is encapsulated behind the step transfer engine (`pg_step_transfer_*`), keeping collective routines focused purely on segment permutation and compute kernels.
 3. **Memory Registration Invariant**: Application and staging memory are lazily registered in the MR cache and persist until `pg_close`, avoiding registration churn in the hot timed path.
-4. **Barrier Isolation Invariant**: Collective phases (Reduce-Scatter and All-Gather) are decoupled by a 3-phase distributed ring barrier (`COLLECT` $\to$ `RELEASE` $\to$ `ACK`) ensuring in-flight CQ events are completely drained.
+4. **Barrier Isolation Invariant**: Collective phases (Reduce-Scatter and All-Gather) are decoupled by a 3-phase distributed ring barrier (`COLLECT` $\to$ `RELEASE` $\to$ `ACK`), with unexpected subsequent-iteration traffic preserved in `pending_q` rather than purged.
 
 ---
 

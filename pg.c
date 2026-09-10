@@ -497,7 +497,7 @@ int pg_rdma_init_resources(struct pg_context *ctx) {
     return PG_SUCCESS;
 }
 
-/* Post one 2-SGE eager payload SEND message (ADR-0002) */
+/* Post one 2-SGE eager payload SEND message (ADR-0003) */
 int pg_post_eager_send(struct pg_context *ctx, int qp_dir, const struct pg_ctrl_msg *hdr,
                        void *payload_addr, uint32_t payload_len, uint32_t lkey, int signaled, uint32_t slot) {
     if (!ctx || !hdr || (qp_dir != PG_QP_DIR_TO_NEXT && qp_dir != PG_QP_DIR_FROM_PREV)) {

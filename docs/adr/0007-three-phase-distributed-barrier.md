@@ -19,8 +19,9 @@ We implemented a robust 3-phase ring barrier (`pg_barrier`):
    - Rank 0 originates a `BARRIER_RELEASE` control token around the ring (`0 -> 1 -> ... -> N-1 -> 0`).
    - Each rank receives the release token, notes permission to exit, and forwards it to `next_rank`.
 
-3. **Phase 3: `BARRIER_ACK` & In-Flight CQ Drain**
-   - To prevent late control completions from leaking into subsequent collective phases, ranks exchange a final `BARRIER_ACK` and execute `pg_progress_drain` on the shared CQ.
+3. **Phase 3: `BARRIER_ACK` Token Pass & Pending Preservation**
+   - Rank 0 originates a `BARRIER_ACK` token around the ring (`0 -> 1 -> ... -> N-1 -> 0`), ensuring all ranks have received the release token before anyone exits.
+   - Any unexpected subsequent-iteration control or eager messages polled during barrier token passing are preserved in `pending_q` rather than purged, preventing race conditions with faster ranks.
 
 ## Consequences
 - Guaranteed global barrier isolation between Reduce-Scatter and All-Gather.
@@ -28,5 +29,5 @@ We implemented a robust 3-phase ring barrier (`pg_barrier`):
 - Intermediate barrier in `pg_all_reduce` was proven in A/B testing on the cluster to improve bandwidth by +3.4% due to synchronized step alignment.
 
 ## References
-- `pg.c` (`pg_barrier`, `pg_progress_drain`).
-- Commit `5e33aad` & `ff5c616`.
+- `pg.c` (`pg_barrier`, `pg_barrier_token_pass`).
+- Commit `5e33aad` & `900dafa`.
