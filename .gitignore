@@ -28,3 +28,9 @@ Thumbs.db
 
 # Secrets / env
 .env
+
+# Agent run workspaces & temporary artifacts
+.agents/*/
+!.agents/skills/
+ORIGINAL_REQUEST.md
+

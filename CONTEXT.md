@@ -39,7 +39,7 @@ An internal staging area used in safe mode (`WORKBUFFER=safe`) to perform out-of
 1. **Module 1: TCP Bootstrap & CLI Topology**: Command-line argument parsing, edge-ordered non-blocking TCP handshake, and peer QP parameter exchange.
 2. **Module 2: Verbs Hardware & QP Lifecycle**: InfiniBand device context opening, Protection Domain (PD), shared Completion Queue (CQ), RC Queue Pair initialization with inline stepdown probing, transition to RTS, and resource cleanup (`pg_rdma_cleanup`).
 3. **Module 3: Memory Registration & Staging Cache**: Lazy MR registration cache (`pg_mr_cache`), grow-only staging buffer allocation, 2 MB hugepage alignment (`PG_HUGEPAGE_ALIGN_BYTES`), and safe work buffer lifecycle.
-4. **Module 4: Progress Engine & CQ Dispatch**: Unified CQ polling, `wr_id` bit-packing/decoding, unexpected control message queueing via dynamic pointers, DMA memory barrier, and receive pool replenishment. Implemented as zero-cost inlines in `pg_internal.h`.
+4. **Module 4: Progress Engine & CQ Dispatch**: Unified CQ polling, `wr_id` bit-packing/decoding, unexpected control message queueing via dynamic pointers, DMA memory barrier, and receive pool replenishment. Implemented privately in `pg.c` (encapsulating all CQ event polling behind the Progress Seam with zero header bloat).
 5. **Module 5: SSE4.2 Vector Reduction Compute Kernels**: 128-bit SIMD reduction kernels with 4x loop unrolling across 12 datatype $\times$ operation combinations on Intel Nehalem CPUs.
 6. **Module 6: Ring Step Transfer & Collectives Orchestration**: Pipelined Rendezvous / Eager step transmission (`pg_ring_step_transfer`), 3-phase distributed barrier synchronization, and `pg_reduce_scatter`, `pg_all_gather`, `pg_all_reduce` API implementations.
 
@@ -47,7 +47,7 @@ An internal staging area used in safe mode (`WORKBUFFER=safe`) to perform out-of
 
 ## Architectural Seams & Invariants
 
-1. **Progress Seam**: All CQ interactions, `wr_id` decoding, DMA memory barriers, and receive pool refills are strictly encapsulated inside the Progress Engine module (`pg_internal.h`). Collective routines use declarative wait helpers (`pg_progress_wait_msg`, `pg_progress_wait_type`, `pg_progress_wait_send_recv`) and never interact directly with raw CQ polling.
+1. **Progress Seam**: All CQ interactions, `wr_id` decoding, DMA memory barriers, and receive pool refills are strictly encapsulated inside the Progress Engine module (`pg.c`). Collective routines use declarative wait helpers (`pg_progress_wait_msg`, `pg_progress_wait_type`, `pg_progress_wait_send_recv`) and never interact directly with raw CQ polling.
 2. **Transfer Seam**: Protocol selection (Eager Send/Recv vs Rendezvous RDMA Write) is encapsulated behind the step transfer engine (`pg_ring_step_transfer`), keeping collective routines focused purely on segment permutation and compute kernels.
 3. **Memory Registration Invariant**: Application and staging memory are lazily registered in the MR cache and persist until `pg_close`, avoiding registration churn in the hot timed path.
 4. **Barrier Isolation Invariant**: Collective phases (Reduce-Scatter and All-Gather) are decoupled by an unconditional 3-phase distributed ring barrier (`COLLECT` $\to$ `RELEASE` $\to$ `ACK`), preventing faster ranks from lapping slower ranks during rapid back-to-back collective iterations. Unexpected subsequent-iteration traffic is preserved in `pending_q` rather than purged.

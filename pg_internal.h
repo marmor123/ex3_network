@@ -59,6 +59,7 @@
 #ifndef PG_DEFAULT_BATCH_SIZE
 #define PG_DEFAULT_BATCH_SIZE    8             /* 8 chained WRs per ibv_post_send */
 #endif
+#define PG_MAX_BATCH_SIZE        16            /* Max bounded WR batch depth (Strategy 1) */
 
 /* Benchmark Harness Constants */
 #ifndef PG_BENCH_MIN_BYTES
@@ -104,6 +105,25 @@ static inline int pg_wr_qp(uint64_t wr_id) {
 
 static inline uint32_t pg_wr_slot(uint64_t wr_id) {
     return (uint32_t)(wr_id >> 8);
+}
+
+/* Strategy 1: Unified inline assembler for batched RDMA Write Work Requests */
+static inline void pg_assemble_rdma_write_wr(struct ibv_send_wr *wr, struct ibv_sge *sge,
+                                             uint32_t slot, uintptr_t local_addr, uint32_t len,
+                                             uint32_t lkey, uint64_t remote_addr, uint32_t rkey,
+                                             int is_signaled, struct ibv_send_wr *next) {
+    sge->addr   = local_addr;
+    sge->length = len;
+    sge->lkey   = lkey;
+
+    wr->wr_id      = pg_make_wr_slot(PG_QP_DIR_TO_NEXT, PG_WR_TYPE_RDMA_WRITE, slot);
+    wr->opcode     = IBV_WR_RDMA_WRITE;
+    wr->send_flags = is_signaled ? IBV_SEND_SIGNALED : 0;
+    wr->sg_list    = sge;
+    wr->num_sge    = 1;
+    wr->next       = next;
+    wr->wr.rdma.remote_addr = remote_addr;
+    wr->wr.rdma.rkey        = rkey;
 }
 
 /* Control Message Types */
@@ -370,238 +390,23 @@ static inline int pg_repost_recv_slot(struct pg_context *ctx, int qp_dir, int sl
 /* === MODULE 4: PROGRESS ENGINE & CQ DISPATCH (ADR-0001, CONTEXT.md)   === */
 /* Encapsulates CQ polling, wr_id decoding, automatic receive buffer        */
 /* replenishment, and pending FIFO message queue matching.                   */
+/* Implemented privately in pg.c.                                            */
 /* ========================================================================= */
 
-struct pg_progress_event {
-    int type;                               /* PG_WR_TYPE_RECV_CTRL, PG_WR_TYPE_RDMA_WRITE, PG_WR_TYPE_SEND_CTRL, PG_WR_TYPE_EAGER_SEND */
-    int qp_dir;                             /* PG_QP_DIR_TO_NEXT (0) or PG_QP_DIR_FROM_PREV (1) */
-    uint32_t slot;                          /* Slot index or micro-chunk sequence index */
-    struct pg_ctrl_msg msg;                 /* Message content (for PG_WR_TYPE_RECV_CTRL) */
-    char *eager_buf;                        /* Pointer to eager payload if type is EAGER_PAYLOAD */
-    uint32_t eager_len;                     /* Length of eager payload */
-};
-
-/* Pop matching message from internal FIFO pending queue */
-static inline int pg_progress_pop_pending(struct pg_context *ctx, int qp_dir, int msg_type, uint32_t seg_idx, struct pg_progress_event *out_event) {
-    if (!ctx || qp_dir < 0 || qp_dir >= 2 || !out_event) return 0;
-    struct pg_ctrl_msg msg;
-    uint32_t eager_len = 0;
-    void *target_buf = (msg_type == PG_CTRL_MSG_EAGER_PAYLOAD) ? ctx->eager_rx_buf : NULL;
-    if (pg_pending_pop_matching(ctx, qp_dir, msg_type, seg_idx, &msg, target_buf, &eager_len)) {
-        out_event->type = PG_WR_TYPE_RECV_CTRL;
-        out_event->qp_dir = qp_dir;
-        out_event->slot = 0;
-        out_event->msg = msg;
-        out_event->eager_buf = (msg.type == PG_CTRL_MSG_EAGER_PAYLOAD) ? ctx->eager_rx_buf : NULL;
-        out_event->eager_len = eager_len;
-        return 1;
-    }
-    return 0;
-}
-
-/* Push unhandled or future-step message into pending queue */
-static inline void pg_progress_push_pending(struct pg_context *ctx, int qp_dir, const struct pg_ctrl_msg *msg, const void *slot_buf) {
-    pg_pending_push(ctx, qp_dir, msg, slot_buf);
-}
-
-/* Non-blocking single CQ poll and event decoder with auto receive slot replenishment */
-static inline int pg_progress_poll(struct pg_context *ctx, struct pg_progress_event *out_event) {
-    if (!ctx || !out_event) return PG_ERR_INVAL;
-
-    struct ibv_wc wc;
-    int ne = ibv_poll_cq(ctx->cq, 1, &wc);
-    if (ne < 0) {
-        fprintf(stderr, "[pg_progress] Error: ibv_poll_cq failed with code %d\n", ne);
-        return PG_ERR_RDMA;
-    }
-    if (ne == 0) {
-        return 0; /* No completion ready */
-    }
-
-    /* Compiler memory barrier ensuring strict DMA completion visibility before reading wc/payload */
-    asm volatile("" ::: "memory");
-
-    if (wc.status != IBV_WC_SUCCESS) {
-        fprintf(stderr, "[pg_progress] Error: CQ completion error %s (%d) on wr_id 0x%lx\n",
-                ibv_wc_status_str(wc.status), wc.status, (unsigned long)wc.wr_id);
-        return PG_ERR_RDMA;
-    }
-
-    out_event->type = pg_wr_type(wc.wr_id);
-    out_event->qp_dir = pg_wr_qp(wc.wr_id);
-    out_event->slot = pg_wr_slot(wc.wr_id);
-    out_event->eager_buf = NULL;
-    out_event->eager_len = 0;
-
-    if (out_event->type == PG_WR_TYPE_RECV_CTRL) {
-        int dir = out_event->qp_dir;
-        int slot = (int)out_event->slot;
-        struct pg_ctrl_msg *rhdr = pg_recv_slot_msg(ctx, dir, slot);
-
-        if (rhdr->tag != PG_CTRL_TAG) {
-            fprintf(stderr, "[pg_progress] Error: Invalid tag 0x%08x on qp_dir %d slot %d\n",
-                    rhdr->tag, dir, slot);
-            return PG_ERR_RDMA;
-        }
-
-        out_event->msg = *rhdr;
-        if (rhdr->type == PG_CTRL_MSG_EAGER_PAYLOAD) {
-            uint32_t elen = rhdr->payload.rdv.length + PG_CTRL_MSG_LEN;
-            if (elen > (PG_EAGER_BUF_SIZE + PG_CTRL_MSG_LEN)) elen = PG_EAGER_BUF_SIZE + PG_CTRL_MSG_LEN;
-            memcpy(ctx->eager_rx_buf, ctx->recv_slot_buf[dir][slot], elen);
-            out_event->eager_buf = ctx->eager_rx_buf;
-            out_event->eager_len = elen;
-        }
-
-        /* Automatically repost the consumed receive buffer slot */
-        if (pg_repost_recv_slot(ctx, dir, slot)) {
-            perror("[pg_progress] Error: Failed to repost receive buffer slot");
-            return PG_ERR_RDMA;
-        }
-    }
-
-    return 1;
-}
-
-/* Watchdog-timed progress event waiter (polls until completion or timeout) */
-static inline int pg_progress_wait(struct pg_context *ctx, double timeout_sec, struct pg_progress_event *out_event) {
-    struct timespec start, now;
-    clock_gettime(CLOCK_MONOTONIC, &start);
-
-    while (1) {
-        int rc = pg_progress_poll(ctx, out_event);
-        if (rc < 0) return rc;
-        if (rc == 1) return 1;
-
-        clock_gettime(CLOCK_MONOTONIC, &now);
-        double elapsed = (now.tv_sec - start.tv_sec) + (now.tv_nsec - start.tv_nsec) / 1e9;
-        if (elapsed >= timeout_sec) {
-            fprintf(stderr, "[pg_progress] Error: Timed out after %.2f s waiting for CQ event\n", elapsed);
-            return PG_ERR_TIMEOUT;
-        }
-    }
-}
-
-/* Automatically buffer unexpected incoming receive messages into pending queue */
-static inline void pg_progress_buffer_unexpected(struct pg_context *ctx, const struct pg_progress_event *ev) {
-    if (ctx && ev && ev->type == PG_WR_TYPE_RECV_CTRL) {
-        pg_progress_push_pending(ctx, ev->qp_dir, &ev->msg, ev->eager_buf);
-    }
-}
-
-/* Wait for a specific local work completion type (e.g. PG_WR_TYPE_SEND_CTRL) on qp_dir (or any dir if qp_dir < 0) */
-static inline int pg_progress_wait_type(struct pg_context *ctx, int qp_dir, int wr_type, double timeout_sec, struct pg_progress_event *out_event) {
-    if (out_event) memset(out_event, 0, sizeof(*out_event));
-    struct timespec start, now;
-    clock_gettime(CLOCK_MONOTONIC, &start);
-
-    struct pg_progress_event ev;
-    while (1) {
-        int rc = pg_progress_poll(ctx, &ev);
-        if (rc < 0) return rc;
-        if (rc == 1) {
-            if (ev.type == wr_type && (qp_dir < 0 || ev.qp_dir == qp_dir)) {
-                if (out_event) *out_event = ev;
-                return PG_SUCCESS;
-            }
-            pg_progress_buffer_unexpected(ctx, &ev);
-        }
-
-        clock_gettime(CLOCK_MONOTONIC, &now);
-        double elapsed = (now.tv_sec - start.tv_sec) + (now.tv_nsec - start.tv_nsec) / 1e9;
-        if (elapsed >= timeout_sec) {
-            fprintf(stderr, "[pg_progress] Error: Timed out waiting for WR type %d on qp_dir %d\n", wr_type, qp_dir);
-            return PG_ERR_TIMEOUT;
-        }
-    }
-}
-
-/* Wait for a matching incoming control message, auto-buffering unexpected messages */
-static inline int pg_progress_wait_msg(struct pg_context *ctx, int qp_dir, uint16_t msg_type, uint32_t seg_idx, double timeout_sec, struct pg_progress_event *out_event) {
-    if (out_event) memset(out_event, 0, sizeof(*out_event));
-    /* 1. First check if already buffered in pending queue */
-    if (pg_progress_pop_pending(ctx, qp_dir, (int)msg_type, seg_idx, out_event)) {
-        return PG_SUCCESS;
-    }
-
-    /* 2. Poll until matching message arrives or timeout */
-    struct timespec start, now;
-    clock_gettime(CLOCK_MONOTONIC, &start);
-
-    struct pg_progress_event ev;
-    while (1) {
-        int rc = pg_progress_poll(ctx, &ev);
-        if (rc < 0) return rc;
-        if (rc == 1) {
-            if (ev.type == PG_WR_TYPE_RECV_CTRL && ev.qp_dir == qp_dir &&
-                ev.msg.type == msg_type &&
-                (seg_idx == (uint32_t)-1 || ev.msg.payload.rdv.seg_idx == seg_idx)) {
-                if (out_event) *out_event = ev;
-                return PG_SUCCESS;
-            }
-            pg_progress_buffer_unexpected(ctx, &ev);
-        }
-
-        clock_gettime(CLOCK_MONOTONIC, &now);
-        double elapsed = (now.tv_sec - start.tv_sec) + (now.tv_nsec - start.tv_nsec) / 1e9;
-        if (elapsed >= timeout_sec) {
-            fprintf(stderr, "[pg_progress] Error: Timed out waiting for msg_type %u from qp_dir %d\n", msg_type, qp_dir);
-            return PG_ERR_TIMEOUT;
-        }
-    }
-}
-
-/* Concurrently wait for a local send completion and a matching incoming control message */
-static inline int pg_progress_wait_send_recv(struct pg_context *ctx,
-                                             int send_qp_dir, int send_wr_type,
-                                             int recv_qp_dir, uint16_t recv_msg_type, uint32_t seg_idx,
-                                             double timeout_sec,
-                                             struct pg_progress_event *out_recv_event) {
-    if (out_recv_event) memset(out_recv_event, 0, sizeof(*out_recv_event));
-    int send_done = 0;
-    int recv_done = 0;
-
-    if (pg_progress_pop_pending(ctx, recv_qp_dir, (int)recv_msg_type, seg_idx, out_recv_event)) {
-        recv_done = 1;
-    }
-
-    struct timespec start, now;
-    clock_gettime(CLOCK_MONOTONIC, &start);
-
-    struct pg_progress_event ev;
-    while (!send_done || !recv_done) {
-        int rc = pg_progress_poll(ctx, &ev);
-        if (rc < 0) return rc;
-        if (rc == 1) {
-            if (!send_done && ev.type == send_wr_type && (send_qp_dir < 0 || ev.qp_dir == send_qp_dir)) {
-                send_done = 1;
-            } else if (!recv_done && ev.type == PG_WR_TYPE_RECV_CTRL && ev.qp_dir == recv_qp_dir &&
-                       ev.msg.type == recv_msg_type &&
-                       (seg_idx == (uint32_t)-1 || ev.msg.payload.rdv.seg_idx == seg_idx)) {
-                if (out_recv_event) *out_recv_event = ev;
-                recv_done = 1;
-            } else {
-                pg_progress_buffer_unexpected(ctx, &ev);
-            }
-        }
-
-        clock_gettime(CLOCK_MONOTONIC, &now);
-        double elapsed = (now.tv_sec - start.tv_sec) + (now.tv_nsec - start.tv_nsec) / 1e9;
-        if (elapsed >= timeout_sec) {
-            fprintf(stderr, "[pg_progress] Error: Timed out waiting for send_type %d / recv_msg %u\n",
-                    send_wr_type, recv_msg_type);
-            return PG_ERR_TIMEOUT;
-        }
-    }
-
-    return PG_SUCCESS;
-}
 
 /* ============================================================================
  * Ring Step Transfer Engine (Pipelined Micro-Chunk Transfer)
  * ============================================================================ */
 
-typedef void (*pg_chunk_handler_fn)(void *dest, const void *src, size_t len, void *user_ctx);
+static inline int pg_get_datatype_shift(DATATYPE datatype) {
+    return (datatype == PG_DOUBLE) ? 3 : 2;
+}
+
+enum pg_chunk_action {
+    PG_CHUNK_ACTION_NONE = 0,
+    PG_CHUNK_ACTION_REDUCE,
+    PG_CHUNK_ACTION_MEMCPY
+};
 
 struct pg_ring_step_desc {
     uint32_t step_idx;          /* 0-indexed ring step */
@@ -619,10 +424,12 @@ struct pg_ring_step_desc {
     uint32_t recv_rkey;         /* Advertised inbound destination rkey */
     size_t recv_bytes;          /* Length in bytes of inbound slice */
 
-    /* Inbound micro-chunk processing */
-    pg_chunk_handler_fn on_recv_chunk; /* Callback per received micro-chunk (e.g. reduction or memcpy) */
-    void *cb_dest;                     /* Destination buffer pointer for callback */
-    void *cb_user_ctx;                 /* User context passed into callback */
+    /* Direct action chunk dispatch (Strategy 4) */
+    enum pg_chunk_action chunk_action;
+    void *cb_dest;              /* Destination buffer pointer for compute/copy */
+    DATATYPE datatype;
+    OPERATION op;
+    int elem_shift;
 };
 
 /* Protocol selection helper: determines whether micro-chunk transfer uses Eager Send/Recv or Rendezvous RDMA Write */

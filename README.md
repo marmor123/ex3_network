@@ -226,9 +226,10 @@ Data is written directly into `recvbuf + offset(s_in)` with zero memory copies. 
 │   ├── MODULE 2: Verbs Hardware & QP Lifecycle
 │   ├── MODULE 3: Memory Registration & Staging Cache
 │   ├── MODULE 5: SSE4.2 Vector Reduction Compute Kernels
+│   ├── MODULE 4: Progress Engine & CQ Dispatch (Private Progress Seam)
 │   ├── Group Lifecycle & Distributed Ring Barrier (ADR-0007)
 │   └── MODULE 6: Ring Step Transfer & Collectives Orchestration
-│   (Note: MODULE 4 Progress Engine & CQ Dispatch is implemented inline in pg_internal.h)
+
 │
 ├── main_test.c                   # Validation & benchmark test harness
 │
