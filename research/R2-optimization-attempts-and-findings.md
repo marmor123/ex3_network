@@ -85,6 +85,23 @@ This document records the exact results of this engineering process:
   - 64 MiB: 19.38 Gbps $\to$ **21.60 Gbps** (+11%)
   - 1 GiB: Preserved maximum line-rate saturation at **22.23 Gbps**.
 
+### 2.10 Eager Protocol Memory Optimization & Direct Zero-Copy CPU Receive
+- **Initial State**:
+  - Receive buffer slots were sized to `PG_PIPELINE_CHUNK` (256 KiB) rather than `PG_EAGER_THRESHOLD` (64 KiB), wasting 75% of pre-posted pinned memory (16.78 MiB total).
+  - Incoming eager payloads in `pg_progress_poll` were copied via an intermediate `memcpy` into `ctx->eager_rx_buf` (up to 64 KiB per chunk) before the caller could reduce or copy the data.
+  - Unexpected or out-of-order eager messages dynamically allocated heap memory via `malloc()` inside `pg_pending_push` in the critical progress polling loop.
+  - Dedicated eager send header buffers (`eager_send_hdr_buf`) duplicated verbs memory registrations already handled by `ctrl_send_buf`.
+- **Implementation**:
+  1. *Strict 64 KiB Buffer Sizing*: Defined `PG_EAGER_BUF_SIZE = PG_EAGER_THRESHOLD` (64 KiB), reducing pinned receive memory from 16.78 MiB to 4.19 MiB (**75% memory footprint reduction**).
+  2. *Direct Zero-Copy CPU Receive*: Dispatched the registered receive slot buffer pointer directly into `out_event->eager_buf`, enabling SSE4.2 SIMD reduction or copy directly from the slot. Deferred slot reposting until after `pg_step_process_chunk` completes (safe because `PG_EAGER_WINDOW = 8` < `PG_EAGER_POOL_DEPTH = 32`).
+  3. *Pre-Allocated Pending Bounce Buffers*: Pre-allocated 32 pool entries per direction during context initialization, eliminating runtime `malloc()` on the fast path.
+  4. *Unified Control / Header Pool*: Unified eager send headers into `ctrl_send_buf`, eliminating redundant MR registrations.
+- **Empirical Impact**:
+  - Pinned receive memory dropped by **75%** (16.78 MiB $\to$ 4.19 MiB).
+  - Small and medium eager latency dropped by up to **-10.5%** ($214.56\,\mu\text{s}$ vs $239.76\,\mu\text{s}$ at 256 KiB; $130.89\,\mu\text{s}$ vs $144.19\,\mu\text{s}$ at 128 KiB; $67.18\,\mu\text{s}$ vs $72.64\,\mu\text{s}$ at 32 KiB).
+  - Peak 1 GiB effective throughput preserved at **22.51–22.62 Gbps**.
+  - 100% test passage across all collectives, datatypes, and 100 rapid stress iterations.
+
 ---
 
 ## 3. Failed & Reverted Attempts (Negative Results & Root Causes)

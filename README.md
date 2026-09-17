@@ -2,7 +2,7 @@
 
 High-performance, single-threaded RDMA collective communication library implementing **Reduce-Scatter**, **All-Gather**, and **All-Reduce** over InfiniBand Reliable Connected (RC) Queue Pairs using the `libibverbs` API.
 
-Designed and tuned on a 4-node InfiniBand cluster (`mlx-stud-01..04`), achieving **22.45 Gbps** peak effective bandwidth (and sub-$16\,\mu\text{s}$ small-message 4-rank all-reduce latency) with automatic Eager/Rendezvous switching, pipelined zero-copy RDMA execution, and NUMA node 0 local PCIe affinity.
+Designed and tuned on a 4-node InfiniBand cluster (`mlx-stud-01..04`), achieving **22.51–22.62 Gbps** peak effective bandwidth with automatic Eager/Rendezvous switching, direct zero-copy eager CPU receive, 4.19 MiB compact receive pools (75% memory footprint reduction), and pipelined zero-copy RDMA execution.
 
 ---
 
@@ -99,8 +99,8 @@ sequenceDiagram
 
 ---
 
-### 2.3 Eager 2-SGE Scatter-Gather Protocol
-Used for small/medium transfers ($\le 64\text{ KiB}$ segment / $\le 256\text{ KiB}$ tensor) to eliminate the 2-RTT RTS/CTS handshake and push payload directly into pre-posted receive buffers:
+### 2.3 Eager 2-SGE Scatter-Gather & Direct Zero-Copy CPU Receive
+Used for small/medium transfers ($\le 64\text{ KiB}$ segment / $\le 256\text{ KiB}$ tensor) to eliminate the 2-RTT RTS/CTS handshake and push payload directly into pre-posted receive buffers with direct zero-copy CPU consumption:
 
 ```mermaid
 sequenceDiagram
@@ -108,11 +108,12 @@ sequenceDiagram
     participant S as Sender (Rank r)
     participant R as Receiver (Rank (r+1)%N)
 
-    Note over R: Pre-posted Receive Pool (32 slots)
-    Note over S: Pack SGE[0]=Control Header + SGE[1]=Payload
-    S->>R: IBV_WR_SEND (2-SGE atomic packet)
-    Note over R: CQ Polled -> Immediate Payload Consumption
-    Note over R: Repost Recv Slot (Refill-Never-Empty)
+    Note over R: Compact 4.19 MiB Receive Pool (32 slots of 65.6 KiB)
+    Note over S: 2-SGE Send: SGE[0]=Unified Ctrl Header + SGE[1]=User Payload
+    S->>R: IBV_WR_SEND (Atomic single-transmission push)
+    Note over R: NIC DMAs header + payload into recv_slot_buf
+    Note over R: Direct Zero-Copy: CPU reduces/copies straight from slot buffer!
+    Note over R: Deferred Repost: Recv slot returned to RQ after processing
 ```
 
 ---
@@ -188,19 +189,20 @@ Data is written directly into `recvbuf + offset(s_in)` with zero memory copies. 
 
 *Summary benchmarks on 4-node physical InfiniBand cluster (`mlx-stud-01..04`)*:
 
-| Size | Eager Latency | Rendezvous Latency | Auto Latency | Auto Bandwidth | Crossover Verdict |
-| :--- | :--- | :--- | :--- | :--- | :--- |
-| **64 B** | **$44.3\,\mu\text{s}$** | $94.3\,\mu\text{s}$ | **$42.1\,\mu\text{s}$** | 0.02 Gbps | **Eager ($2.1\times$ faster)** |
-| **256 B** | **$41.9\,\mu\text{s}$** | $92.3\,\mu\text{s}$ | **$43.9\,\mu\text{s}$** | 0.07 Gbps | **Eager ($2.2\times$ faster)** |
-| **1 KiB** | **$44.8\,\mu\text{s}$** | $102.8\,\mu\text{s}$ | **$44.4\,\mu\text{s}$** | 0.28 Gbps | **Eager ($2.3\times$ faster)** |
-| **8 KiB** | **$53.6\,\mu\text{s}$** | $101.9\,\mu\text{s}$ | **$53.3\,\mu\text{s}$** | 1.85 Gbps | **Eager ($1.9\times$ faster)** |
-| **16 KiB** | **$60.5\,\mu\text{s}$** | $101.5\,\mu\text{s}$ | **$60.2\,\mu\text{s}$** | 3.26 Gbps | **Eager ($1.7\times$ faster)** |
-| **64 KiB** | **$91.2\,\mu\text{s}$** | $140.9\,\mu\text{s}$ | **$92.1\,\mu\text{s}$** | **8.54 Gbps** | **Eager ($1.5\times$ faster)** |
-| **128 KiB** | **$138.4\,\mu\text{s}$** | $179.9\,\mu\text{s}$ | **$135.7\,\mu\text{s}$** | **11.59 Gbps** | **Eager ($1.3\times$ faster)** |
-| **256 KiB** | **$231.8\,\mu\text{s}$** | $273.6\,\mu\text{s}$ | **$234.3\,\mu\text{s}$** | **13.42 Gbps** | **Eager ($1.2\times$ faster)** |
-| **1 MiB** | $866.2\,\mu\text{s}$ | **$823.8\,\mu\text{s}$** | **$831.8\,\mu\text{s}$** | **15.13 Gbps** | **Rendezvous ($1.1\times$ faster)** |
-| **64 MiB** | N/A | **$36.9\,\text{ms}$** | **$37.4\,\text{ms}$** | **21.53 Gbps** | **Rendezvous (Adaptive 64K Chunks)** |
-| **1 GiB** | N/A | **$573.9\,\text{ms}$** | **$580.9\,\text{ms}$** | **22.18 Gbps** | **Rendezvous (Peak: 22.45 Gbps)** |
+| Size | Auto Latency (Before) | Auto Latency (Optimized) | Latency Delta | Effective Bandwidth | Optimal Protocol Mode |
+| :--- | :---: | :---: | :---: | :---: | :--- |
+| **64 B** | $43.13\,\mu\text{s}$ | **$41.88\,\mu\text{s}$** | **-2.9%** | 0.02 Gbps | **Eager (Direct Zero-Copy)** |
+| **256 B** | $44.05\,\mu\text{s}$ | **$42.77\,\mu\text{s}$** | **-2.9%** | 0.07 Gbps | **Eager (Direct Zero-Copy)** |
+| **1 KiB** | $45.13\,\mu\text{s}$ | **$43.54\,\mu\text{s}$** | **-3.5%** | 0.28 Gbps | **Eager (Direct Zero-Copy)** |
+| **8 KiB** | $54.32\,\mu\text{s}$ | **$51.93\,\mu\text{s}$** | **-4.4%** | 1.89 Gbps | **Eager (Direct Zero-Copy)** |
+| **16 KiB** | $62.05\,\mu\text{s}$ | **$59.64\,\mu\text{s}$** | **-3.9%** | 3.30 Gbps | **Eager (Direct Zero-Copy)** |
+| **32 KiB** | $72.64\,\mu\text{s}$ | **$67.18\,\mu\text{s}$** | **-7.5%** | **5.85 Gbps** | **Eager (Direct Zero-Copy)** |
+| **64 KiB** | $94.71\,\mu\text{s}$ | **$89.95\,\mu\text{s}$** | **-5.0%** | **8.74 Gbps** | **Eager (Direct Zero-Copy)** |
+| **128 KiB** | $144.19\,\mu\text{s}$ | **$130.89\,\mu\text{s}$** | **-9.2%** | **12.02 Gbps** | **Eager (Direct Zero-Copy)** |
+| **256 KiB** | $239.76\,\mu\text{s}$ | **$214.56\,\mu\text{s}$** | **-10.5%** | **14.66 Gbps** | **Eager (Direct Zero-Copy)** |
+| **1 MiB** | $823.54\,\mu\text{s}$ | **$827.68\,\mu\text{s}$** | +0.5% | **15.20 Gbps** | **Rendezvous ($1.1\times$ faster than eager)** |
+| **64 MiB** | $37.45\,\text{ms}$ | **$36.68\,\text{ms}$** | -2.1% | **21.96 Gbps** | **Rendezvous (Adaptive 64K Chunks)** |
+| **1 GiB** | $576.07\,\text{ms}$ | **$569.73\,\text{ms}$** | **-1.1%** | **22.62 Gbps** | **Rendezvous (Peak: 22.62 Gbps)** |
 
 > [!TIP]
 > For the complete dataset, hyperparameter sensitivity sweeps (chunk size, window depth, batching, SIMD vs scalar), and the **Tested vs. Not-Tested Boundary Matrix**, refer to the full [Empirical Protocol Evaluation Report](file:///c:/Users/marmo/ateret/ex3_network/docs/empirical_protocol_report.md).

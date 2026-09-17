@@ -46,7 +46,7 @@
 #define PG_EAGER_THRESHOLD      (64 * 1024)  /* 64 KiB optimal crossover */
 #define PG_EAGER_POOL_DEPTH     32           /* 32 pre-posted buffers per QP */
 #define PG_EAGER_WINDOW         8            /* In-flight send flow control window */
-#define PG_EAGER_BUF_SIZE       (PG_PIPELINE_CHUNK > PG_EAGER_THRESHOLD ? PG_PIPELINE_CHUNK : PG_EAGER_THRESHOLD)
+#define PG_EAGER_BUF_SIZE       PG_EAGER_THRESHOLD /* Sized strictly to threshold (64 KiB) for 75% memory footprint reduction */
 
 /* Pipelining Constants (256 KiB chunk, 32 in-flight window, 8 signal interval) */
 #define PG_PIPELINE_CHUNK        (256 * 1024)  /* 256 KiB optimal sweet spot */
@@ -227,12 +227,10 @@ struct pg_context {
     void *recv_slot_raw_mem[2];
     struct ibv_mr *recv_slot_mr[2];
 
-    /* Control & Eager Send Header Buffers */
+    /* Control & Eager Send Header Buffers (Unified Pool) */
     char ctrl_send_buf[2][PG_CTRL_POOL_DEPTH][PG_CTRL_MSG_LEN];
     uint32_t ctrl_send_slot[2];
     struct ibv_mr *ctrl_send_mr[2];
-    char eager_send_hdr_buf[2][PG_CTRL_POOL_DEPTH][PG_CTRL_MSG_LEN];
-    struct ibv_mr *eager_send_hdr_mr[2];
 
     /* Lazy MR Cache (ADR-0002) */
     struct pg_mr_entry mr_cache[PG_MR_CACHE_MAX];

@@ -291,10 +291,6 @@ void pg_rdma_cleanup(struct pg_context *ctx) {
             free(ctx->recv_slot_raw_mem[dir]);
             ctx->recv_slot_raw_mem[dir] = NULL;
         }
-        if (ctx->eager_send_hdr_mr[dir]) {
-            ibv_dereg_mr(ctx->eager_send_hdr_mr[dir]);
-            ctx->eager_send_hdr_mr[dir] = NULL;
-        }
         if (ctx->ctrl_send_mr[dir]) {
             ibv_dereg_mr(ctx->ctrl_send_mr[dir]);
             ctx->ctrl_send_mr[dir] = NULL;
@@ -398,14 +394,14 @@ int pg_rdma_init_resources(struct pg_context *ctx) {
             return PG_ERR_RDMA;
         }
 
-        /* Eager header send MR */
-        ctx->eager_send_hdr_mr[dir] = ibv_reg_mr(ctx->pd, ctx->eager_send_hdr_buf[dir],
-                                                 sizeof(ctx->eager_send_hdr_buf[dir]),
-                                                 IBV_ACCESS_LOCAL_WRITE);
-        if (!ctx->eager_send_hdr_mr[dir]) {
-            fprintf(stderr, "[pg_rdma] Error: Could not register eager header send MR for dir %d\n", dir);
-            pg_rdma_cleanup(ctx);
-            return PG_ERR_RDMA;
+        /* Pre-allocate pending queue eager bounce buffers to eliminate fast-path runtime malloc */
+        for (int k = 0; k < PG_CTRL_POOL_DEPTH; k++) {
+            ctx->pending_q[dir].pool[k].eager_buf = (char *)malloc(PG_EAGER_SLOT_SIZE);
+            if (!ctx->pending_q[dir].pool[k].eager_buf) {
+                fprintf(stderr, "[pg_rdma] Error: Could not pre-allocate pending eager buffer for dir %d slot %d\n", dir, k);
+                pg_rdma_cleanup(ctx);
+                return PG_ERR_NOMEM;
+            }
         }
     }
 
@@ -507,13 +503,13 @@ int pg_post_eager_send(struct pg_context *ctx, int qp_dir, const struct pg_ctrl_
     struct ibv_qp *target_qp = (qp_dir == PG_QP_DIR_TO_NEXT) ? ctx->qp_to_next : ctx->qp_from_prev;
     uint32_t s = slot % PG_CTRL_POOL_DEPTH;
 
-    /* Copy header into dedicated slot in registered eager_send_hdr_buf */
-    memcpy(ctx->eager_send_hdr_buf[qp_dir][s], hdr, sizeof(*hdr));
+    /* Copy header into dedicated slot in registered unified ctrl_send_buf */
+    memcpy(ctx->ctrl_send_buf[qp_dir][s], hdr, sizeof(*hdr));
 
     struct ibv_sge sges[2];
-    sges[0].addr   = (uintptr_t)ctx->eager_send_hdr_buf[qp_dir][s];
+    sges[0].addr   = (uintptr_t)ctx->ctrl_send_buf[qp_dir][s];
     sges[0].length = sizeof(*hdr);
-    sges[0].lkey   = ctx->eager_send_hdr_mr[qp_dir]->lkey;
+    sges[0].lkey   = ctx->ctrl_send_mr[qp_dir]->lkey;
 
     sges[1].addr   = (uintptr_t)payload_addr;
     sges[1].length = payload_len;
@@ -909,7 +905,7 @@ static inline int pg_progress_pop_pending(struct pg_context *ctx, int qp_dir, in
     if (pg_pending_pop_matching(ctx, qp_dir, msg_type, seg_idx, &msg, target_buf, &eager_len)) {
         out_event->type = PG_WR_TYPE_RECV_CTRL;
         out_event->qp_dir = qp_dir;
-        out_event->slot = 0;
+        out_event->slot = (uint32_t)-1;
         out_event->msg = msg;
         out_event->eager_buf = (msg.type == PG_CTRL_MSG_EAGER_PAYLOAD) ? ctx->eager_rx_buf : NULL;
         out_event->eager_len = eager_len;
@@ -967,15 +963,21 @@ static inline int pg_progress_poll(struct pg_context *ctx, struct pg_progress_ev
         if (rhdr->type == PG_CTRL_MSG_EAGER_PAYLOAD) {
             uint32_t elen = rhdr->payload.rdv.length + PG_CTRL_MSG_LEN;
             if (elen > (PG_EAGER_BUF_SIZE + PG_CTRL_MSG_LEN)) elen = PG_EAGER_BUF_SIZE + PG_CTRL_MSG_LEN;
-            memcpy(ctx->eager_rx_buf, ctx->recv_slot_buf[dir][slot], elen);
-            out_event->eager_buf = ctx->eager_rx_buf;
+            /*
+             * Direct Zero-Copy CPU Receive Path (Phase 2):
+             * Point eager_buf directly to the registered receive slot buffer instead of copying
+             * 64 KiB into a temporary scratchpad. Reposting is deferred until after the consumer
+             * executes vector reduction or memcpy directly from the receive slot, eliminating
+             * redundant memory passes and cache line pollution on the critical path.
+             */
+            out_event->eager_buf = ctx->recv_slot_buf[dir][slot];
             out_event->eager_len = elen;
-        }
-
-        /* Automatically repost the consumed receive buffer slot */
-        if (pg_repost_recv_slot(ctx, dir, slot)) {
-            perror("[pg_progress] Error: Failed to repost receive buffer slot");
-            return PG_ERR_RDMA;
+        } else {
+            /* Automatically repost the consumed control receive buffer slot */
+            if (pg_repost_recv_slot(ctx, dir, slot)) {
+                perror("[pg_progress] Error: Failed to repost receive buffer slot");
+                return PG_ERR_RDMA;
+            }
         }
     }
 
@@ -1005,6 +1007,9 @@ static inline int pg_progress_wait(struct pg_context *ctx, double timeout_sec, s
 static inline void pg_progress_buffer_unexpected(struct pg_context *ctx, const struct pg_progress_event *ev) {
     if (ctx && ev && ev->type == PG_WR_TYPE_RECV_CTRL) {
         pg_progress_push_pending(ctx, ev->qp_dir, &ev->msg, ev->eager_buf);
+        if (ev->msg.type == PG_CTRL_MSG_EAGER_PAYLOAD && ev->slot != (uint32_t)-1) {
+            pg_repost_recv_slot(ctx, ev->qp_dir, (int)ev->slot);
+        }
     }
 }
 
@@ -1489,8 +1494,9 @@ static inline void pg_step_process_chunk(const struct pg_ring_step_desc *desc,
 
 /* Eager Payload Ring Step Transfer Engine */
 static int pg_ring_step_transfer_eager(struct pg_context *ctx, const struct pg_ring_step_desc *desc) {
-    uint32_t num_send_micros = (uint32_t)((desc->send_bytes + ctx->pipeline_chunk - 1) / ctx->pipeline_chunk);
-    uint32_t num_recv_micros = (uint32_t)((desc->recv_bytes + ctx->pipeline_chunk - 1) / ctx->pipeline_chunk);
+    size_t chunk_size = ctx->pipeline_chunk < PG_EAGER_BUF_SIZE ? ctx->pipeline_chunk : PG_EAGER_BUF_SIZE;
+    uint32_t num_send_micros = (uint32_t)((desc->send_bytes + chunk_size - 1) / chunk_size);
+    uint32_t num_recv_micros = (uint32_t)((desc->recv_bytes + chunk_size - 1) / chunk_size);
 
     int send_done = (num_send_micros == 0) ? 1 : 0;
     int recv_done = (num_recv_micros == 0) ? 1 : 0;
@@ -1507,7 +1513,7 @@ static int pg_ring_step_transfer_eager(struct pg_context *ctx, const struct pg_r
         while (!recv_done && pg_progress_pop_pending(ctx, PG_QP_DIR_FROM_PREV, PG_CTRL_MSG_EAGER_PAYLOAD, desc->recv_tag, &peager)) {
             uint32_t k = peager.msg.payload.rdv.micro_idx;
             uint32_t micro_len = peager.msg.payload.rdv.length;
-            size_t offset = (size_t)k * ctx->pipeline_chunk;
+            size_t offset = (size_t)k * chunk_size;
 
             if (desc->chunk_action != PG_CHUNK_ACTION_NONE) {
                 void *dest = (char *)desc->cb_dest + offset;
@@ -1526,9 +1532,9 @@ static int pg_ring_step_transfer_eager(struct pg_context *ctx, const struct pg_r
         while (eager_posted_micros < num_send_micros &&
                (eager_posted_micros - eager_completed_micros) < ctx->eager_window) {
             uint32_t k = eager_posted_micros;
-            size_t offset = (size_t)k * ctx->pipeline_chunk;
+            size_t offset = (size_t)k * chunk_size;
             size_t micro_len = desc->send_bytes - offset;
-            if (micro_len > ctx->pipeline_chunk) micro_len = ctx->pipeline_chunk;
+            if (micro_len > chunk_size) micro_len = chunk_size;
 
             void *local_src = (char *)desc->send_buf + offset;
 
@@ -1579,12 +1585,17 @@ static int pg_ring_step_transfer_eager(struct pg_context *ctx, const struct pg_r
                             ev.msg.payload.rdv.seg_idx == desc->recv_tag) {
                             uint32_t k = ev.msg.payload.rdv.micro_idx;
                             uint32_t micro_len = ev.msg.payload.rdv.length;
-                            size_t offset = (size_t)k * ctx->pipeline_chunk;
+                            size_t offset = (size_t)k * chunk_size;
 
                             if (desc->chunk_action != PG_CHUNK_ACTION_NONE) {
                                 void *dest = (char *)desc->cb_dest + offset;
                                 const void *src = ev.eager_buf + PG_CTRL_MSG_LEN;
                                 pg_step_process_chunk(desc, dest, src, micro_len);
+                            }
+
+                            /* Return consumed receive buffer slot back to NIC Receive Queue after direct compute/copy */
+                            if (ev.slot != (uint32_t)-1) {
+                                pg_repost_recv_slot(ctx, ev.qp_dir, (int)ev.slot);
                             }
 
                             eager_recv_micros++;
