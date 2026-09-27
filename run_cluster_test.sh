@@ -15,6 +15,7 @@ MODE="${1:-cluster}"
 NUM_NODES="${2:-4}"
 CLUSTER_DIR="${CLUSTER_DIR:-/cs/usr/ateret.tabib/Downloads/ex3_network}"
 SSH_OPTS="${SSH_OPTS:-}"
+REMOTE_TEST_ENV="${REMOTE_TEST_ENV:-}"
 
 if [ "$MODE" = "2" ] || [ "$MODE" = "4" ]; then
     NUM_NODES="$MODE"
@@ -78,8 +79,10 @@ echo "Syncing local workspace to ${HOSTS[0]}:$CLUSTER_DIR..."
 rsync -avz --exclude '.git' --exclude '*.o' --exclude 'test' "$SCRIPT_DIR/" "${HOSTS[0]}:$CLUSTER_DIR/"
 
 MODE_BUILD="${MODE_BUILD:-${COLLECTIVE_MODE:-auto}}"
-echo "Building on ${HOSTS[0]} (MODE=$MODE_BUILD)..."
-ssh $SSH_OPTS "${HOSTS[0]}" "cd $CLUSTER_DIR && make clean && make MODE=$MODE_BUILD"
+TEST_HOOKS_BUILD="${TEST_HOOKS_BUILD:-0}"
+WORKBUFFER_BUILD="${WORKBUFFER_BUILD:-inplace}"
+echo "Building on ${HOSTS[0]} (MODE=$MODE_BUILD, WORKBUFFER=$WORKBUFFER_BUILD, TEST_HOOKS=$TEST_HOOKS_BUILD)..."
+ssh $SSH_OPTS "${HOSTS[0]}" "cd $CLUSTER_DIR && make clean && make MODE=$MODE_BUILD WORKBUFFER=$WORKBUFFER_BUILD TEST_HOOKS=$TEST_HOOKS_BUILD"
 
 PIDS=()
 for i in "${!HOSTS[@]}"; do
@@ -88,7 +91,7 @@ for i in "${!HOSTS[@]}"; do
     HOST="${HOSTS[$i]}"
     
     echo "Starting Rank $RANK (index $INDEX) on host $HOST..."
-    ssh $SSH_OPTS "$HOST" "cd $CLUSTER_DIR && (command -v numactl >/dev/null 2>&1 && numactl --cpunodebind=0 --preferred=0 ./test -myindex $INDEX -list ${HOSTS[*]} || ./test -myindex $INDEX -list ${HOSTS[*]})" &
+    ssh $SSH_OPTS "$HOST" "cd $CLUSTER_DIR && if command -v numactl >/dev/null 2>&1; then env $REMOTE_TEST_ENV numactl --cpunodebind=0 --preferred=0 ./test -myindex $INDEX -list ${HOSTS[*]}; else env $REMOTE_TEST_ENV ./test -myindex $INDEX -list ${HOSTS[*]}; fi" &
     PIDS+=($!)
 done
 

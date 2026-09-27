@@ -75,7 +75,7 @@ struct test_desc {
     uint32_t send_lkey;
 };
 
-/* Test function containing the batch loop from docs/refactoring_roadmap.md:471-490 */
+/* Test function containing the bounded batch assembly loop. */
 __attribute__((noinline))
 int run_batch_transfer(uint32_t to_post_requested, struct test_desc *desc,
                        size_t chunk_size, uint64_t remote_target_addr, uint32_t remote_target_rkey,

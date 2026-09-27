@@ -45,7 +45,7 @@ struct pg_context {
     struct pg_pending_queue pending_q[2];
 };
 
-/* Strategy 3 implementation from docs/refactoring_roadmap.md:704-750 */
+/* Pre-allocated pending-queue implementation under test. */
 static inline void pg_pending_push(struct pg_context *ctx, int qp_dir,
                                    const struct pg_ctrl_msg *msg, const void *slot_buf) {
     if (__builtin_expect(!ctx || qp_dir < 0 || qp_dir >= 2 || !msg, 0)) return;

@@ -9,11 +9,10 @@ We needed to establish the optimal crossover threshold empirically on the live 4
 
 ## Decision
 
-### 1. Empirical Threshold Determination: 64 KiB
-A coordinate sweep on the 4-node cluster across thresholds from 1 KiB to 256 KiB revealed:
-- Payloads $\le 64\text{ KiB}$ segment ($\le 256\text{ KiB}$ tensor): Eager protocol provides **$2.1\times\text{--}2.3\times$ lower latency** compared to Rendezvous ($41.88\,\mu\text{s}$ vs $94.3\,\mu\text{s}$ at 64 B, $89.95\,\mu\text{s}$ vs $140.9\,\mu\text{s}$ at 64 KiB, $130.89\,\mu\text{s}$ at 128 KiB, $214.56\,\mu\text{s}$ at 256 KiB) by eliminating the 4-way RTS/CTS control handshake and pushing payload directly into pre-posted receive buffers.
-- Payloads $> 64\text{ KiB}$ segment: Rendezvous protocol overtakes Eager in effective bandwidth due to zero-copy direct memory transfers and pipelined micro-chunk overlap.
-- We set `PG_EAGER_THRESHOLD = (64 * 1024)` (64 KiB) as the optimal crossover boundary.
+### 1. Bounded Eager Selection: 64 KiB per Segment
+`PG_EAGER_THRESHOLD = 64 KiB` bounds every pre-posted Eager receive slot and keeps protocol choice symmetric. On four ranks this selects Eager through a 256 KiB total tensor and Rendezvous above it.
+
+The full sweep on 2026-09-27 measured Eager at $16.0\,\mu\text{s}$ versus Rendezvous at $65.8\,\mu\text{s}$ for 64 B, and $189.6\,\mu\text{s}$ versus $202.6\,\mu\text{s}$ for 256 KiB. Pure Eager remained slightly faster through 8 MiB, with Rendezvous taking the lead at 16 MiB. The configured threshold is therefore a conservative receive-memory and flow-control bound, not the current empirical latency crossover.
 
 ### 2. Protocol Modes
 We support three compilation modes via `Makefile MODE=<mode>`:
@@ -35,15 +34,14 @@ $$\text{max\_seg\_bytes} = \frac{\text{total\_bytes} + N - 1}{N}$$
 This derives from `desc->total_bytes`, ensuring all ranks make mathematically identical protocol decisions.
 
 ## Consequences
-- Small-message operations (e.g. metadata sync, small tensor all-reduces) achieve near-wire latency ($41.88\,\mu\text{s}$ at 64 B).
-- Medium-message eager operations achieve up to **-10.5% lower latency** ($214.56\,\mu\text{s}$ vs $239.76\,\mu\text{s}$ at 256 KiB) due to direct zero-copy CPU receive.
+- Small-message operations achieve $16.0\,\mu\text{s}$ Eager latency at 64 B in the 2026-09-27 four-node sweep.
+- At the configured 256 KiB four-rank tensor boundary, Eager measured $189.6\,\mu\text{s}$ versus $202.6\,\mu\text{s}$ for Rendezvous.
 - Pinned receive memory footprint slashed by **75%** (from 16.78 MiB to 4.19 MiB).
-- Large-message operations achieve peak link bandwidth without buffer copy bottlenecks (**22.51–22.62 Gbps**).
-- `MODE=auto` provides the superior Pareto frontier across all buffer sizes from 64 B to 1 GiB.
+- Large-message operations achieve peak link bandwidth without buffer copy bottlenecks (**22.42 Gbps** Rendezvous and **22.32 Gbps** AUTO at 1 GiB).
+- `MODE=auto` is conservative between 512 KiB and 8 MiB, where the pure Eager build was faster in the latest sweep; the threshold should be retuned separately if benchmark-optimal selection is required.
 - Guaranteed ring-wide symmetry across non-divisible remainder boundaries.
 
 ## References
 - `assignment.txt`: Lecture #2 Eager vs. Rendezvous requirements.
 - `docs/empirical_protocol_report.md`: Sweep data on `mlx-stud-01..04`.
-- `walkthrough.md`: Optimization benchmark and memory footprint comparison.
 - Commit `3b33127`, `5e33aad`, `88f62d7`, `1ae3c55`.

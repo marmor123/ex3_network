@@ -78,6 +78,105 @@ static int compare_doubles(const void *a, const void *b) {
     return 0;
 }
 
+static int test_sync(void *pg_handle) {
+    int values[PG_MAX_RANKS] = {0};
+    int rank = pg_get_rank(pg_handle);
+    values[rank] = rank;
+    return pg_all_gather(&values[rank], values, 1, PG_INT, pg_handle);
+}
+
+static int run_alias_contract_tests(void *pg_handle) {
+    int rank = pg_get_rank(pg_handle);
+    int size = pg_get_size(pg_handle);
+    int count = 1024;
+    int gather_count = 64;
+    size_t bytes = (size_t)count * sizeof(int);
+    size_t gather_bytes = (size_t)gather_count * (size_t)size * sizeof(int);
+    size_t allocation_bytes = bytes + sizeof(int);
+    if (gather_bytes > allocation_bytes) allocation_bytes = gather_bytes;
+    int *buffer = (int *)malloc(allocation_bytes);
+    if (!buffer) return PG_ERR_NOMEM;
+
+    for (int i = 0; i < count; i++) {
+        buffer[i] = rank + 1;
+    }
+
+    int rc = pg_all_reduce(buffer, buffer, count, PG_INT, PG_SUM, pg_handle);
+
+    int result = PG_SUCCESS;
+    if (rc != PG_ERR_INVAL) {
+        fprintf(stderr,
+                "  [FAIL] pg_all_reduce accepted identical send/receive buffers on rank %d (rc=%d)\n",
+                rank, rc);
+        result = PG_ERR_RDMA;
+    } else if (rank == 0) {
+        printf("  [PASS] pg_all_reduce rejects identical send/receive buffers\n");
+    }
+
+    rc = pg_all_reduce(buffer, buffer + 1, count, PG_INT, PG_SUM, pg_handle);
+    if (rc != PG_ERR_INVAL) {
+        fprintf(stderr,
+                "  [FAIL] pg_all_reduce accepted partially overlapping buffers on rank %d (rc=%d)\n",
+                rank, rc);
+        result = PG_ERR_RDMA;
+    } else if (rank == 0) {
+        printf("  [PASS] pg_all_reduce rejects partially overlapping buffers\n");
+    }
+
+    int local_count = count / size;
+    rc = pg_reduce_scatter(buffer, buffer + rank * local_count,
+                           count, PG_INT, PG_SUM, pg_handle);
+    if (rc != PG_ERR_INVAL) {
+        fprintf(stderr,
+                "  [FAIL] pg_reduce_scatter accepted an output slice inside sendbuf on rank %d (rc=%d)\n",
+                rank, rc);
+        result = PG_ERR_RDMA;
+    } else if (rank == 0) {
+        printf("  [PASS] pg_reduce_scatter rejects output ranges inside sendbuf\n");
+    }
+
+    int nonlocal_rank = (rank + 1) % size;
+    rc = pg_all_gather(buffer + nonlocal_rank * gather_count, buffer,
+                       gather_count, PG_INT, pg_handle);
+    if (rc != PG_ERR_INVAL) {
+        fprintf(stderr,
+                "  [FAIL] pg_all_gather accepted a nonlocal slice inside recvbuf on rank %d (rc=%d)\n",
+                rank, rc);
+        result = PG_ERR_RDMA;
+    } else if (rank == 0) {
+        printf("  [PASS] pg_all_gather rejects nonlocal slices inside recvbuf\n");
+    }
+
+    int gather_total = gather_count * size;
+    memset(buffer, 0, (size_t)gather_total * sizeof(int));
+    int *local_slice = buffer + rank * gather_count;
+    for (int i = 0; i < gather_count; i++) {
+        local_slice[i] = (rank + 1) * 1000 + i;
+    }
+
+    rc = pg_all_gather(local_slice, buffer, gather_count, PG_INT, pg_handle);
+    int gather_errors = 0;
+    if (rc == PG_SUCCESS) {
+        for (int origin = 0; origin < size; origin++) {
+            for (int i = 0; i < gather_count; i++) {
+                int expected = (origin + 1) * 1000 + i;
+                if (buffer[origin * gather_count + i] != expected) gather_errors++;
+            }
+        }
+    }
+    if (rc != PG_SUCCESS || gather_errors != 0) {
+        fprintf(stderr,
+                "  [FAIL] pg_all_gather exact local-slice form failed on rank %d (rc=%d, mismatches=%d)\n",
+                rank, rc, gather_errors);
+        result = PG_ERR_RDMA;
+    } else if (rank == 0) {
+        printf("  [PASS] pg_all_gather accepts its exact local slice\n");
+    }
+
+    free(buffer);
+    return result;
+}
+
 static int check_collective_alloc(void *pg_handle, void *buf1, void *buf2, size_t sz, int count) {
     int rank = pg_get_rank(pg_handle);
     int size = pg_get_size(pg_handle);
@@ -177,14 +276,6 @@ static int run_benchmark_harness(void *pg_handle) {
             return rc;
         }
 
-        rc = pg_barrier(pg_handle);
-        if (rc != PG_SUCCESS) {
-            fprintf(stderr, "Rank %d post-warmup barrier failed with code %d\n", rank, rc);
-            free(sendbuf);
-            free(recvbuf);
-            return rc;
-        }
-
         /* Timed iterations */
         if (bench_iter > 100) bench_iter = 100;
         if (bench_iter < 1) bench_iter = 1;
@@ -192,9 +283,10 @@ static int run_benchmark_harness(void *pg_handle) {
         double total_us = 0.0;
 
         for (int iter = 0; iter < bench_iter; iter++) {
-            rc = pg_barrier(pg_handle);
+            rc = test_sync(pg_handle);
             if (rc != PG_SUCCESS) {
-                fprintf(stderr, "Rank %d pre-iteration barrier failed with code %d\n", rank, rc);
+                fprintf(stderr, "Rank %d pre-iteration synchronization failed with code %d\n",
+                        rank, rc);
                 free(sendbuf);
                 free(recvbuf);
                 return rc;
@@ -217,14 +309,6 @@ static int run_benchmark_harness(void *pg_handle) {
                              (double)(t_end.tv_nsec - t_start.tv_nsec) / 1e3;
             times_us[iter] = iter_us;
             total_us += iter_us;
-
-            rc = pg_barrier(pg_handle);
-            if (rc != PG_SUCCESS) {
-                fprintf(stderr, "Rank %d post-iteration barrier failed with code %d\n", rank, rc);
-                free(sendbuf);
-                free(recvbuf);
-                return rc;
-            }
         }
 
         qsort(times_us, bench_iter, sizeof(double), compare_doubles);
@@ -305,7 +389,6 @@ static int run_datatypes_and_ops_tests(void *pg_handle) {
                 }
             }
 
-            pg_barrier(pg_handle);
             int rc = pg_all_reduce(sendbuf, recvbuf, count, dt, op, pg_handle);
             if (rc != PG_SUCCESS) {
                 fprintf(stderr, "  [FAIL] %s x %s failed with code %d\n", dt_names[d], op_names[o], rc);
@@ -379,7 +462,6 @@ static int run_datatypes_and_ops_tests(void *pg_handle) {
             free(recvbuf);
         }
     }
-    pg_barrier(pg_handle);
     if (rank == 0) {
         printf("[PG Datatypes & Operations] SUCCESS: All 12 datatype x op combinations passed.\n");
     }
@@ -416,7 +498,6 @@ static int run_non_divisible_counts_tests(void *pg_handle) {
             s[i] = (rank + 1) * 100 + (i % 100);
         }
 
-        pg_barrier(pg_handle);
         int rc = pg_all_reduce(sendbuf, recvbuf, count, PG_INT, PG_SUM, pg_handle);
         if (rc != PG_SUCCESS) {
             fprintf(stderr, "  [FAIL] Non-divisible count %d failed with code %d\n", count, rc);
@@ -444,22 +525,33 @@ static int run_non_divisible_counts_tests(void *pg_handle) {
         free(recvbuf);
     }
 
-    pg_barrier(pg_handle);
     if (rank == 0) {
         printf("[PG Non-Divisible Counts] SUCCESS: All remainder count tests passed.\n");
     }
     return PG_SUCCESS;
 }
 
-static int run_barrier_free_stress_test(void *pg_handle) {
+static int run_phase_handoff_stress_test(void *pg_handle) {
     int rank = pg_get_rank(pg_handle);
     int size = pg_get_size(pg_handle);
     int count = 16384;
+    const char *count_env = getenv("PG_STRESS_COUNT");
+    if (count_env && *count_env) {
+        long parsed = strtol(count_env, NULL, 10);
+        if (parsed > 0 && parsed <= INT32_MAX) count = (int)parsed;
+    }
+    int iterations = 100;
+    const char *iter_env = getenv("PG_STRESS_ITER");
+    if (iter_env && *iter_env) {
+        int parsed = atoi(iter_env);
+        if (parsed > 0) iterations = parsed;
+    }
     size_t sz = (size_t)count * sizeof(int);
 
     if (rank == 0) {
         printf("=================================================================\n");
-        printf("[PG Barrier-Free Stress] Testing 100 Rapid Back-to-Back Iterations\n");
+        printf("[PG Phase-Handoff Stress] Testing %d Rapid Back-to-Back Iterations\n",
+               iterations);
         printf("=================================================================\n");
     }
 
@@ -473,27 +565,28 @@ static int run_barrier_free_stress_test(void *pg_handle) {
 
     int *s = (int *)sendbuf;
     int *r = (int *)recvbuf;
-    for (int i = 0; i < count; i++) {
-        s[i] = (rank + 1);
-    }
 
-    pg_barrier(pg_handle);
-
-    int expected_sum = (size * (size + 1)) / 2;
     int rc = PG_SUCCESS;
 
-    for (int iter = 0; iter < 100; iter++) {
+    for (int iter = 0; iter < iterations; iter++) {
         for (int i = 0; i < count; i++) {
-            s[i] = (rank + 1);
+            s[i] = (rank + 1) * 1000 + iter * 7 + (i % 97);
         }
         rc = pg_all_reduce(sendbuf, recvbuf, count, PG_INT, PG_SUM, pg_handle);
         if (rc != PG_SUCCESS) {
             fprintf(stderr, "  [FAIL] Rapid iteration %d failed with code %d\n", iter, rc);
             break;
         }
-        if (r[0] != expected_sum) {
-            fprintf(stderr, "  [FAIL] Rapid iteration %d data mismatch: got %d, expected %d\n",
-                    iter, r[0], expected_sum);
+        int mismatches = 0;
+        int rank_sum = (size * (size + 1)) / 2;
+        for (int i = 0; i < count; i++) {
+            int expected = rank_sum * 1000 + size * (iter * 7 + (i % 97));
+            if (r[i] != expected) mismatches++;
+        }
+        if (mismatches != 0) {
+            fprintf(stderr,
+                    "  [FAIL] Rapid iteration %d had %d full-buffer mismatches on rank %d\n",
+                    iter, mismatches, rank);
             rc = PG_ERR_RDMA;
             break;
         }
@@ -501,10 +594,9 @@ static int run_barrier_free_stress_test(void *pg_handle) {
 
     free(sendbuf);
     free(recvbuf);
-    pg_barrier(pg_handle);
-
     if (rc == PG_SUCCESS && rank == 0) {
-        printf("[PG Barrier-Free Stress] SUCCESS: 100 rapid iterations completed with 0 errors.\n");
+        printf("[PG Phase-Handoff Stress] SUCCESS: %d rapid iterations verified every element.\n",
+               iterations);
     }
     return rc;
 }
@@ -561,6 +653,15 @@ int main(int argc, char **argv) {
            prev_rank, rank, next_rank);
     printf("=================================================================\n");
 
+    printf("=================================================================\n");
+    printf("[PG Buffer Contract] Testing collective alias rules\n");
+    printf("=================================================================\n");
+    int alias_rc = run_alias_contract_tests(pg_handle);
+    if (alias_rc != PG_SUCCESS) {
+        pg_close(pg_handle);
+        return 1;
+    }
+
     /* Run Collectives Verification Suite (4 KiB, 64 KiB, 1 MiB, 4 MiB, and 1 GiB for RDV) */
     size_t test_sizes[] = {
         4 * 1024,                    /* 4 KiB (sub-chunk) */
@@ -572,6 +673,11 @@ int main(int argc, char **argv) {
 #endif
     };
     int num_tests = (int)(sizeof(test_sizes) / sizeof(test_sizes[0]));
+    size_t verify_max_bytes = (size_t)-1;
+    const char *verify_max_env = getenv("PG_VERIFY_MAX_BYTES");
+    if (verify_max_env && *verify_max_env) {
+        verify_max_bytes = (size_t)strtoull(verify_max_env, NULL, 10);
+    }
 
     /* Run Pipelined Reduce-Scatter Tests (PG_INT + PG_SUM) */
     printf("=================================================================\n");
@@ -580,6 +686,7 @@ int main(int argc, char **argv) {
 
     int rs_passed = 1;
     for (int t = 0; t < num_tests; t++) {
+        if (test_sizes[t] > verify_max_bytes) continue;
         size_t sz = test_sizes[t];
         int count = (int)(sz / sizeof(int));
         int segment_count = count / size;
@@ -591,16 +698,6 @@ int main(int argc, char **argv) {
             if (sendbuf) free(sendbuf);
             if (recvbuf) free(recvbuf);
             continue;
-        }
-
-        /* Synchronize all ranks before starting Reduce-Scatter */
-        int brc = pg_barrier(pg_handle);
-        if (brc != PG_SUCCESS) {
-            fprintf(stderr, "Pre-RS barrier failed with code %d\n", brc);
-            rs_passed = 0;
-            free(sendbuf);
-            free(recvbuf);
-            break;
         }
 
         /* Fill sendbuf with deterministic arithmetic pattern */
@@ -648,16 +745,6 @@ int main(int argc, char **argv) {
                    sz, count, segment_count, rank);
         }
 
-        /* Synchronize all ranks after finishing Reduce-Scatter */
-        brc = pg_barrier(pg_handle);
-        if (brc != PG_SUCCESS) {
-            fprintf(stderr, "Post-RS barrier failed with code %d\n", brc);
-            rs_passed = 0;
-            free(sendbuf);
-            free(recvbuf);
-            break;
-        }
-
         free(sendbuf);
         free(recvbuf);
     }
@@ -676,6 +763,7 @@ int main(int argc, char **argv) {
 
     int ag_passed = 1;
     for (int t = 0; t < num_tests; t++) {
+        if (test_sizes[t] > verify_max_bytes) continue;
         size_t sz = test_sizes[t];
         int count = (int)(sz / sizeof(int));
         size_t total_gather_bytes = sz * (size_t)size;
@@ -686,16 +774,6 @@ int main(int argc, char **argv) {
             if (sendbuf) free(sendbuf);
             if (recvbuf) free(recvbuf);
             continue;
-        }
-
-        /* Synchronize all ranks before starting All-Gather */
-        int brc = pg_barrier(pg_handle);
-        if (brc != PG_SUCCESS) {
-            fprintf(stderr, "Pre-AG barrier failed with code %d\n", brc);
-            ag_passed = 0;
-            free(sendbuf);
-            free(recvbuf);
-            break;
         }
 
         /* Fill sendbuf with deterministic pattern per rank */
@@ -744,16 +822,6 @@ int main(int argc, char **argv) {
                    sz, count, count * size, rank);
         }
 
-        /* Synchronize all ranks after finishing All-Gather */
-        brc = pg_barrier(pg_handle);
-        if (brc != PG_SUCCESS) {
-            fprintf(stderr, "Post-AG barrier failed with code %d\n", brc);
-            ag_passed = 0;
-            free(sendbuf);
-            free(recvbuf);
-            break;
-        }
-
         free(sendbuf);
         free(recvbuf);
     }
@@ -767,11 +835,12 @@ int main(int argc, char **argv) {
 
     /* Run Pipelined All-Reduce Tests (PG_INT + PG_SUM) */
     printf("=================================================================\n");
-    printf("[PG All-Reduce] Testing Pipelined Ring All-Reduce (RS + Barrier + AG)\n");
+    printf("[PG All-Reduce] Testing Pipelined Ring All-Reduce (RS + epoch-gated AG)\n");
     printf("=================================================================\n");
 
     int ar_passed = 1;
     for (int t = 0; t < num_tests; t++) {
+        if (test_sizes[t] > verify_max_bytes) continue;
         size_t sz = test_sizes[t];
         int count = (int)(sz / sizeof(int));
 
@@ -781,16 +850,6 @@ int main(int argc, char **argv) {
             if (sendbuf) free(sendbuf);
             if (recvbuf) free(recvbuf);
             continue;
-        }
-
-        /* Synchronize all ranks before starting All-Reduce */
-        int brc = pg_barrier(pg_handle);
-        if (brc != PG_SUCCESS) {
-            fprintf(stderr, "Pre-AR barrier failed with code %d\n", brc);
-            ar_passed = 0;
-            free(sendbuf);
-            free(recvbuf);
-            break;
         }
 
         /* Fill sendbuf with deterministic arithmetic pattern */
@@ -838,16 +897,6 @@ int main(int argc, char **argv) {
                    sz, count, rank);
         }
 
-        /* Synchronize all ranks after finishing All-Reduce */
-        brc = pg_barrier(pg_handle);
-        if (brc != PG_SUCCESS) {
-            fprintf(stderr, "Post-AR barrier failed with code %d\n", brc);
-            ar_passed = 0;
-            free(sendbuf);
-            free(recvbuf);
-            break;
-        }
-
         free(sendbuf);
         free(recvbuf);
     }
@@ -865,7 +914,7 @@ int main(int argc, char **argv) {
     if (rs_passed && ag_passed && ar_passed) {
         dt_rc = run_datatypes_and_ops_tests(pg_handle);
         rem_rc = run_non_divisible_counts_tests(pg_handle);
-        stress_rc = run_barrier_free_stress_test(pg_handle);
+        stress_rc = run_phase_handoff_stress_test(pg_handle);
     }
 
     int bench_rc = PG_SUCCESS;

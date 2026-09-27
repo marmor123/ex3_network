@@ -2,7 +2,7 @@
 
 High-performance, single-threaded RDMA collective communication library implementing **Reduce-Scatter**, **All-Gather**, and **All-Reduce** over InfiniBand Reliable Connected (RC) Queue Pairs using the `libibverbs` API.
 
-Designed and tuned on a 4-node InfiniBand cluster (`mlx-stud-01..04`), achieving **22.51–22.62 Gbps** peak effective bandwidth with automatic Eager/Rendezvous switching, direct zero-copy eager CPU receive, 4.19 MiB compact receive pools (75% memory footprint reduction), and pipelined zero-copy RDMA execution.
+Designed and tuned on a 4-node InfiniBand cluster (`mlx-stud-01..04`), achieving **22.42 Gbps** peak Rendezvous and **22.32 Gbps** AUTO effective bandwidth with direct zero-copy eager CPU receive, 4.19 MiB compact receive pools, and pipelined zero-copy RDMA execution.
 
 ---
 
@@ -17,7 +17,7 @@ Designed and tuned on a 4-node InfiniBand cluster (`mlx-stud-01..04`), achieving
                                         |
 +---------------------------------------v---------------------------------------+
 |                    COLLECTIVE ORCHESTRATION ENGINE                            |
-|   - MPI Remainder Slicing ((Q+1)/Q)       - 3-Phase Distributed Ring Barrier  |
+|   - MPI Remainder Slicing ((Q+1)/Q)       - Epoch-Gated Phase Handoff         |
 |   - Ring Permutation Step Math            - Safe Workbuf / Zero-Copy Staging  |
 +-------------------+---------------------------------------+-------------------+
                     |                                       |
@@ -43,6 +43,12 @@ Designed and tuned on a 4-node InfiniBand cluster (`mlx-stud-01..04`), achieving
 2. **Compute-Communication Overlap**: Adaptive 64 KiB / 256 KiB micro-chunks pipeline network transmission with 128-bit SSE4.2 SIMD vector reduction.
 3. **Adaptive Protocol Switching**: Automatically switches between Eager Send/Recv ($\le 64\text{ KiB}$ segment / $\le 256\text{ KiB}$ tensor) for low latency and Pipelined Rendezvous ($> 64\text{ KiB}$) for line-rate throughput.
 4. **Deadlock-Free Bootstrap**: Edge-ordered TCP connection initialization ensures deterministic ring setup across arbitrary rank counts.
+5. **Exact Transfer Identity**: Collective epoch, phase, step, segment, and micro-chunk prevent early or subsequent-iteration traffic from selecting the wrong receive state, eliminating the dedicated barrier protocol.
+
+### Buffer Contract
+
+- `pg_reduce_scatter` and `pg_all_reduce` require disjoint input and output ranges. With the default `WORKBUFFER=inplace`, `sendbuf` is mutable scratch.
+- `pg_all_gather` accepts disjoint ranges or `sendbuf` pointing exactly at the calling rank's owned slice inside `recvbuf`; other overlap is invalid.
 
 ---
 
@@ -187,25 +193,21 @@ Data is written directly into `recvbuf + offset(s_in)` with zero memory copies. 
 
 ## 4. Empirical Performance Highlights
 
-*Summary benchmarks on 4-node physical InfiniBand cluster (`mlx-stud-01..04`)*:
+*Fresh 5-iteration medians measured on the 4-node physical InfiniBand cluster (`mlx-stud-01..04`) on 2026-09-27. A one-element All-Gather aligns ranks immediately before each timed sample and is excluded from the measurement.*
 
-| Size | Auto Latency (Before) | Auto Latency (Optimized) | Latency Delta | Effective Bandwidth | Optimal Protocol Mode |
-| :--- | :---: | :---: | :---: | :---: | :--- |
-| **64 B** | $43.13\,\mu\text{s}$ | **$41.88\,\mu\text{s}$** | **-2.9%** | 0.02 Gbps | **Eager (Direct Zero-Copy)** |
-| **256 B** | $44.05\,\mu\text{s}$ | **$42.77\,\mu\text{s}$** | **-2.9%** | 0.07 Gbps | **Eager (Direct Zero-Copy)** |
-| **1 KiB** | $45.13\,\mu\text{s}$ | **$43.54\,\mu\text{s}$** | **-3.5%** | 0.28 Gbps | **Eager (Direct Zero-Copy)** |
-| **8 KiB** | $54.32\,\mu\text{s}$ | **$51.93\,\mu\text{s}$** | **-4.4%** | 1.89 Gbps | **Eager (Direct Zero-Copy)** |
-| **16 KiB** | $62.05\,\mu\text{s}$ | **$59.64\,\mu\text{s}$** | **-3.9%** | 3.30 Gbps | **Eager (Direct Zero-Copy)** |
-| **32 KiB** | $72.64\,\mu\text{s}$ | **$67.18\,\mu\text{s}$** | **-7.5%** | **5.85 Gbps** | **Eager (Direct Zero-Copy)** |
-| **64 KiB** | $94.71\,\mu\text{s}$ | **$89.95\,\mu\text{s}$** | **-5.0%** | **8.74 Gbps** | **Eager (Direct Zero-Copy)** |
-| **128 KiB** | $144.19\,\mu\text{s}$ | **$130.89\,\mu\text{s}$** | **-9.2%** | **12.02 Gbps** | **Eager (Direct Zero-Copy)** |
-| **256 KiB** | $239.76\,\mu\text{s}$ | **$214.56\,\mu\text{s}$** | **-10.5%** | **14.66 Gbps** | **Eager (Direct Zero-Copy)** |
-| **1 MiB** | $823.54\,\mu\text{s}$ | **$827.68\,\mu\text{s}$** | +0.5% | **15.20 Gbps** | **Rendezvous ($1.1\times$ faster than eager)** |
-| **64 MiB** | $37.45\,\text{ms}$ | **$36.68\,\text{ms}$** | -2.1% | **21.96 Gbps** | **Rendezvous (Adaptive 64K Chunks)** |
-| **1 GiB** | $576.07\,\text{ms}$ | **$569.73\,\text{ms}$** | **-1.1%** | **22.62 Gbps** | **Rendezvous (Peak: 22.62 Gbps)** |
+| Size | Eager Latency | Rendezvous Latency | AUTO Latency | AUTO Bandwidth | Fastest Explicit Mode |
+| :--- | ---: | ---: | ---: | ---: | :--- |
+| **64 B** | **16.0 µs** | 65.8 µs | 17.5 µs | 0.04 Gbps | Eager |
+| **64 KiB** | **63.4 µs** | 105.7 µs | 62.8 µs | 12.53 Gbps | Eager |
+| **256 KiB** | **189.6 µs** | 202.6 µs | 186.8 µs | 16.84 Gbps | Eager |
+| **1 MiB** | **647.5 µs** | 755.2 µs | 737.6 µs | 17.06 Gbps | Eager |
+| **8 MiB** | **5.22 ms** | 5.23 ms | 5.28 ms | 19.08 Gbps | Eager |
+| **16 MiB** | 10.44 ms | **9.91 ms** | 10.04 ms | 20.06 Gbps | Rendezvous |
+| **64 MiB** | — | 37.25 ms | **37.13 ms** | 21.69 Gbps | Rendezvous |
+| **1 GiB** | — | **574.81 ms** | 577.32 ms | **22.32 Gbps** | Rendezvous |
 
 > [!TIP]
-> For the complete dataset, hyperparameter sensitivity sweeps (chunk size, window depth, batching, SIMD vs scalar), and the **Tested vs. Not-Tested Boundary Matrix**, refer to the full [Empirical Protocol Evaluation Report](file:///c:/Users/marmo/ateret/ex3_network/docs/empirical_protocol_report.md).
+> For the complete dataset, hyperparameter sensitivity sweeps, and the **Tested vs. Not-Tested Boundary Matrix**, refer to the full [Empirical Protocol Evaluation Report](docs/empirical_protocol_report.md).
 
 ---
 
@@ -229,7 +231,7 @@ Data is written directly into `recvbuf + offset(s_in)` with zero memory copies. 
 │   ├── MODULE 3: Memory Registration & Staging Cache
 │   ├── MODULE 5: SSE4.2 Vector Reduction Compute Kernels
 │   ├── MODULE 4: Progress Engine & CQ Dispatch (Private Progress Seam)
-│   ├── Group Lifecycle & Distributed Ring Barrier (ADR-0007)
+│   ├── Group Lifecycle & Epoch-Gated Phase Handoff (ADR-0008)
 │   └── MODULE 6: Ring Step Transfer & Collectives Orchestration
 
 │
@@ -241,14 +243,14 @@ Data is written directly into `recvbuf + offset(s_in)` with zero memory copies. 
 │
 └── docs/
     ├── empirical_protocol_report.md  # Detailed benchmark analysis and empirical boundary matrix
-    └── adr/                          # Architectural Decision Records (0001 - 0007)
+    └── adr/                          # Current architectural decision records
         ├── 0001-wr-id-progress-engine.md
         ├── 0002-mr-buffer-lifecycle.md
         ├── 0003-eager-threshold-and-adaptive-selection.md
         ├── 0004-simd-vectorization-and-wr-batching.md
         ├── 0005-mpi-remainder-and-ring-step-permutation.md
         ├── 0006-pipelined-windowing-and-selective-signaling.md
-        └── 0007-three-phase-distributed-barrier.md
+        └── 0008-epoch-gated-phase-handoff.md
 ```
 
 ---
@@ -270,6 +272,8 @@ make MODE=eager      # Pure Eager Send/Recv
 # Compile with Safe Work Buffer (Preserves sendbuf without mutation)
 make WORKBUFFER=safe
 ```
+
+All-Reduce always uses epoch-gated, barrier-free phase handoff. The library contains no dedicated barrier interface or control messages. Connection and teardown use a symmetric neighbor ping; the benchmark harness uses a one-element public All-Gather before timed samples.
 
 ### 6.2 Multi-Node Cluster Execution
 Run on the physical InfiniBand cluster (`mlx-stud-01..04`):

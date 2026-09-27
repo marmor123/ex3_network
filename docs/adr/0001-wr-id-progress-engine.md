@@ -1,7 +1,7 @@
 # ADR-0001: wr_id Bit-Packing and Progress-Engine Dispatch
 
 ## Context
-The collective ring consists of 2 RC QPs (`qp_to_next` and `qp_from_prev`) sharing a single Completion Queue (CQ), handling both control types (`RTS`, `CTS`, `DATA_DONE`, `BARRIER`, `EAGER_PAYLOAD`) and data path work requests (`RDMA_WRITE`, `EAGER_SEND`).
+The collective ring consists of 2 RC QPs (`qp_to_next` and `qp_from_prev`) sharing a single Completion Queue (CQ), handling control types (`PING`, `RTS`, `CTS`, `DATA_DONE`, `EAGER_PAYLOAD`) and data-path work requests (`RDMA_WRITE`, `EAGER_SEND`).
 
 We needed a low-overhead, deterministic completion routing mechanism that distinguishes QP direction and operation type directly from the 64-bit `wr_id` without requiring dynamic memory allocation or payload parsing in the hot CQ polling loop.
 
@@ -9,7 +9,7 @@ We needed a low-overhead, deterministic completion routing mechanism that distin
 
 ### 1. wr_id Bit-Packing Layout
 - 64-bit `wr_id`:
-  - bits `0-3`: `WR_TYPE` enum (0–15): `RECV_CTRL=1`, `SEND_CTRL=2`, `RTS=3`, `CTS=4`, `DATA_DONE=5`, `RDMA_WRITE=6`, `BARRIER=7`, `EAGER_RECV=8`, `EAGER_SEND=9`.
+  - bits `0-3`: completion kind: `RECV_CTRL=1`, `SEND_CTRL=2`, `RDMA_WRITE=6`, or `EAGER_SEND=9`.
   - bit `4`: `QP_DIR` (`0 = to_next`, `1 = from_prev`).
   - bits `8-31`: Buffer slot index or micro-chunk sequence number.
 - Fast bitwise inline helpers:
@@ -24,9 +24,9 @@ We needed a low-overhead, deterministic completion routing mechanism that distin
 - Upon polling a `PG_WR_TYPE_RECV_CTRL` CQ completion, the progress engine copies/processes the message and immediately reposts the receive work request to maintain invariant pool depth.
 
 ### 3. Progress Engine Polling, Dispatch & Automatic Buffering
-- Encapsulated within `pg_progress_poll`, `pg_progress_wait`, `pg_progress_wait_msg`, `pg_progress_wait_type`, and `pg_progress_wait_send_recv`.
+- Encapsulated within `pg_progress_poll`, `pg_progress_wait_send_recv`, and the ring-step transfer engines.
 - Unexpected or future-step control messages are automatically diverted into an internal FIFO queue (`pending_q`) via `pg_progress_buffer_unexpected` rather than leaking queue maintenance to callers.
-- Callers declaratively wait on expected control messages or completion types without manual pushback loops.
+- Callers match exact transfer identities while unexpected traffic is retained without manual pushback loops.
 - **Dynamic Pointer Indirection**: In `struct pg_pending_entry` and `struct pg_progress_event`, eager message payloads are referenced via dynamic pointers backed by a single 64-byte cacheline-aligned context buffer (`ctx->eager_rx_buf`) rather than embedding 262 KB arrays in each struct.
 - **Strict DMA Memory Barrier**: `pg_progress_poll` issues an explicit compiler memory barrier (`asm volatile("" ::: "memory");`) immediately upon detecting a non-zero completion count from `ibv_poll_cq`, preventing compiler reordering of memory loads before DMA completion validation.
 
@@ -38,6 +38,6 @@ We needed a low-overhead, deterministic completion routing mechanism that distin
 - Guaranteed memory visibility across asynchronous NIC DMA operations.
 
 ## References
-- `pg_internal.h` (`pg_make_wr`, `pg_progress_poll`, `pg_progress_wait`, `pg_pending_queue`).
+- `pg_internal.h` (`pg_make_wr`, `pg_pending_queue`) and `pg.c` (`pg_progress_poll`).
 - `CONTEXT.md` (Progress Seam #1).
 - Commit `c1b79ac` (Ticket #18) & `add1f2f`.

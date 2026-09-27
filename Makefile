@@ -8,6 +8,11 @@ ifeq ($(WORKBUFFER),inplace)
     CFLAGS += -DPG_WORKBUFFER_INPLACE
 endif
 
+TEST_HOOKS ?= 0
+ifeq ($(TEST_HOOKS),1)
+    CFLAGS += -DPG_TEST_HOOKS
+endif
+
 MODE ?= auto
 ifeq ($(MODE),eager)
     CFLAGS += -DPG_MODE_EAGER

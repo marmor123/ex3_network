@@ -131,10 +131,21 @@ static inline void pg_assemble_rdma_write_wr(struct ibv_send_wr *wr, struct ibv_
 #define PG_CTRL_MSG_RTS             3
 #define PG_CTRL_MSG_CTS             4
 #define PG_CTRL_MSG_DATA_DONE       5
-#define PG_CTRL_MSG_BARRIER_COLLECT 6
-#define PG_CTRL_MSG_BARRIER_RELEASE 7
-#define PG_CTRL_MSG_BARRIER_ACK     8
-#define PG_CTRL_MSG_EAGER_PAYLOAD   9
+#define PG_CTRL_MSG_EAGER_PAYLOAD   6
+
+/* Collective and phase identity carried by every data-path message. */
+#define PG_COLLECTIVE_REDUCE_SCATTER 1
+#define PG_COLLECTIVE_ALL_GATHER     2
+#define PG_COLLECTIVE_ALL_REDUCE     3
+
+#define PG_PHASE_REDUCE_SCATTER      1
+#define PG_PHASE_ALL_GATHER          2
+
+struct pg_collective_scope {
+    uint64_t epoch;
+    uint16_t collective;
+    uint16_t phase;
+};
 
 /* 64-byte Control Message Structure */
 struct pg_ctrl_msg {
@@ -145,14 +156,45 @@ struct pg_ctrl_msg {
     union {
         struct {
             uint64_t remote_addr; /* Remote staging/recvbuf virtual address (Rendezvous protocol) */
+            uint64_t epoch;       /* Process-group-local collective invocation number */
             uint32_t rkey;        /* Remote memory key (Rendezvous protocol) */
             uint32_t seg_idx;     /* Ring segment index */
             uint32_t micro_idx;   /* Pipelined micro-chunk index */
             uint32_t length;      /* Payload byte length */
+            uint16_t collective;  /* PG_COLLECTIVE_* */
+            uint16_t phase;       /* PG_PHASE_* */
         } rdv;
         uint8_t raw[48];          /* Reserved / padding to 64 bytes total */
     } payload;
 };
+
+_Static_assert(sizeof(struct pg_ctrl_msg) == PG_CTRL_MSG_LEN,
+               "pg_ctrl_msg must remain exactly one control header");
+
+struct pg_transfer_key {
+    uint64_t epoch;
+    uint32_t step_seq;
+    uint32_t seg_idx;
+    uint32_t micro_idx;
+    uint16_t collective;
+    uint16_t phase;
+    int match_micro;
+};
+
+static inline int pg_ctrl_msg_matches(const struct pg_ctrl_msg *msg, int type,
+                                      uint32_t seg_idx,
+                                      const struct pg_transfer_key *key) {
+    if (!msg || msg->type != type) return 0;
+    if (seg_idx != (uint32_t)-1 && msg->payload.rdv.seg_idx != seg_idx) return 0;
+    if (!key) return 1;
+
+    return msg->payload.rdv.epoch == key->epoch &&
+           msg->payload.rdv.collective == key->collective &&
+           msg->payload.rdv.phase == key->phase &&
+           msg->seq == key->step_seq &&
+           msg->payload.rdv.seg_idx == key->seg_idx &&
+           (!key->match_micro || msg->payload.rdv.micro_idx == key->micro_idx);
+}
 
 /* TCP QP Metadata exchanged during bootstrap */
 struct pg_tcp_qp_info {
@@ -206,6 +248,7 @@ struct pg_context {
     uint32_t batch_size;
     size_t eager_threshold;
     uint32_t eager_window;
+    uint64_t next_collective_epoch;
 
     /* InfiniBand Verbs Resources */
     struct ibv_context *ib_ctx;
@@ -258,12 +301,14 @@ struct pg_context {
     struct pg_tcp_qp_info remote_from_prev;        /* Received QP info from prev rank */
 };
 
-static inline void pg_pending_push(struct pg_context *ctx, int qp_dir, const struct pg_ctrl_msg *msg, const void *slot_buf) {
-    if (!ctx || qp_dir < 0 || qp_dir >= 2 || !msg) return;
+static inline int pg_pending_push(struct pg_context *ctx, int qp_dir,
+                                  const struct pg_ctrl_msg *msg,
+                                  const void *slot_buf) {
+    if (!ctx || qp_dir < 0 || qp_dir >= 2 || !msg) return PG_ERR_INVAL;
     struct pg_pending_queue *q = &ctx->pending_q[qp_dir];
     if (q->count >= PG_PENDING_QUEUE_MAX) {
         fprintf(stderr, "[pg] Error: Pending control queue overflow on qp_dir %d (count=%d)\n", qp_dir, q->count);
-        return;
+        return PG_ERR_RDMA;
     }
 
     int slot = -1;
@@ -273,20 +318,23 @@ static inline void pg_pending_push(struct pg_context *ctx, int qp_dir, const str
             break;
         }
     }
-    if (slot < 0) return;
+    if (slot < 0) return PG_ERR_RDMA;
 
     q->pool[slot].in_use = 1;
     q->pool[slot].msg = *msg;
     q->pool[slot].eager_len = 0;
     if (msg->type == PG_CTRL_MSG_EAGER_PAYLOAD && slot_buf) {
         uint32_t elen = msg->payload.rdv.length + PG_CTRL_MSG_LEN;
-        if (elen > (PG_EAGER_BUF_SIZE + PG_CTRL_MSG_LEN)) elen = PG_EAGER_BUF_SIZE + PG_CTRL_MSG_LEN;
+        if (elen > (PG_EAGER_BUF_SIZE + PG_CTRL_MSG_LEN)) {
+            q->pool[slot].in_use = 0;
+            return PG_ERR_RDMA;
+        }
         if (!q->pool[slot].eager_buf) {
             q->pool[slot].eager_buf = (char *)malloc(PG_EAGER_SLOT_SIZE);
             if (!q->pool[slot].eager_buf) {
                 fprintf(stderr, "[pg] Fatal: OOM allocating eager buffer in pending queue\n");
                 q->pool[slot].in_use = 0;
-                return;
+                return PG_ERR_NOMEM;
             }
         }
         memcpy(q->pool[slot].eager_buf, slot_buf, elen);
@@ -296,9 +344,15 @@ static inline void pg_pending_push(struct pg_context *ctx, int qp_dir, const str
     q->ring[q->tail] = slot;
     q->tail = (q->tail + 1) % PG_PENDING_QUEUE_MAX;
     q->count++;
+    return PG_SUCCESS;
 }
 
-static inline int pg_pending_pop_matching(struct pg_context *ctx, int qp_dir, int type, uint32_t seg_idx, struct pg_ctrl_msg *out_msg, void *out_slot_buf, uint32_t *out_eager_len) {
+static inline int pg_pending_pop_matching(struct pg_context *ctx, int qp_dir, int type,
+                                          uint32_t seg_idx,
+                                          const struct pg_transfer_key *key,
+                                          struct pg_ctrl_msg *out_msg,
+                                          void *out_slot_buf,
+                                          uint32_t *out_eager_len) {
     if (!ctx || qp_dir < 0 || qp_dir >= 2) return 0;
     struct pg_pending_queue *q = &ctx->pending_q[qp_dir];
     if (q->count == 0) return 0;
@@ -309,7 +363,7 @@ static inline int pg_pending_pop_matching(struct pg_context *ctx, int qp_dir, in
         struct pg_pending_entry *entry = &q->pool[slot];
         struct pg_ctrl_msg *m = &entry->msg;
 
-        if (m->type == type && (seg_idx == (uint32_t)-1 || m->payload.rdv.seg_idx == seg_idx)) {
+        if (pg_ctrl_msg_matches(m, type, seg_idx, key)) {
             if (out_msg) *out_msg = *m;
             if (out_eager_len) *out_eager_len = entry->eager_len;
             if (out_slot_buf && entry->eager_len > 0 && entry->eager_buf) {
@@ -407,6 +461,7 @@ enum pg_chunk_action {
 };
 
 struct pg_ring_step_desc {
+    struct pg_collective_scope scope; /* Collective invocation and phase identity */
     uint32_t step_idx;          /* 0-indexed ring step */
     size_t total_bytes;         /* Total collective tensor size in bytes (uniform across ring) */
 
@@ -454,7 +509,6 @@ int pg_tcp_bootstrap(struct pg_context *ctx);
 int pg_post_ctrl_send(struct pg_context *ctx, int qp_dir, const struct pg_ctrl_msg *msg);
 int pg_post_eager_send(struct pg_context *ctx, int qp_dir, const struct pg_ctrl_msg *hdr,
                        void *payload_addr, uint32_t payload_len, uint32_t lkey, int signaled, uint32_t slot);
-int pg_rdma_ring_ping(struct pg_context *ctx);
 void pg_rdma_cleanup(struct pg_context *ctx);
 
 /* Runtime Hyperparameter Init */
@@ -468,12 +522,9 @@ int pg_ensure_internal_buffers(struct pg_context *ctx, size_t count_bytes, size_
 void pg_reduce_buffer(void *dest, const void *src, int count,
                       DATATYPE datatype, OPERATION op);
 
-/* Distributed Ring Barrier */
-int pg_barrier(void *pg_handle);
-
 /* Ring All-Gather Generalized Core Engine (Zero-Copy RDMA Write) */
-int pg_ring_all_gather_generalized(struct pg_context *ctx, void *recvbuf, int count, DATATYPE datatype);
+int pg_ring_all_gather_generalized(struct pg_context *ctx, void *recvbuf, int count,
+                                   DATATYPE datatype,
+                                   const struct pg_collective_scope *scope);
 
 #endif /* PG_INTERNAL_H */
-
-

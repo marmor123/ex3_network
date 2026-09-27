@@ -797,6 +797,7 @@ void pg_init_tuning_params(struct pg_context *ctx) {
         unsigned long val = strtoul(ewin_env, NULL, 10);
         if (val > 0) ctx->eager_window = (uint32_t)val;
     }
+
 }
 
 /* ========================================================================= */
@@ -897,12 +898,16 @@ struct pg_progress_event {
 };
 
 /* Pop matching message from internal FIFO pending queue */
-static inline int pg_progress_pop_pending(struct pg_context *ctx, int qp_dir, int msg_type, uint32_t seg_idx, struct pg_progress_event *out_event) {
+static inline int pg_progress_pop_pending(struct pg_context *ctx, int qp_dir, int msg_type,
+                                          uint32_t seg_idx,
+                                          const struct pg_transfer_key *key,
+                                          struct pg_progress_event *out_event) {
     if (!ctx || qp_dir < 0 || qp_dir >= 2 || !out_event) return 0;
     struct pg_ctrl_msg msg;
     uint32_t eager_len = 0;
     void *target_buf = (msg_type == PG_CTRL_MSG_EAGER_PAYLOAD) ? ctx->eager_rx_buf : NULL;
-    if (pg_pending_pop_matching(ctx, qp_dir, msg_type, seg_idx, &msg, target_buf, &eager_len)) {
+    if (pg_pending_pop_matching(ctx, qp_dir, msg_type, seg_idx, key,
+                                &msg, target_buf, &eager_len)) {
         out_event->type = PG_WR_TYPE_RECV_CTRL;
         out_event->qp_dir = qp_dir;
         out_event->slot = (uint32_t)-1;
@@ -915,8 +920,10 @@ static inline int pg_progress_pop_pending(struct pg_context *ctx, int qp_dir, in
 }
 
 /* Push unhandled or future-step message into pending queue */
-static inline void pg_progress_push_pending(struct pg_context *ctx, int qp_dir, const struct pg_ctrl_msg *msg, const void *slot_buf) {
-    pg_pending_push(ctx, qp_dir, msg, slot_buf);
+static inline int pg_progress_push_pending(struct pg_context *ctx, int qp_dir,
+                                           const struct pg_ctrl_msg *msg,
+                                           const void *slot_buf) {
+    return pg_pending_push(ctx, qp_dir, msg, slot_buf);
 }
 
 /* Non-blocking single CQ poll and event decoder with auto receive slot replenishment */
@@ -961,8 +968,12 @@ static inline int pg_progress_poll(struct pg_context *ctx, struct pg_progress_ev
 
         out_event->msg = *rhdr;
         if (rhdr->type == PG_CTRL_MSG_EAGER_PAYLOAD) {
+            if (rhdr->payload.rdv.length > PG_EAGER_BUF_SIZE) {
+                fprintf(stderr, "[pg_progress] Error: Eager payload length %u exceeds %u bytes\n",
+                        rhdr->payload.rdv.length, (unsigned)PG_EAGER_BUF_SIZE);
+                return PG_ERR_RDMA;
+            }
             uint32_t elen = rhdr->payload.rdv.length + PG_CTRL_MSG_LEN;
-            if (elen > (PG_EAGER_BUF_SIZE + PG_CTRL_MSG_LEN)) elen = PG_EAGER_BUF_SIZE + PG_CTRL_MSG_LEN;
             /*
              * Direct Zero-Copy CPU Receive Path (Phase 2):
              * Point eager_buf directly to the registered receive slot buffer instead of copying
@@ -984,95 +995,19 @@ static inline int pg_progress_poll(struct pg_context *ctx, struct pg_progress_ev
     return 1;
 }
 
-/* Watchdog-timed progress event waiter (polls until completion or timeout) */
-static inline int pg_progress_wait(struct pg_context *ctx, double timeout_sec, struct pg_progress_event *out_event) {
-    struct timespec start, now;
-    clock_gettime(CLOCK_MONOTONIC, &start);
-
-    while (1) {
-        int rc = pg_progress_poll(ctx, out_event);
-        if (rc < 0) return rc;
-        if (rc == 1) return 1;
-
-        clock_gettime(CLOCK_MONOTONIC, &now);
-        double elapsed = (now.tv_sec - start.tv_sec) + (now.tv_nsec - start.tv_nsec) / 1e9;
-        if (elapsed >= timeout_sec) {
-            fprintf(stderr, "[pg_progress] Error: Timed out after %.2f s waiting for CQ event\n", elapsed);
-            return PG_ERR_TIMEOUT;
-        }
-    }
-}
-
 /* Automatically buffer unexpected incoming receive messages into pending queue */
-static inline void pg_progress_buffer_unexpected(struct pg_context *ctx, const struct pg_progress_event *ev) {
+static inline int pg_progress_buffer_unexpected(struct pg_context *ctx,
+                                                const struct pg_progress_event *ev) {
     if (ctx && ev && ev->type == PG_WR_TYPE_RECV_CTRL) {
-        pg_progress_push_pending(ctx, ev->qp_dir, &ev->msg, ev->eager_buf);
+        int rc = pg_progress_push_pending(ctx, ev->qp_dir, &ev->msg, ev->eager_buf);
         if (ev->msg.type == PG_CTRL_MSG_EAGER_PAYLOAD && ev->slot != (uint32_t)-1) {
-            pg_repost_recv_slot(ctx, ev->qp_dir, (int)ev->slot);
-        }
-    }
-}
-
-/* Wait for a specific local work completion type (e.g. PG_WR_TYPE_SEND_CTRL) on qp_dir (or any dir if qp_dir < 0) */
-static inline int pg_progress_wait_type(struct pg_context *ctx, int qp_dir, int wr_type, double timeout_sec, struct pg_progress_event *out_event) {
-    if (out_event) memset(out_event, 0, sizeof(*out_event));
-    struct timespec start, now;
-    clock_gettime(CLOCK_MONOTONIC, &start);
-
-    struct pg_progress_event ev;
-    while (1) {
-        int rc = pg_progress_poll(ctx, &ev);
-        if (rc < 0) return rc;
-        if (rc == 1) {
-            if (ev.type == wr_type && (qp_dir < 0 || ev.qp_dir == qp_dir)) {
-                if (out_event) *out_event = ev;
-                return PG_SUCCESS;
+            if (pg_repost_recv_slot(ctx, ev->qp_dir, (int)ev->slot)) {
+                return PG_ERR_RDMA;
             }
-            pg_progress_buffer_unexpected(ctx, &ev);
         }
-
-        clock_gettime(CLOCK_MONOTONIC, &now);
-        double elapsed = (now.tv_sec - start.tv_sec) + (now.tv_nsec - start.tv_nsec) / 1e9;
-        if (elapsed >= timeout_sec) {
-            fprintf(stderr, "[pg_progress] Error: Timed out waiting for WR type %d on qp_dir %d\n", wr_type, qp_dir);
-            return PG_ERR_TIMEOUT;
-        }
+        return rc;
     }
-}
-
-/* Wait for a matching incoming control message, auto-buffering unexpected messages */
-static inline int pg_progress_wait_msg(struct pg_context *ctx, int qp_dir, uint16_t msg_type, uint32_t seg_idx, double timeout_sec, struct pg_progress_event *out_event) {
-    if (out_event) memset(out_event, 0, sizeof(*out_event));
-    /* 1. First check if already buffered in pending queue */
-    if (pg_progress_pop_pending(ctx, qp_dir, (int)msg_type, seg_idx, out_event)) {
-        return PG_SUCCESS;
-    }
-
-    /* 2. Poll until matching message arrives or timeout */
-    struct timespec start, now;
-    clock_gettime(CLOCK_MONOTONIC, &start);
-
-    struct pg_progress_event ev;
-    while (1) {
-        int rc = pg_progress_poll(ctx, &ev);
-        if (rc < 0) return rc;
-        if (rc == 1) {
-            if (ev.type == PG_WR_TYPE_RECV_CTRL && ev.qp_dir == qp_dir &&
-                ev.msg.type == msg_type &&
-                (seg_idx == (uint32_t)-1 || ev.msg.payload.rdv.seg_idx == seg_idx)) {
-                if (out_event) *out_event = ev;
-                return PG_SUCCESS;
-            }
-            pg_progress_buffer_unexpected(ctx, &ev);
-        }
-
-        clock_gettime(CLOCK_MONOTONIC, &now);
-        double elapsed = (now.tv_sec - start.tv_sec) + (now.tv_nsec - start.tv_nsec) / 1e9;
-        if (elapsed >= timeout_sec) {
-            fprintf(stderr, "[pg_progress] Error: Timed out waiting for msg_type %u from qp_dir %d\n", msg_type, qp_dir);
-            return PG_ERR_TIMEOUT;
-        }
-    }
+    return PG_SUCCESS;
 }
 
 /* Concurrently wait for a local send completion and a matching incoming control message */
@@ -1085,7 +1020,8 @@ static inline int pg_progress_wait_send_recv(struct pg_context *ctx,
     int send_done = 0;
     int recv_done = 0;
 
-    if (pg_progress_pop_pending(ctx, recv_qp_dir, (int)recv_msg_type, seg_idx, out_recv_event)) {
+    if (pg_progress_pop_pending(ctx, recv_qp_dir, (int)recv_msg_type, seg_idx,
+                                NULL, out_recv_event)) {
         recv_done = 1;
     }
 
@@ -1105,7 +1041,8 @@ static inline int pg_progress_wait_send_recv(struct pg_context *ctx,
                 if (out_recv_event) *out_recv_event = ev;
                 recv_done = 1;
             } else {
-                pg_progress_buffer_unexpected(ctx, &ev);
+                int brc = pg_progress_buffer_unexpected(ctx, &ev);
+                if (brc != PG_SUCCESS) return brc;
             }
         }
 
@@ -1122,10 +1059,8 @@ static inline int pg_progress_wait_send_recv(struct pg_context *ctx,
 }
 
 /* ========================================================================= */
-/* === PROCESS GROUP LIFECYCLE & RING BARRIER (ADR-0007)                === */
+/* === PROCESS GROUP LIFECYCLE                                          === */
 /* ========================================================================= */
-
-
 
 /* Edge-ordered ring-only TCP bootstrap exchanging real QP metadata */
 int pg_tcp_bootstrap(struct pg_context *ctx) {
@@ -1271,7 +1206,7 @@ int pg_tcp_bootstrap(struct pg_context *ctx) {
 }
 
 /* Symmetric RDMA control ring ping verification */
-int pg_rdma_ring_ping(struct pg_context *ctx) {
+static int pg_rdma_ring_ping(struct pg_context *ctx) {
     if (!ctx) return PG_ERR_INVAL;
 
     struct pg_ctrl_msg send_msg;
@@ -1299,63 +1234,6 @@ int pg_rdma_ring_ping(struct pg_context *ctx) {
                 ctx->rank, ev.msg.sender_rank, ctx->prev_rank);
         return PG_ERR_RDMA;
     }
-
-    return PG_SUCCESS;
-}
-
-/* Pass a token once around the entire ring for Phase 1 (Collect), Phase 2 (Release), or Phase 3 (Ack) */
-static int pg_barrier_token_pass(struct pg_context *ctx, uint16_t msg_type) {
-    int rc;
-    struct pg_progress_event ev = {0};
-
-    struct pg_ctrl_msg msg;
-    memset(&msg, 0, sizeof(msg));
-    msg.tag = PG_CTRL_TAG;
-    msg.type = msg_type;
-    msg.sender_rank = (uint16_t)ctx->rank;
-
-    if (ctx->rank == 0) {
-        /* Rank 0: Originate token to next_rank and wait for token to traverse the ring back from prev_rank */
-        rc = pg_post_ctrl_send(ctx, PG_QP_DIR_TO_NEXT, &msg);
-        if (rc != PG_SUCCESS) return rc;
-
-        rc = pg_progress_wait_send_recv(ctx, PG_QP_DIR_TO_NEXT, PG_WR_TYPE_SEND_CTRL,
-                                        PG_QP_DIR_FROM_PREV, msg_type, (uint32_t)-1,
-                                        PG_CTRL_POLL_TIMEOUT_SEC, &ev);
-        if (rc != PG_SUCCESS) return rc;
-    } else {
-        /* Other Ranks: Wait for token from prev_rank, then forward token to next_rank */
-        rc = pg_progress_wait_msg(ctx, PG_QP_DIR_FROM_PREV, msg_type, (uint32_t)-1,
-                                  PG_CTRL_POLL_TIMEOUT_SEC, &ev);
-        if (rc != PG_SUCCESS) return rc;
-
-        rc = pg_post_ctrl_send(ctx, PG_QP_DIR_TO_NEXT, &msg);
-        if (rc != PG_SUCCESS) return rc;
-
-        rc = pg_progress_wait_type(ctx, PG_QP_DIR_TO_NEXT, PG_WR_TYPE_SEND_CTRL,
-                                   PG_CTRL_POLL_TIMEOUT_SEC, NULL);
-        if (rc != PG_SUCCESS) return rc;
-    }
-
-    return PG_SUCCESS;
-}
-
-/* Distributed Ring Barrier (3-phase Collect, Release & Acknowledge) */
-int pg_barrier(void *pg_handle) {
-    if (!pg_handle) return PG_ERR_INVAL;
-    struct pg_context *ctx = (struct pg_context *)pg_handle;
-
-    /* Phase 1: Collect (Rank 0 circulates token, ensuring all ranks entered barrier) */
-    int rc = pg_barrier_token_pass(ctx, PG_CTRL_MSG_BARRIER_COLLECT);
-    if (rc != PG_SUCCESS) return rc;
-
-    /* Phase 2: Release (Rank 0 circulates release token, ensuring all ranks start exit) */
-    rc = pg_barrier_token_pass(ctx, PG_CTRL_MSG_BARRIER_RELEASE);
-    if (rc != PG_SUCCESS) return rc;
-
-    /* Phase 3: Ack (Rank 0 circulates ack token, ensuring all ranks exited release phase) */
-    rc = pg_barrier_token_pass(ctx, PG_CTRL_MSG_BARRIER_ACK);
-    if (rc != PG_SUCCESS) return rc;
 
     return PG_SUCCESS;
 }
@@ -1423,10 +1301,10 @@ int connect_process_group(char *servername, void **pg_handle) {
         return rc;
     }
 
-    /* 3. Run distributed RDMA ring barrier to verify ring connectivity and synchronize ranks */
-    rc = pg_barrier((void *)ctx);
+    /* 3. Exchange a symmetric neighbor ping to verify every ring edge. */
+    rc = pg_rdma_ring_ping(ctx);
     if (rc != PG_SUCCESS) {
-        fprintf(stderr, "[pg] Error: RDMA control ring barrier failed with code %d\n", rc);
+        fprintf(stderr, "[pg] Error: RDMA control ring ping failed with code %d\n", rc);
         pg_rdma_cleanup(ctx);
         free(ctx);
         *pg_handle = NULL;
@@ -1443,12 +1321,11 @@ int pg_close(void *pg_handle) {
     }
 
     struct pg_context *ctx = (struct pg_context *)pg_handle;
-    /* Synchronize ranks before tearing down RDMA resources */
-    pg_barrier(pg_handle);
+    int rc = pg_rdma_ring_ping(ctx);
 
     pg_rdma_cleanup(ctx);
     free(ctx);
-    return PG_SUCCESS;
+    return rc;
 }
 
 int pg_get_rank(void *pg_handle) {
@@ -1492,6 +1369,60 @@ static inline void pg_step_process_chunk(const struct pg_ring_step_desc *desc,
     }
 }
 
+static inline struct pg_transfer_key
+pg_transfer_key_for(const struct pg_ring_step_desc *desc, uint32_t seg_idx,
+                    uint32_t micro_idx, int match_micro) {
+    struct pg_transfer_key key = {
+        .epoch = desc->scope.epoch,
+        .step_seq = desc->step_idx + 1,
+        .seg_idx = seg_idx,
+        .micro_idx = micro_idx,
+        .collective = desc->scope.collective,
+        .phase = desc->scope.phase,
+        .match_micro = match_micro
+    };
+    return key;
+}
+
+static inline void pg_init_transfer_msg(struct pg_ctrl_msg *msg,
+                                        const struct pg_context *ctx,
+                                        uint16_t type,
+                                        const struct pg_ring_step_desc *desc,
+                                        uint32_t seg_idx,
+                                        uint32_t micro_idx,
+                                        uint32_t length) {
+    memset(msg, 0, sizeof(*msg));
+    msg->tag = PG_CTRL_TAG;
+    msg->type = type;
+    msg->sender_rank = (uint16_t)ctx->rank;
+    msg->seq = desc->step_idx + 1;
+    msg->payload.rdv.epoch = desc->scope.epoch;
+    msg->payload.rdv.seg_idx = seg_idx;
+    msg->payload.rdv.micro_idx = micro_idx;
+    msg->payload.rdv.length = length;
+    msg->payload.rdv.collective = desc->scope.collective;
+    msg->payload.rdv.phase = desc->scope.phase;
+}
+
+static inline int pg_validate_eager_payload(const struct pg_progress_event *ev,
+                                            const struct pg_ring_step_desc *desc,
+                                            uint32_t expected_micro,
+                                            uint32_t num_recv_micros,
+                                            size_t chunk_size) {
+    if (expected_micro >= num_recv_micros) return PG_ERR_RDMA;
+
+    size_t offset = (size_t)expected_micro * chunk_size;
+    size_t expected_len = desc->recv_bytes - offset;
+    if (expected_len > chunk_size) expected_len = chunk_size;
+
+    if (ev->msg.payload.rdv.micro_idx != expected_micro ||
+        ev->msg.payload.rdv.length != expected_len ||
+        ev->eager_len < PG_CTRL_MSG_LEN + expected_len) {
+        return PG_ERR_RDMA;
+    }
+    return PG_SUCCESS;
+}
+
 /* Eager Payload Ring Step Transfer Engine */
 static int pg_ring_step_transfer_eager(struct pg_context *ctx, const struct pg_ring_step_desc *desc) {
     size_t chunk_size = ctx->pipeline_chunk < PG_EAGER_BUF_SIZE ? ctx->pipeline_chunk : PG_EAGER_BUF_SIZE;
@@ -1510,7 +1441,17 @@ static int pg_ring_step_transfer_eager(struct pg_context *ctx, const struct pg_r
     while (!send_done || !recv_done) {
         /* 1. Pop any pending eager payloads for this recv_tag */
         struct pg_progress_event peager;
-        while (!recv_done && pg_progress_pop_pending(ctx, PG_QP_DIR_FROM_PREV, PG_CTRL_MSG_EAGER_PAYLOAD, desc->recv_tag, &peager)) {
+        while (!recv_done) {
+            struct pg_transfer_key recv_key = pg_transfer_key_for(
+                desc, desc->recv_tag, eager_recv_micros, 1);
+            if (!pg_progress_pop_pending(
+                    ctx, PG_QP_DIR_FROM_PREV, PG_CTRL_MSG_EAGER_PAYLOAD,
+                    desc->recv_tag, &recv_key, &peager)) {
+                break;
+            }
+            int vrc = pg_validate_eager_payload(&peager, desc, eager_recv_micros,
+                                                num_recv_micros, chunk_size);
+            if (vrc != PG_SUCCESS) return vrc;
             uint32_t k = peager.msg.payload.rdv.micro_idx;
             uint32_t micro_len = peager.msg.payload.rdv.length;
             size_t offset = (size_t)k * chunk_size;
@@ -1539,14 +1480,9 @@ static int pg_ring_step_transfer_eager(struct pg_context *ctx, const struct pg_r
             void *local_src = (char *)desc->send_buf + offset;
 
             struct pg_ctrl_msg ehdr;
-            memset(&ehdr, 0, sizeof(ehdr));
-            ehdr.tag = PG_CTRL_TAG;
-            ehdr.type = PG_CTRL_MSG_EAGER_PAYLOAD;
-            ehdr.sender_rank = (uint16_t)ctx->rank;
-            ehdr.seq = desc->step_idx + 1;
-            ehdr.payload.rdv.seg_idx = desc->send_tag;
-            ehdr.payload.rdv.micro_idx = k;
-            ehdr.payload.rdv.length = (uint32_t)micro_len;
+            pg_init_transfer_msg(&ehdr, ctx, PG_CTRL_MSG_EAGER_PAYLOAD,
+                                 desc, desc->send_tag, k,
+                                 (uint32_t)micro_len);
 
             uint32_t slot = (uint32_t)(desc->step_idx * (num_send_micros > 0 ? num_send_micros : 1) + k);
             int rc = pg_post_eager_send(ctx, PG_QP_DIR_TO_NEXT, &ehdr, local_src,
@@ -1581,8 +1517,15 @@ static int pg_ring_step_transfer_eager(struct pg_context *ctx, const struct pg_r
 
                 case PG_WR_TYPE_RECV_CTRL: {
                     if (ev.qp_dir == PG_QP_DIR_FROM_PREV) {
-                        if (ev.msg.tag == PG_CTRL_TAG && ev.msg.type == PG_CTRL_MSG_EAGER_PAYLOAD &&
-                            ev.msg.payload.rdv.seg_idx == desc->recv_tag) {
+                        struct pg_transfer_key live_key = pg_transfer_key_for(
+                            desc, desc->recv_tag, eager_recv_micros, 1);
+                        if (ev.msg.tag == PG_CTRL_TAG &&
+                            pg_ctrl_msg_matches(&ev.msg, PG_CTRL_MSG_EAGER_PAYLOAD,
+                                                desc->recv_tag, &live_key)) {
+                            int vrc = pg_validate_eager_payload(
+                                &ev, desc, eager_recv_micros,
+                                num_recv_micros, chunk_size);
+                            if (vrc != PG_SUCCESS) return vrc;
                             uint32_t k = ev.msg.payload.rdv.micro_idx;
                             uint32_t micro_len = ev.msg.payload.rdv.length;
                             size_t offset = (size_t)k * chunk_size;
@@ -1603,16 +1546,21 @@ static int pg_ring_step_transfer_eager(struct pg_context *ctx, const struct pg_r
                                 recv_done = 1;
                             }
                         } else {
-                            pg_progress_buffer_unexpected(ctx, &ev);
+                            int brc = pg_progress_buffer_unexpected(ctx, &ev);
+                            if (brc != PG_SUCCESS) return brc;
                         }
                     } else {
-                        pg_progress_buffer_unexpected(ctx, &ev);
+                        int brc = pg_progress_buffer_unexpected(ctx, &ev);
+                        if (brc != PG_SUCCESS) return brc;
                     }
                     break;
                 }
 
                 default:
-                    pg_progress_buffer_unexpected(ctx, &ev);
+                    {
+                        int brc = pg_progress_buffer_unexpected(ctx, &ev);
+                        if (brc != PG_SUCCESS) return brc;
+                    }
                     break;
             }
         }
@@ -1669,13 +1617,9 @@ static int pg_ring_step_transfer_rdv(struct pg_context *ctx, const struct pg_rin
     /* Post RTS to next rank on qp_to_next if we have data to send */
     if (num_send_micros > 0) {
         struct pg_ctrl_msg rts_msg;
-        memset(&rts_msg, 0, sizeof(rts_msg));
-        rts_msg.tag = PG_CTRL_TAG;
-        rts_msg.type = PG_CTRL_MSG_RTS;
-        rts_msg.sender_rank = (uint16_t)ctx->rank;
-        rts_msg.seq = desc->step_idx + 1;
-        rts_msg.payload.rdv.seg_idx = desc->send_tag;
-        rts_msg.payload.rdv.length = (uint32_t)desc->send_bytes;
+        pg_init_transfer_msg(&rts_msg, ctx, PG_CTRL_MSG_RTS, desc,
+                             desc->send_tag, 0,
+                             (uint32_t)desc->send_bytes);
 
         int rc = pg_post_ctrl_send(ctx, PG_QP_DIR_TO_NEXT, &rts_msg);
         if (rc != PG_SUCCESS) {
@@ -1690,17 +1634,22 @@ static int pg_ring_step_transfer_rdv(struct pg_context *ctx, const struct pg_rin
     while (!send_done || !recv_done) {
         /* 1. Check pending RTS messages from prev */
         struct pg_progress_event pmsg;
-        if (num_recv_micros > 0 && pg_progress_pop_pending(ctx, PG_QP_DIR_FROM_PREV, PG_CTRL_MSG_RTS, desc->recv_tag, &pmsg)) {
+        struct pg_transfer_key recv_key = pg_transfer_key_for(
+            desc, desc->recv_tag, 0, 0);
+        struct pg_transfer_key send_key = pg_transfer_key_for(
+            desc, desc->send_tag, 0, 0);
+        if (num_recv_micros > 0 && pg_progress_pop_pending(
+                ctx, PG_QP_DIR_FROM_PREV, PG_CTRL_MSG_RTS,
+                desc->recv_tag, &recv_key, &pmsg)) {
+            if (pmsg.msg.payload.rdv.length != desc->recv_bytes) {
+                return PG_ERR_RDMA;
+            }
             struct pg_ctrl_msg cts_msg;
-            memset(&cts_msg, 0, sizeof(cts_msg));
-            cts_msg.tag = PG_CTRL_TAG;
-            cts_msg.type = PG_CTRL_MSG_CTS;
-            cts_msg.sender_rank = (uint16_t)ctx->rank;
-            cts_msg.seq = pmsg.msg.seq;
+            pg_init_transfer_msg(&cts_msg, ctx, PG_CTRL_MSG_CTS, desc,
+                                 desc->recv_tag, 0,
+                                 (uint32_t)desc->recv_bytes);
             cts_msg.payload.rdv.remote_addr = (uint64_t)(uintptr_t)desc->recv_target_addr;
             cts_msg.payload.rdv.rkey = desc->recv_rkey;
-            cts_msg.payload.rdv.seg_idx = pmsg.msg.payload.rdv.seg_idx;
-            cts_msg.payload.rdv.length = pmsg.msg.payload.rdv.length;
 
             int rc = pg_post_ctrl_send(ctx, PG_QP_DIR_FROM_PREV, &cts_msg);
             if (rc != PG_SUCCESS) {
@@ -1711,9 +1660,14 @@ static int pg_ring_step_transfer_rdv(struct pg_context *ctx, const struct pg_rin
         }
 
         /* 2. Check pending DATA_DONE messages from prev */
-        while (!recv_done && pg_progress_pop_pending(ctx, PG_QP_DIR_FROM_PREV, PG_CTRL_MSG_DATA_DONE, desc->recv_tag, &pmsg)) {
+        while (!recv_done && pg_progress_pop_pending(
+                   ctx, PG_QP_DIR_FROM_PREV, PG_CTRL_MSG_DATA_DONE,
+                   desc->recv_tag, &recv_key, &pmsg)) {
             uint32_t target_micros = pmsg.msg.payload.rdv.micro_idx;
-            if (target_micros > num_recv_micros) target_micros = num_recv_micros;
+            if (pmsg.msg.payload.rdv.length != desc->recv_bytes ||
+                target_micros > num_recv_micros) {
+                return PG_ERR_RDMA;
+            }
             while (data_done_recv_micros < target_micros) {
                 uint32_t k = data_done_recv_micros;
                 size_t offset = (size_t)k * chunk_size;
@@ -1734,7 +1688,13 @@ static int pg_ring_step_transfer_rdv(struct pg_context *ctx, const struct pg_rin
         }
 
         /* 3. Check pending CTS messages from next */
-        if (!cts_received && pg_progress_pop_pending(ctx, PG_QP_DIR_TO_NEXT, PG_CTRL_MSG_CTS, desc->send_tag, &pmsg)) {
+        if (!cts_received && pg_progress_pop_pending(
+                ctx, PG_QP_DIR_TO_NEXT, PG_CTRL_MSG_CTS,
+                desc->send_tag, &send_key, &pmsg)) {
+            if (pmsg.msg.payload.rdv.length != desc->send_bytes ||
+                pmsg.msg.payload.rdv.remote_addr == 0) {
+                return PG_ERR_RDMA;
+            }
             cts_received = 1;
             remote_target_addr = pmsg.msg.payload.rdv.remote_addr;
             remote_target_rkey = pmsg.msg.payload.rdv.rkey;
@@ -1802,33 +1762,42 @@ static int pg_ring_step_transfer_rdv(struct pg_context *ctx, const struct pg_rin
                         return PG_ERR_RDMA;
                     }
 
-                    if (ev.msg.type == PG_CTRL_MSG_RTS && ev.qp_dir == PG_QP_DIR_FROM_PREV &&
-                        ev.msg.payload.rdv.seg_idx == desc->recv_tag && num_recv_micros > 0) {
+                    if (ev.qp_dir == PG_QP_DIR_FROM_PREV && num_recv_micros > 0 &&
+                        pg_ctrl_msg_matches(&ev.msg, PG_CTRL_MSG_RTS,
+                                            desc->recv_tag, &recv_key)) {
+                        if (ev.msg.payload.rdv.length != desc->recv_bytes) {
+                            return PG_ERR_RDMA;
+                        }
                         struct pg_ctrl_msg cts_msg;
-                        memset(&cts_msg, 0, sizeof(cts_msg));
-                        cts_msg.tag = PG_CTRL_TAG;
-                        cts_msg.type = PG_CTRL_MSG_CTS;
-                        cts_msg.sender_rank = (uint16_t)ctx->rank;
-                        cts_msg.seq = ev.msg.seq;
+                        pg_init_transfer_msg(&cts_msg, ctx, PG_CTRL_MSG_CTS,
+                                             desc, desc->recv_tag, 0,
+                                             (uint32_t)desc->recv_bytes);
                         cts_msg.payload.rdv.remote_addr = (uint64_t)(uintptr_t)desc->recv_target_addr;
                         cts_msg.payload.rdv.rkey = desc->recv_rkey;
-                        cts_msg.payload.rdv.seg_idx = ev.msg.payload.rdv.seg_idx;
-                        cts_msg.payload.rdv.length = ev.msg.payload.rdv.length;
 
                         rc = pg_post_ctrl_send(ctx, PG_QP_DIR_FROM_PREV, &cts_msg);
                         if (rc != PG_SUCCESS) {
                             fprintf(stderr, "[pg_transfer] Rank %d failed to send CTS\n", ctx->rank);
                             return rc;
                         }
-                    } else if (ev.msg.type == PG_CTRL_MSG_CTS && ev.qp_dir == PG_QP_DIR_TO_NEXT &&
-                               ev.msg.payload.rdv.seg_idx == desc->send_tag && !cts_received) {
+                    } else if (ev.qp_dir == PG_QP_DIR_TO_NEXT && !cts_received &&
+                               pg_ctrl_msg_matches(&ev.msg, PG_CTRL_MSG_CTS,
+                                                   desc->send_tag, &send_key)) {
+                        if (ev.msg.payload.rdv.length != desc->send_bytes ||
+                            ev.msg.payload.rdv.remote_addr == 0) {
+                            return PG_ERR_RDMA;
+                        }
                         cts_received = 1;
                         remote_target_addr = ev.msg.payload.rdv.remote_addr;
                         remote_target_rkey = ev.msg.payload.rdv.rkey;
-                    } else if (ev.msg.type == PG_CTRL_MSG_DATA_DONE && ev.qp_dir == PG_QP_DIR_FROM_PREV &&
-                               ev.msg.payload.rdv.seg_idx == desc->recv_tag && !recv_done) {
+                    } else if (ev.qp_dir == PG_QP_DIR_FROM_PREV && !recv_done &&
+                               pg_ctrl_msg_matches(&ev.msg, PG_CTRL_MSG_DATA_DONE,
+                                                   desc->recv_tag, &recv_key)) {
                         uint32_t target_micros = ev.msg.payload.rdv.micro_idx;
-                        if (target_micros > num_recv_micros) target_micros = num_recv_micros;
+                        if (ev.msg.payload.rdv.length != desc->recv_bytes ||
+                            target_micros > num_recv_micros) {
+                            return PG_ERR_RDMA;
+                        }
                         while (data_done_recv_micros < target_micros) {
                             uint32_t k = data_done_recv_micros;
                             size_t offset = (size_t)k * chunk_size;
@@ -1846,7 +1815,8 @@ static int pg_ring_step_transfer_rdv(struct pg_context *ctx, const struct pg_rin
                             recv_done = 1;
                         }
                     } else {
-                        pg_progress_buffer_unexpected(ctx, &ev);
+                        int brc = pg_progress_buffer_unexpected(ctx, &ev);
+                        if (brc != PG_SUCCESS) return brc;
                     }
                     break;
                 }
@@ -1860,14 +1830,10 @@ static int pg_ring_step_transfer_rdv(struct pg_context *ctx, const struct pg_rin
 
                         if (rdma_completed_micros == num_send_micros && data_done_sent_micros < num_send_micros) {
                             struct pg_ctrl_msg done_msg;
-                            memset(&done_msg, 0, sizeof(done_msg));
-                            done_msg.tag = PG_CTRL_TAG;
-                            done_msg.type = PG_CTRL_MSG_DATA_DONE;
-                            done_msg.sender_rank = (uint16_t)ctx->rank;
-                            done_msg.seq = desc->step_idx + 1;
-                            done_msg.payload.rdv.seg_idx = desc->send_tag;
-                            done_msg.payload.rdv.micro_idx = num_send_micros;
-                            done_msg.payload.rdv.length = (uint32_t)desc->send_bytes;
+                            pg_init_transfer_msg(&done_msg, ctx,
+                                                 PG_CTRL_MSG_DATA_DONE, desc,
+                                                 desc->send_tag, num_send_micros,
+                                                 (uint32_t)desc->send_bytes);
 
                             rc = pg_post_ctrl_send(ctx, PG_QP_DIR_TO_NEXT, &done_msg);
                             if (rc != PG_SUCCESS) {
@@ -1878,14 +1844,11 @@ static int pg_ring_step_transfer_rdv(struct pg_context *ctx, const struct pg_rin
                             data_done_sent_count++;
                         } else if (rdma_completed_micros > data_done_sent_micros) {
                             struct pg_ctrl_msg done_msg;
-                            memset(&done_msg, 0, sizeof(done_msg));
-                            done_msg.tag = PG_CTRL_TAG;
-                            done_msg.type = PG_CTRL_MSG_DATA_DONE;
-                            done_msg.sender_rank = (uint16_t)ctx->rank;
-                            done_msg.seq = desc->step_idx + 1;
-                            done_msg.payload.rdv.seg_idx = desc->send_tag;
-                            done_msg.payload.rdv.micro_idx = rdma_completed_micros;
-                            done_msg.payload.rdv.length = (uint32_t)desc->send_bytes;
+                            pg_init_transfer_msg(&done_msg, ctx,
+                                                 PG_CTRL_MSG_DATA_DONE, desc,
+                                                 desc->send_tag,
+                                                 rdma_completed_micros,
+                                                 (uint32_t)desc->send_bytes);
 
                             rc = pg_post_ctrl_send(ctx, PG_QP_DIR_TO_NEXT, &done_msg);
                             if (rc != PG_SUCCESS) {
@@ -1971,6 +1934,16 @@ static inline int pg_validate_collective(const void *handle, const void *sendbuf
     return PG_SUCCESS;
 }
 
+static inline int pg_ranges_overlap(const void *lhs, size_t lhs_bytes,
+                                    const void *rhs, size_t rhs_bytes) {
+    uintptr_t lhs_start = (uintptr_t)lhs;
+    uintptr_t rhs_start = (uintptr_t)rhs;
+
+    if (lhs_bytes == 0 || rhs_bytes == 0) return 0;
+    if (lhs_start <= rhs_start) return (rhs_start - lhs_start) < lhs_bytes;
+    return (lhs_start - rhs_start) < rhs_bytes;
+}
+
 static inline int pg_validate_op(OPERATION op) {
     if (__builtin_expect(op != PG_SUM && op != PG_MIN && op != PG_MAX && op != PG_PROD, 0)) {
         return PG_ERR_UNSUPPORTED;
@@ -1992,21 +1965,39 @@ static inline int pg_single_rank_bypass(struct pg_context *ctx, void *sendbuf, v
     return 0;
 }
 
-int pg_reduce_scatter(void *sendbuf, void *recvbuf, int count,
-                      DATATYPE datatype, OPERATION op,
-                      void *pg_handle) {
-    int vrc = pg_validate_collective(pg_handle, sendbuf, recvbuf, count, datatype);
-    if (vrc != PG_SUCCESS) return vrc;
-    vrc = pg_validate_op(op);
-    if (vrc != PG_SUCCESS) return vrc;
-    struct pg_context *ctx = (struct pg_context *)pg_handle;
+static inline struct pg_collective_scope
+pg_begin_collective(struct pg_context *ctx, uint16_t collective, uint16_t phase) {
+    ctx->next_collective_epoch++;
+    if (ctx->next_collective_epoch == 0) ctx->next_collective_epoch++;
+
+    struct pg_collective_scope scope = {
+        .epoch = ctx->next_collective_epoch,
+        .collective = collective,
+        .phase = phase
+    };
+    return scope;
+}
+
+static inline void pg_test_delay_after_reduce_scatter(const struct pg_context *ctx) {
+#ifdef PG_TEST_HOOKS
+    const char *rank_env = getenv("PG_TEST_DELAY_RANK");
+    const char *usec_env = getenv("PG_TEST_DELAY_AFTER_RS_US");
+    if (rank_env && usec_env && atoi(rank_env) == ctx->rank) {
+        unsigned long usec = strtoul(usec_env, NULL, 10);
+        if (usec > 0) usleep((useconds_t)usec);
+    }
+#else
+    (void)ctx;
+#endif
+}
+
+static int pg_reduce_scatter_impl(void *sendbuf, void *recvbuf, int count,
+                                  DATATYPE datatype, OPERATION op,
+                                  struct pg_context *ctx,
+                                  const struct pg_collective_scope *scope) {
 
     size_t elem_size = pg_get_datatype_size(datatype);
     size_t total_bytes = (size_t)count * elem_size;
-
-    if (pg_single_rank_bypass(ctx, sendbuf, recvbuf, total_bytes)) {
-        return PG_SUCCESS;
-    }
 
     /* Maximum segment byte size across ranks */
     int max_seg_elems = pg_get_seg_count(0, count, ctx->size);
@@ -2051,6 +2042,7 @@ int pg_reduce_scatter(void *sendbuf, void *recvbuf, int count,
 
         struct pg_ring_step_desc desc;
         memset(&desc, 0, sizeof(desc));
+        desc.scope = *scope;
         desc.step_idx = (uint32_t)step;
         desc.total_bytes = total_bytes;
         desc.send_tag = (uint32_t)send_seg;
@@ -2084,9 +2076,36 @@ int pg_reduce_scatter(void *sendbuf, void *recvbuf, int count,
     return PG_SUCCESS;
 }
 
+int pg_reduce_scatter(void *sendbuf, void *recvbuf, int count,
+                      DATATYPE datatype, OPERATION op,
+                      void *pg_handle) {
+    int vrc = pg_validate_collective(pg_handle, sendbuf, recvbuf, count, datatype);
+    if (vrc != PG_SUCCESS) return vrc;
+    vrc = pg_validate_op(op);
+    if (vrc != PG_SUCCESS) return vrc;
+    struct pg_context *ctx = (struct pg_context *)pg_handle;
+
+    size_t elem_size = pg_get_datatype_size(datatype);
+    size_t total_bytes = (size_t)count * elem_size;
+    size_t output_bytes = (size_t)pg_get_seg_count(ctx->rank, count, ctx->size) * elem_size;
+    if (pg_ranges_overlap(sendbuf, total_bytes, recvbuf, output_bytes)) {
+        return PG_ERR_INVAL;
+    }
+    if (pg_single_rank_bypass(ctx, sendbuf, recvbuf, total_bytes)) {
+        return PG_SUCCESS;
+    }
+
+    struct pg_collective_scope scope = pg_begin_collective(
+        ctx, PG_COLLECTIVE_REDUCE_SCATTER, PG_PHASE_REDUCE_SCATTER);
+    return pg_reduce_scatter_impl(sendbuf, recvbuf, count, datatype, op,
+                                  ctx, &scope);
+}
+
 /* Ring All-Gather Generalized Engine (Zero-Copy RDMA Write into final recvbuf with Multi-WR Batching) */
-int pg_ring_all_gather_generalized(struct pg_context *ctx, void *recvbuf, int count, DATATYPE datatype) {
-    if (!ctx || !recvbuf || count <= 0) return PG_ERR_INVAL;
+int pg_ring_all_gather_generalized(struct pg_context *ctx, void *recvbuf, int count,
+                                   DATATYPE datatype,
+                                   const struct pg_collective_scope *scope) {
+    if (!ctx || !recvbuf || count <= 0 || !scope) return PG_ERR_INVAL;
 
     if (ctx->size == 1) return PG_SUCCESS;
 
@@ -2115,6 +2134,7 @@ int pg_ring_all_gather_generalized(struct pg_context *ctx, void *recvbuf, int co
 
         struct pg_ring_step_desc desc;
         memset(&desc, 0, sizeof(desc));
+        desc.scope = *scope;
         desc.step_idx = (uint32_t)step;
         desc.total_bytes = total_bytes;
         desc.send_tag = (uint32_t)send_origin;
@@ -2148,6 +2168,13 @@ int pg_all_gather(void *sendbuf, void *recvbuf, int count,
 
     size_t elem_size = pg_get_datatype_size(datatype);
     size_t segment_bytes = (size_t)count * elem_size;
+    size_t total_bytes = segment_bytes * (size_t)ctx->size;
+    void *local_slice = (char *)recvbuf + (size_t)ctx->rank * segment_bytes;
+
+    if (sendbuf != local_slice &&
+        pg_ranges_overlap(sendbuf, segment_bytes, recvbuf, total_bytes)) {
+        return PG_ERR_INVAL;
+    }
 
     if (pg_single_rank_bypass(ctx, sendbuf, recvbuf, segment_bytes)) {
         return PG_SUCCESS;
@@ -2160,7 +2187,10 @@ int pg_all_gather(void *sendbuf, void *recvbuf, int count,
     }
 
     /* Run ring zero-copy RDMA all-gather */
-    return pg_ring_all_gather_generalized(ctx, recvbuf, count * ctx->size, datatype);
+    struct pg_collective_scope scope = pg_begin_collective(
+        ctx, PG_COLLECTIVE_ALL_GATHER, PG_PHASE_ALL_GATHER);
+    return pg_ring_all_gather_generalized(ctx, recvbuf, count * ctx->size,
+                                          datatype, &scope);
 }
 
 int pg_all_reduce(void *sendbuf, void *recvbuf, int count,
@@ -2175,32 +2205,34 @@ int pg_all_reduce(void *sendbuf, void *recvbuf, int count,
     size_t elem_size = pg_get_datatype_size(datatype);
     size_t total_bytes = (size_t)count * elem_size;
 
+    if (pg_ranges_overlap(sendbuf, total_bytes, recvbuf, total_bytes)) {
+        return PG_ERR_INVAL;
+    }
+
     if (pg_single_rank_bypass(ctx, sendbuf, recvbuf, total_bytes)) {
         return PG_SUCCESS;
     }
+
+    struct pg_collective_scope scope = pg_begin_collective(
+        ctx, PG_COLLECTIVE_ALL_REDUCE, PG_PHASE_REDUCE_SCATTER);
 
     /* Offset for local owned slice within recvbuf */
     size_t my_seg_offset = pg_get_seg_offset_bytes(ctx->rank, count, ctx->size, elem_size);
 
     /* Phase 1: Reduce-Scatter into local owned slice recvbuf[rank] */
-    int rc = pg_reduce_scatter(sendbuf, (char *)recvbuf + my_seg_offset,
-                               count, datatype, op, pg_handle);
+    int rc = pg_reduce_scatter_impl(sendbuf, (char *)recvbuf + my_seg_offset,
+                                    count, datatype, op, ctx, &scope);
     if (rc != PG_SUCCESS) {
         fprintf(stderr, "[pg_all_reduce] Rank %d Reduce-Scatter phase failed with code %d\n",
                 ctx->rank, rc);
         return rc;
     }
 
-    /* Phase 2: Distributed barrier before All-Gather phase (ensures phase synchronization and race-freedom across rapid collective iterations) */
-    rc = pg_barrier(pg_handle);
-    if (rc != PG_SUCCESS) {
-        fprintf(stderr, "[pg_all_reduce] Rank %d intermediate barrier failed with code %d\n",
-                ctx->rank, rc);
-        return rc;
-    }
+    pg_test_delay_after_reduce_scatter(ctx);
 
-    /* Phase 3: Direct All-Gather distributing reduced segments across ring */
-    rc = pg_ring_all_gather_generalized(ctx, recvbuf, count, datatype);
+    /* Phase 2: Direct All-Gather distributing reduced segments across ring */
+    scope.phase = PG_PHASE_ALL_GATHER;
+    rc = pg_ring_all_gather_generalized(ctx, recvbuf, count, datatype, &scope);
     if (rc != PG_SUCCESS) {
         fprintf(stderr, "[pg_all_reduce] Rank %d All-Gather phase failed with code %d\n",
                 ctx->rank, rc);

@@ -89,6 +89,9 @@ int connect_process_group(char *servername, void **pg_handle);
  * Supports arbitrary (non-divisible) buffer counts via MPI-style (Q+1)/Q remainder
  * distribution. Employs pipelined micro-chunks (adaptive 64 KiB / 256 KiB) to overlap
  * network data transfer with SSE4.2 SIMD compute kernels.
+ * @p sendbuf and @p recvbuf must refer to disjoint ranges. In the default
+ * WORKBUFFER=inplace build, @p sendbuf is mutable scratch and is modified;
+ * WORKBUFFER=safe preserves it.
  *
  * @param sendbuf   Pointer to local input array (count elements).
  * @param recvbuf   Pointer to output buffer to receive this rank's reduced segment slice.
@@ -109,6 +112,8 @@ int pg_reduce_scatter(void *sendbuf, void *recvbuf, int count,
  * rank finishes with the full concatenated result (count * size elements) in @p recvbuf.
  * Utilizes zero-copy direct RDMA Writes into remote target buffers for Rendezvous mode,
  * or 2-SGE scatter-gather sends for sub-threshold Eager mode.
+ * The two ranges must be disjoint unless @p sendbuf points exactly at this rank's
+ * owned slice inside @p recvbuf. Other full or partial overlap is invalid.
  *
  * @param sendbuf   Pointer to local contribution (count elements).
  * @param recvbuf   Pointer to output buffer (count * size elements).
@@ -125,10 +130,13 @@ int pg_all_gather(void *sendbuf, void *recvbuf, int count,
  * @brief Performs a full global All-Reduce collective across all ranks.
  *
  * Reduces @p count elements from @p sendbuf using operation @p op, and places the
- * full reduced result into @p recvbuf on all ranks. Implemented as a three-phase pipeline:
- *   1. Reduce-Scatter into local owned segment recvbuf[rank].
- *   2. Distributed 3-phase ring barrier (ensures phase synchronization and race-freedom).
- *   3. Direct All-Gather distributing reduced segments across the ring.
+ * full reduced result into @p recvbuf on all ranks. Reduce-Scatter and All-Gather
+ * hand off without a global barrier: every transfer is identified by collective
+ * epoch, phase, step, segment, and micro-chunk, so early traffic remains pending
+ * until its exact phase becomes active.
+ * @p sendbuf and @p recvbuf must refer to disjoint ranges. In the default
+ * WORKBUFFER=inplace build, @p sendbuf is mutable scratch and is modified;
+ * WORKBUFFER=safe preserves it.
  *
  * @param sendbuf   Pointer to local input array (count elements).
  * @param recvbuf   Pointer to output buffer (count elements).
@@ -145,8 +153,8 @@ int pg_all_reduce(void *sendbuf, void *recvbuf, int count,
 /**
  * @brief Closes the process group and releases all allocated Verbs and memory resources.
  *
- * In reverse order: destroys Queue Pairs, Completion Queue, deregisters MR cache and
- * internal staging/work buffers, deallocates Protection Domain, and closes InfiniBand device.
+ * Every rank must call this after its final collective. A symmetric neighbor ping
+ * quiesces each ring edge before local Verbs resources are destroyed.
  *
  * @param pg_handle Opaque process group handle to destroy.
  * @return PG_SUCCESS on success, or negative PG_ERR_* code on failure.

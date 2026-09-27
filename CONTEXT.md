@@ -9,8 +9,17 @@ This document establishes the ubiquitous language, architectural seams, and doma
 ### Process Group
 The logical set of participating processes (ranks $0 \dots N-1$) connected in a deterministic ring topology. Each rank communicates directly with its two immediate ring neighbors: `next_rank = (rank + 1) % size` and `prev_rank = (rank - 1 + size) % size`.
 
+### Transfer Identity
+The unique identity of collective traffic across an invocation, phase, ring step, segment, and micro-chunk. Traffic with a different identity cannot satisfy the active transfer.
+
+### Phase Handoff
+The transition from Reduce-Scatter to All-Gather. It is receiver-gated: early traffic waits until its transfer identity becomes active rather than requiring all ranks to rendezvous globally.
+
+### Collective Buffer Contract
+The ownership and overlap rules for a collective's input and output ranges. Reduce operations require disjoint input and output, while All-Gather additionally permits its exact local output slice as the input.
+
 ### Progress Engine (Seam #1)
-The deep module responsible for driving Verbs Completion Queue (`ibv_cq`) polling, `wr_id` dispatch, unexpected control message queueing (`pending_q`) with pre-allocated bounce buffers, direct zero-copy dispatch to pre-posted receive slots, and deferred receive buffer pool replenishment (`pg_repost_recv_slot`). It presents a zero-cost event interface and declarative waiting primitives (`pg_progress_wait_type`, `pg_progress_wait_msg`, `pg_progress_wait_send_recv`) to higher-level collective routines. It includes an explicit compiler memory barrier (`asm volatile("" ::: "memory");`) to guarantee strict DMA visibility.
+The deep module responsible for driving Verbs Completion Queue (`ibv_cq`) polling, `wr_id` dispatch, unexpected control message queueing (`pending_q`) with pre-allocated bounce buffers, direct zero-copy dispatch to pre-posted receive slots, and deferred receive buffer pool replenishment (`pg_repost_recv_slot`). It presents a zero-cost event interface and a combined send/receive wait primitive to higher-level routines. It includes an explicit compiler memory barrier (`asm volatile("" ::: "memory");`) to guarantee strict DMA visibility.
 
 ### Ring Step Transfer (Seam #2)
 A single phase of pipelined data movement between adjacent ring neighbors during a collective algorithm. In an $N$-rank ring, collectives execute $N-1$ step transfers where each rank concurrently transmits an outbound segment to `next_rank` while receiving an inbound segment from `prev_rank`. Protocol selection (Eager Send/Recv with Direct Zero-Copy CPU receive vs Rendezvous RDMA Write) is encapsulated behind `pg_ring_step_transfer(ctx, desc)`.
@@ -30,7 +39,7 @@ An internal staging area used in safe mode (`WORKBUFFER=safe`) to perform out-of
 ### Collective Operations
 - **Reduce-Scatter**: Reduces an array of data across all processes and distributes the reduced slices across the ranks.
 - **All-Gather**: Gathers distributed slices from all ranks so that every rank ends up with the complete contiguous array (zero-copy RDMA Write).
-- **All-Reduce**: Performs a full global reduction and distributes the complete reduced result to all ranks (implemented as Reduce-Scatter &rarr; Three-Phase Distributed Barrier &rarr; All-Gather, guaranteeing phase synchronization and race-freedom across rapid back-to-back collective iterations).
+- **All-Reduce**: Performs a full global reduction and distributes the complete reduced result to all ranks through a receiver-gated Reduce-Scatter &rarr; All-Gather phase handoff.
 
 ---
 
@@ -41,16 +50,16 @@ An internal staging area used in safe mode (`WORKBUFFER=safe`) to perform out-of
 3. **Module 3: Memory Registration & Staging Cache**: Lazy MR registration cache (`pg_mr_cache`), grow-only staging buffer allocation, 2 MB hugepage alignment (`PG_HUGEPAGE_ALIGN_BYTES`), and safe work buffer lifecycle.
 4. **Module 4: Progress Engine & CQ Dispatch**: Unified CQ polling, `wr_id` bit-packing/decoding, direct zero-copy eager CPU receive, deferred receive slot replenishment, pre-allocated unexpected message buffers, and DMA memory barrier. Implemented privately in `pg.c` (encapsulating all CQ event polling behind the Progress Seam with zero header bloat).
 5. **Module 5: SSE4.2 Vector Reduction Compute Kernels**: 128-bit SIMD reduction kernels with 4x loop unrolling across 12 datatype $\times$ operation combinations on Intel Nehalem CPUs.
-6. **Module 6: Ring Step Transfer & Collectives Orchestration**: Pipelined Rendezvous / Eager step transmission (`pg_ring_step_transfer`), 3-phase distributed barrier synchronization, and `pg_reduce_scatter`, `pg_all_gather`, `pg_all_reduce` API implementations.
+6. **Module 6: Ring Step Transfer & Collectives Orchestration**: Pipelined Rendezvous / Eager step transmission (`pg_ring_step_transfer`), epoch-gated phase handoff, and `pg_reduce_scatter`, `pg_all_gather`, `pg_all_reduce` API implementations.
 
 ---
 
 ## Architectural Seams & Invariants
 
-1. **Progress Seam**: All CQ interactions, `wr_id` decoding, DMA memory barriers, and receive pool refills are strictly encapsulated inside the Progress Engine module (`pg.c`). Collective routines use declarative wait helpers (`pg_progress_wait_msg`, `pg_progress_wait_type`, `pg_progress_wait_send_recv`) and never interact directly with raw CQ polling.
+1. **Progress Seam**: All CQ interactions, `wr_id` decoding, DMA memory barriers, and receive pool refills are strictly encapsulated inside the Progress Engine module (`pg.c`). Collective routines never interact directly with raw CQ polling.
 2. **Transfer Seam**: Protocol selection (Eager Send/Recv with direct zero-copy CPU receive vs Rendezvous RDMA Write) is encapsulated behind the step transfer engine (`pg_ring_step_transfer`), keeping collective routines focused purely on segment permutation and compute kernels.
 3. **Memory Registration Invariant**: Application and staging memory are lazily registered in the MR cache and persist until `pg_close`, avoiding registration churn in the hot timed path.
-4. **Barrier Isolation Invariant**: Collective phases (Reduce-Scatter and All-Gather) are decoupled by an unconditional 3-phase distributed ring barrier (`COLLECT` $\to$ `RELEASE` $\to$ `ACK`), preventing faster ranks from lapping slower ranks during rapid back-to-back collective iterations. Unexpected subsequent-iteration traffic is preserved in `pending_q` rather than purged.
+4. **Transfer Identity Invariant**: Data-path traffic matches only its exact collective epoch, phase, step, segment, and micro-chunk. Future traffic remains pending, and Rendezvous destinations are advertised only when the matching receive phase is active.
 5. **Symmetric Micro-Chunk Invariant**: In non-divisible remainder distributions, all ranks derive protocol mode and chunk granularity from `total_bytes` rather than local segment size, preventing deadlocks from asymmetric micro-chunk boundaries.
 6. **Eager Flow Control & Slot Safety Invariant**: In Eager protocol transfers, the sender window is bounded to `PG_EAGER_WINDOW = 8` while the hardware receive queue depth is `PG_EAGER_POOL_DEPTH = 32`. Holding 1 receive slot active during direct zero-copy CPU reduction leaves $\ge 31$ slots in the RQ, guaranteeing the peer cannot overrun the receive queue while eliminating the intermediate memory copy.
 
@@ -64,4 +73,4 @@ An internal staging area used in safe mode (`WORKBUFFER=safe`) to perform out-of
 - [ADR-0004: SSE4.2 SIMD vector reduction and multi-WR batching](docs/adr/0004-simd-vectorization-and-wr-batching.md)
 - [ADR-0005: MPI remainder partitioning and ring step permutations](docs/adr/0005-mpi-remainder-and-ring-step-permutation.md)
 - [ADR-0006: Pipelined windowing and selective CQ signaling](docs/adr/0006-pipelined-windowing-and-selective-signaling.md)
-- [ADR-0007: Three-phase distributed ring barrier](docs/adr/0007-three-phase-distributed-barrier.md)
+- [ADR-0008: Epoch-gated barrier-free phase handoff](docs/adr/0008-epoch-gated-phase-handoff.md)
