@@ -12,7 +12,7 @@ We needed to establish the optimal crossover threshold empirically on the live 4
 ### 1. Bounded Eager Selection: 64 KiB per Segment
 `PG_EAGER_THRESHOLD = 64 KiB` bounds every pre-posted Eager receive slot and keeps protocol choice symmetric. On four ranks this selects Eager through a 256 KiB total tensor and Rendezvous above it.
 
-The full sweep on 2026-09-27 measured Eager at $16.0\,\mu\text{s}$ versus Rendezvous at $65.8\,\mu\text{s}$ for 64 B, and $189.6\,\mu\text{s}$ versus $202.6\,\mu\text{s}$ for 256 KiB. Pure Eager remained slightly faster through 8 MiB, with Rendezvous taking the lead at 16 MiB. The configured threshold is therefore a conservative receive-memory and flow-control bound, not the current empirical latency crossover.
+The full sweep on 2026-09-28 measured Eager at $18.8\,\mu\text{s}$ versus Rendezvous at $62.4\,\mu\text{s}$ for 64 B, and $198.2\,\mu\text{s}$ versus $218.2\,\mu\text{s}$ for 256 KiB. Results near the crossover were non-monotonic: Rendezvous won at 512 KiB, Eager at 1–4 MiB, and Rendezvous from 8 MiB onward. The configured threshold is therefore a conservative receive-memory and flow-control bound, not the current empirical latency crossover.
 
 ### 2. Protocol Modes
 We support three compilation modes via `Makefile MODE=<mode>`:
@@ -34,11 +34,11 @@ $$\text{max\_seg\_bytes} = \frac{\text{total\_bytes} + N - 1}{N}$$
 This derives from `desc->total_bytes`, ensuring all ranks make mathematically identical protocol decisions.
 
 ## Consequences
-- Small-message operations achieve $16.0\,\mu\text{s}$ Eager latency at 64 B in the 2026-09-27 four-node sweep.
-- At the configured 256 KiB four-rank tensor boundary, Eager measured $189.6\,\mu\text{s}$ versus $202.6\,\mu\text{s}$ for Rendezvous.
+- Small-message operations achieve $18.8\,\mu\text{s}$ Eager latency at 64 B in the 2026-09-28 four-node sweep.
+- At the configured 256 KiB four-rank tensor boundary, Eager measured $198.2\,\mu\text{s}$ versus $218.2\,\mu\text{s}$ for Rendezvous.
 - Pinned receive memory footprint slashed by **75%** (from 16.78 MiB to 4.19 MiB).
-- Large-message operations achieve peak link bandwidth without buffer copy bottlenecks (**22.42 Gbps** Rendezvous and **22.32 Gbps** AUTO at 1 GiB).
-- `MODE=auto` is conservative between 512 KiB and 8 MiB, where the pure Eager build was faster in the latest sweep; the threshold should be retuned separately if benchmark-optimal selection is required.
+- Large-message operations achieve peak link bandwidth without buffer copy bottlenecks (**22.23 Gbps** Rendezvous and **21.57 Gbps** AUTO at 1 GiB).
+- `MODE=auto` is conservative above 256 KiB; the threshold should be retuned separately if benchmark-optimal selection is required.
 - Guaranteed ring-wide symmetry across non-divisible remainder boundaries.
 
 ## References

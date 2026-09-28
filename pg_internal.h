@@ -133,67 +133,30 @@ static inline void pg_assemble_rdma_write_wr(struct ibv_send_wr *wr, struct ibv_
 #define PG_CTRL_MSG_DATA_DONE       5
 #define PG_CTRL_MSG_EAGER_PAYLOAD   6
 
-/* Collective and phase identity carried by every data-path message. */
-#define PG_COLLECTIVE_REDUCE_SCATTER 1
-#define PG_COLLECTIVE_ALL_GATHER     2
-#define PG_COLLECTIVE_ALL_REDUCE     3
-
-#define PG_PHASE_REDUCE_SCATTER      1
-#define PG_PHASE_ALL_GATHER          2
-
-struct pg_collective_scope {
-    uint64_t epoch;
-    uint16_t collective;
-    uint16_t phase;
-};
-
 /* 64-byte Control Message Structure */
 struct pg_ctrl_msg {
     uint32_t tag;           /* PG_CTRL_TAG (0x50474354) */
     uint16_t type;          /* PG_CTRL_MSG_* */
     uint16_t sender_rank;   /* Sender rank */
-    uint32_t seq;           /* Sequence number */
     union {
         struct {
             uint64_t remote_addr; /* Remote staging/recvbuf virtual address (Rendezvous protocol) */
-            uint64_t epoch;       /* Process-group-local collective invocation number */
             uint32_t rkey;        /* Remote memory key (Rendezvous protocol) */
             uint32_t seg_idx;     /* Ring segment index */
             uint32_t micro_idx;   /* Pipelined micro-chunk index */
             uint32_t length;      /* Payload byte length */
-            uint16_t collective;  /* PG_COLLECTIVE_* */
-            uint16_t phase;       /* PG_PHASE_* */
         } rdv;
-        uint8_t raw[48];          /* Reserved / padding to 64 bytes total */
+        uint8_t raw[56];          /* Reserved / padding to 64 bytes total */
     } payload;
 };
 
 _Static_assert(sizeof(struct pg_ctrl_msg) == PG_CTRL_MSG_LEN,
                "pg_ctrl_msg must remain exactly one control header");
 
-struct pg_transfer_key {
-    uint64_t epoch;
-    uint32_t step_seq;
-    uint32_t seg_idx;
-    uint32_t micro_idx;
-    uint16_t collective;
-    uint16_t phase;
-    int match_micro;
-};
-
 static inline int pg_ctrl_msg_matches(const struct pg_ctrl_msg *msg, int type,
-                                      uint32_t seg_idx,
-                                      const struct pg_transfer_key *key) {
+                                      uint32_t seg_idx) {
     if (!msg || msg->type != type) return 0;
-    if (seg_idx != (uint32_t)-1 && msg->payload.rdv.seg_idx != seg_idx) return 0;
-    if (!key) return 1;
-
-    return msg->payload.rdv.epoch == key->epoch &&
-           msg->payload.rdv.collective == key->collective &&
-           msg->payload.rdv.phase == key->phase &&
-           msg->seq == key->step_seq &&
-           msg->payload.rdv.seg_idx == key->seg_idx &&
-           (!key->match_micro || msg->payload.rdv.micro_idx == key->micro_idx);
+    return seg_idx == (uint32_t)-1 || msg->payload.rdv.seg_idx == seg_idx;
 }
 
 /* TCP QP Metadata exchanged during bootstrap */
@@ -248,7 +211,6 @@ struct pg_context {
     uint32_t batch_size;
     size_t eager_threshold;
     uint32_t eager_window;
-    uint64_t next_collective_epoch;
 
     /* InfiniBand Verbs Resources */
     struct ibv_context *ib_ctx;
@@ -349,7 +311,6 @@ static inline int pg_pending_push(struct pg_context *ctx, int qp_dir,
 
 static inline int pg_pending_pop_matching(struct pg_context *ctx, int qp_dir, int type,
                                           uint32_t seg_idx,
-                                          const struct pg_transfer_key *key,
                                           struct pg_ctrl_msg *out_msg,
                                           void *out_slot_buf,
                                           uint32_t *out_eager_len) {
@@ -357,35 +318,20 @@ static inline int pg_pending_pop_matching(struct pg_context *ctx, int qp_dir, in
     struct pg_pending_queue *q = &ctx->pending_q[qp_dir];
     if (q->count == 0) return 0;
 
-    for (int i = 0; i < q->count; i++) {
-        int ring_idx = (q->head + i) % PG_PENDING_QUEUE_MAX;
-        int slot = q->ring[ring_idx];
-        struct pg_pending_entry *entry = &q->pool[slot];
-        struct pg_ctrl_msg *m = &entry->msg;
+    int slot = q->ring[q->head];
+    struct pg_pending_entry *entry = &q->pool[slot];
+    struct pg_ctrl_msg *m = &entry->msg;
+    if (!pg_ctrl_msg_matches(m, type, seg_idx)) return 0;
 
-        if (pg_ctrl_msg_matches(m, type, seg_idx, key)) {
-            if (out_msg) *out_msg = *m;
-            if (out_eager_len) *out_eager_len = entry->eager_len;
-            if (out_slot_buf && entry->eager_len > 0 && entry->eager_buf) {
-                memcpy(out_slot_buf, entry->eager_buf, entry->eager_len);
-            }
-            entry->in_use = 0;
-
-            if (i == 0) {
-                q->head = (q->head + 1) % PG_PENDING_QUEUE_MAX;
-            } else {
-                for (int j = i; j < q->count - 1; j++) {
-                    int cur = (q->head + j) % PG_PENDING_QUEUE_MAX;
-                    int next = (q->head + j + 1) % PG_PENDING_QUEUE_MAX;
-                    q->ring[cur] = q->ring[next];
-                }
-                q->tail = (q->tail - 1 + PG_PENDING_QUEUE_MAX) % PG_PENDING_QUEUE_MAX;
-            }
-            q->count--;
-            return 1;
-        }
+    if (out_msg) *out_msg = *m;
+    if (out_eager_len) *out_eager_len = entry->eager_len;
+    if (out_slot_buf && entry->eager_len > 0 && entry->eager_buf) {
+        memcpy(out_slot_buf, entry->eager_buf, entry->eager_len);
     }
-    return 0;
+    entry->in_use = 0;
+    q->head = (q->head + 1) % PG_PENDING_QUEUE_MAX;
+    q->count--;
+    return 1;
 }
 
 /* Datatype Size Helper */
@@ -461,7 +407,6 @@ enum pg_chunk_action {
 };
 
 struct pg_ring_step_desc {
-    struct pg_collective_scope scope; /* Collective invocation and phase identity */
     uint32_t step_idx;          /* 0-indexed ring step */
     size_t total_bytes;         /* Total collective tensor size in bytes (uniform across ring) */
 
@@ -524,7 +469,6 @@ void pg_reduce_buffer(void *dest, const void *src, int count,
 
 /* Ring All-Gather Generalized Core Engine (Zero-Copy RDMA Write) */
 int pg_ring_all_gather_generalized(struct pg_context *ctx, void *recvbuf, int count,
-                                   DATATYPE datatype,
-                                   const struct pg_collective_scope *scope);
+                                   DATATYPE datatype);
 
 #endif /* PG_INTERNAL_H */

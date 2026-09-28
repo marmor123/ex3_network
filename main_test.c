@@ -835,7 +835,7 @@ int main(int argc, char **argv) {
 
     /* Run Pipelined All-Reduce Tests (PG_INT + PG_SUM) */
     printf("=================================================================\n");
-    printf("[PG All-Reduce] Testing Pipelined Ring All-Reduce (RS + epoch-gated AG)\n");
+    printf("[PG All-Reduce] Testing Pipelined Ring All-Reduce (RS + FIFO-gated AG)\n");
     printf("=================================================================\n");
 
     int ar_passed = 1;

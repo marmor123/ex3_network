@@ -28,7 +28,7 @@ In large-scale RDMA collectives (up to 1 GiB payloads), transferring entire ring
 
 ## Consequences
 - Full overlap of network transmission and SIMD reduction for all payload sizes $\ge 1\text{ MiB}$.
-- Sustained effective throughput reaching **21.82 Gbps** at 64 MiB with 64 KiB chunks and **22.42 Gbps** at 1 GiB in the 2026-09-27 four-node sweep.
+- Sustained effective throughput reaching **21.74 Gbps** at 64 MiB with 64 KiB chunks and **22.23 Gbps** at 1 GiB in the 2026-09-28 four-node sweep.
 - Narrow window configurations (e.g. `Window = 1` or `Window = 16`) run cleanly without credit exhaustion deadlocks.
 - Zero risk of micro-chunk granularity mismatch across remainder boundaries.
 

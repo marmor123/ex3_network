@@ -11,11 +11,11 @@
 This report documents the empirical performance characterization of the RDMA Ring Collective communication library across **Eager Send/Receive**, **Windowed Rendezvous RDMA Write**, and **Adaptive Auto** protocols on a physical 4-node InfiniBand cluster.
 
 ### Key Empirical Findings
-1. **Low-Latency Small Payloads**: Eager measured $16.0\,\mu\text{s}$ at 64 B versus $65.8\,\mu\text{s}$ for Rendezvous, a $4.1\times$ advantage from avoiding the RTS/CTS exchange.
-2. **Measured Crossover**: In the 2026-09-27 sweep, pure Eager remained faster through 8 MiB; Rendezvous became faster at 16 MiB and scaled to **22.42 Gbps** at 1 GiB.
-3. **Conservative AUTO Policy**: AUTO selects Eager only through a 64 KiB segment (256 KiB total on four ranks). It is therefore deliberately conservative from 512 KiB through 8 MiB rather than following the measured latency crossover.
-4. **Peak Effective Bandwidth**: AUTO reached **22.32 Gbps** at 1 GiB ($577.32\,\text{ms}$), within 0.5% of the explicit Rendezvous build.
-5. **Barrier-Free Harness**: Correctness tests run back-to-back without global fences. Each timed sample is preceded by a one-element All-Gather outside the timed region; the dedicated three-pass barrier protocol no longer exists.
+1. **Low-Latency Small Payloads**: Eager measured $18.8\,\mu\text{s}$ at 64 B versus $62.4\,\mu\text{s}$ for Rendezvous, a $3.3\times$ advantage from avoiding the RTS/CTS exchange.
+2. **Measured Crossover**: The 2026-09-28 sweep was mildly non-monotonic near the crossover: Rendezvous won at 512 KiB, Eager regained the lead from 1–4 MiB, and Rendezvous led from 8 MiB onward, reaching **22.23 Gbps** at 1 GiB.
+3. **Conservative AUTO Policy**: AUTO selects Eager only through a 64 KiB segment (256 KiB total on four ranks). The threshold remains a receive-memory bound rather than an attempt to follow a noisy empirical crossover.
+4. **Peak Effective Bandwidth**: AUTO reached **21.57 Gbps** at 1 GiB ($597.43\,\text{ms}$), 3.0% below the explicit Rendezvous build.
+5. **Ordered Barrier-Free Harness**: Correctness tests run back-to-back without global fences. Each timed sample is preceded by a one-element All-Gather outside the timed region; strict per-QP FIFO order replaces both the old barrier and explicit epoch/phase tags.
 
 ---
 
@@ -36,33 +36,33 @@ This report documents the empirical performance characterization of the RDMA Rin
 
 ## 3. Protocol Comparison Matrix (4-Node Ring Sweep)
 
-Measurements obtained on `mlx-stud-01..04` on 2026-09-27, performing global `pg_all_reduce` (`PG_INT`, `PG_SUM`) across 5 timed iterations per size. A one-element All-Gather aligns ranks before each sample and is outside the timed interval. These results are not directly comparable to older tables that used the removed three-pass barrier as the pre-sample synchronization mechanism.
+Measurements obtained on `mlx-stud-01..04` on 2026-09-28, performing global `pg_all_reduce` (`PG_INT`, `PG_SUM`) across 5 timed iterations per size. A one-element All-Gather aligns ranks before each sample and is outside the timed interval. These results are not directly comparable to older tables that used the removed three-pass barrier as the pre-sample synchronization mechanism.
 
 | Message Size | Element Count | Eager Latency ($\mu\text{s}$) | Rendezvous Latency ($\mu\text{s}$) | Auto Mode Latency ($\mu\text{s}$) | Eager BW (Gbps) | Rendezvous BW (Gbps) | Auto BW (Gbps) | Optimal Protocol |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **64 B** | 16 | **16.0** | 65.8 | 17.5 | 0.05 | 0.01 | 0.04 | **Eager ($4.1\times$ faster)** |
-| **256 B** | 64 | **16.4** | 61.5 | 16.3 | 0.19 | 0.05 | 0.19 | **Eager ($3.8\times$ faster)** |
-| **1 KiB** | 256 | **19.1** | 63.7 | 17.1 | 0.64 | 0.19 | 0.72 | **Eager ($3.3\times$ faster)** |
-| **2 KiB** | 512 | **18.3** | 65.1 | 18.8 | 1.34 | 0.38 | 1.31 | **Eager ($3.6\times$ faster)** |
-| **4 KiB** | 1,024 | **22.4** | 64.5 | 22.5 | 2.19 | 0.76 | 2.18 | **Eager ($2.9\times$ faster)** |
-| **8 KiB** | 2,048 | **26.4** | 67.5 | 26.1 | 3.73 | 1.46 | 3.76 | **Eager ($2.6\times$ faster)** |
-| **16 KiB** | 4,096 | **34.6** | 74.6 | 34.9 | 5.69 | 2.63 | 5.64 | **Eager ($2.2\times$ faster)** |
-| **32 KiB** | 8,192 | **44.0** | 85.7 | 43.4 | 8.93 | 4.59 | 9.06 | **Eager ($1.9\times$ faster)** |
-| **64 KiB** | 16,384 | **63.4** | 105.7 | 62.8 | 12.41 | 7.44 | 12.53 | **Eager ($1.7\times$ faster)** |
-| **128 KiB** | 32,768 | **106.8** | 151.7 | 105.3 | 14.73 | 10.37 | 14.93 | **Eager ($1.4\times$ faster)** |
-| **256 KiB** | 65,536 | **189.6** | 202.6 | 186.8 | 16.59 | 15.53 | 16.84 | **Eager ($1.1\times$ faster)** |
-| **512 KiB** | 131,072 | **333.6** | 420.4 | 397.0 | 18.86 | 14.97 | 15.85 | **Eager ($1.3\times$ faster)** |
-| **1 MiB** | 262,144 | **647.5** | 755.2 | 737.6 | 19.43 | 16.66 | 17.06 | **Eager ($1.2\times$ faster)** |
-| **2 MiB** | 524,288 | **1232.3** | 1455.8 | 1537.1 | 20.42 | 17.29 | 16.37 | **Eager ($1.2\times$ faster)** |
-| **4 MiB** | 1,048,576 | **2416.6** | 2703.8 | 2766.4 | 20.83 | 18.62 | 18.19 | **Eager ($1.1\times$ faster)** |
-| **8 MiB** | 2,097,152 | **5220.3** | 5226.8 | 5275.6 | 19.28 | 19.26 | 19.08 | **Eager (marginally faster)** |
-| **16 MiB** | 4,194,304 | 10439.3 | **9911.3** | 10036.5 | 19.29 | 20.31 | 20.06 | **Rendezvous ($1.1\times$ faster)** |
-| **32 MiB** | 8,388,608 | N/A (Pool Cap) | **18817.6** | 19016.6 | N/A | 21.40 | 21.17 | **Rendezvous** |
-| **64 MiB** | 16,777,216 | N/A (Pool Cap) | 37252.7 | **37134.5** | N/A | 21.62 | 21.69 | **Rendezvous** |
-| **128 MiB** | 33,554,432 | N/A (Pool Cap) | **72108.8** | 72736.7 | N/A | 22.34 | 22.14 | **Rendezvous** |
-| **256 MiB** | 67,108,864 | N/A (Pool Cap) | 146458.0 | **146288.7** | N/A | 21.99 | 22.02 | **Rendezvous** |
-| **512 MiB** | 134,217,728 | N/A (Pool Cap) | 290451.8 | **289619.9** | N/A | 22.18 | 22.24 | **Rendezvous** |
-| **1 GiB** | 268,435,456 | N/A (Pool Cap) | **574806.8** | 577324.9 | N/A | **22.42** | 22.32 | **Rendezvous (Peak)** |
+| **64 B** | 16 | **18.8** | 62.4 | 17.3 | 0.04 | 0.01 | 0.04 | **Eager ($3.3\times$ faster)** |
+| **256 B** | 64 | **16.7** | 62.5 | 16.3 | 0.18 | 0.05 | 0.19 | **Eager ($3.7\times$ faster)** |
+| **1 KiB** | 256 | **17.2** | 63.7 | 18.3 | 0.71 | 0.19 | 0.67 | **Eager ($3.7\times$ faster)** |
+| **2 KiB** | 512 | **20.6** | 63.2 | 18.4 | 1.19 | 0.39 | 1.33 | **Eager ($3.1\times$ faster)** |
+| **4 KiB** | 1,024 | **24.1** | 64.7 | 22.8 | 2.04 | 0.76 | 2.16 | **Eager ($2.7\times$ faster)** |
+| **8 KiB** | 2,048 | **26.1** | 68.5 | 26.4 | 3.77 | 1.43 | 3.73 | **Eager ($2.6\times$ faster)** |
+| **16 KiB** | 4,096 | **35.3** | 74.3 | 35.1 | 5.57 | 2.65 | 5.60 | **Eager ($2.1\times$ faster)** |
+| **32 KiB** | 8,192 | **44.0** | 85.8 | 44.2 | 8.93 | 4.58 | 8.89 | **Eager ($1.9\times$ faster)** |
+| **64 KiB** | 16,384 | **62.3** | 106.5 | 64.4 | 12.63 | 7.39 | 12.21 | **Eager ($1.7\times$ faster)** |
+| **128 KiB** | 32,768 | **110.2** | 151.1 | 108.6 | 14.28 | 10.41 | 14.48 | **Eager ($1.4\times$ faster)** |
+| **256 KiB** | 65,536 | **198.2** | 218.2 | 187.6 | 15.87 | 14.42 | 16.77 | **Eager ($1.1\times$ faster)** |
+| **512 KiB** | 131,072 | 405.8 | **385.3** | 384.8 | 15.50 | 16.33 | 16.35 | **Rendezvous ($1.1\times$ faster)** |
+| **1 MiB** | 262,144 | **674.0** | 704.8 | 740.5 | 18.67 | 17.85 | 16.99 | **Eager ($1.0\times$ faster)** |
+| **2 MiB** | 524,288 | **1267.5** | 1455.1 | 1441.7 | 19.85 | 17.30 | 17.46 | **Eager ($1.1\times$ faster)** |
+| **4 MiB** | 1,048,576 | **2434.2** | 2762.0 | 2686.2 | 20.68 | 18.22 | 18.74 | **Eager ($1.1\times$ faster)** |
+| **8 MiB** | 2,097,152 | 5239.4 | **5225.9** | 5251.4 | 19.21 | 19.26 | 19.17 | **Rendezvous ($1.0\times$ faster)** |
+| **16 MiB** | 4,194,304 | 10358.9 | **10084.9** | 9982.2 | 19.44 | 19.96 | 20.17 | **Rendezvous ($1.0\times$ faster)** |
+| **32 MiB** | 8,388,608 | N/A (Pool Cap) | **19040.6** | 19315.8 | N/A | 21.15 | 20.85 | **Rendezvous** |
+| **64 MiB** | 16,777,216 | N/A (Pool Cap) | **36931.2** | 37611.2 | N/A | 21.81 | 21.41 | **Rendezvous** |
+| **128 MiB** | 33,554,432 | N/A (Pool Cap) | **72750.4** | 75338.8 | N/A | 22.14 | 21.38 | **Rendezvous** |
+| **256 MiB** | 67,108,864 | N/A (Pool Cap) | **146320.4** | 154791.0 | N/A | 22.01 | 20.81 | **Rendezvous** |
+| **512 MiB** | 134,217,728 | N/A (Pool Cap) | **290745.7** | 308142.7 | N/A | 22.16 | 20.91 | **Rendezvous** |
+| **1 GiB** | 268,435,456 | N/A (Pool Cap) | **579528.1** | 597430.5 | N/A | **22.23** | 21.57 | **Rendezvous (Peak)** |
 
 ---
 
@@ -75,22 +75,22 @@ A systematic coordinate descent optimization was executed on the live 4-node clu
 
 | Chunk Size | Latency (ms) | Effective BW (Gbps) | Analysis |
 | :--- | :--- | :--- | :--- |
-| **64 KiB** | **36.90** | **21.82** | **Best 64 MiB result; matches adaptive default** |
-| 128 KiB | 37.73 | 21.34 | High throughput with moderate descriptor count |
-| 256 KiB | 39.58 | 20.35 | Default for segments at least 64 MiB |
-| 512 KiB | 43.60 | 18.47 | Larger pipeline startup/drain bubble |
-| 1 MiB | 46.11 | 17.46 | Lowest descriptor count, highest 64 MiB latency |
+| **64 KiB** | **37.04** | **21.74** | **Best 64 MiB result; matches adaptive default** |
+| 128 KiB | 37.81 | 21.30 | High throughput with moderate descriptor count |
+| 256 KiB | 39.57 | 20.35 | Default for segments at least 64 MiB |
+| 512 KiB | 43.77 | 18.40 | Larger pipeline startup/drain bubble |
+| 1 MiB | 47.01 | 17.13 | Lowest descriptor count, highest 64 MiB latency |
 
 ### 4.2 In-Flight Window Depth (`PG_RDMA_WINDOW`)
 *Tested on 64 MiB All-Reduce (Chunk = 256 KiB)*
 
 | Window Depth | Latency (ms) | Effective BW (Gbps) | Stability |
 | :--- | :--- | :--- | :--- |
-| 1 | 42.01 | 19.17 | 100% stable (auto-bounded signal interval = 1) |
-| 8 | 38.84 | 20.73 | 100% stable |
-| 16 | 37.13 | 21.69 | 100% stable |
-| **32** | **37.01** | **21.76** | **Best measured balance** |
-| 64 | 38.03 | 21.17 | Diminishing return |
+| 1 | 42.41 | 18.99 | 100% stable (auto-bounded signal interval = 1) |
+| 8 | 39.47 | 20.40 | 100% stable |
+| 16 | 39.07 | 20.61 | 100% stable |
+| **32** | **37.32** | **21.58** | **Best measured balance** |
+| 64 | 37.70 | 21.36 | Diminishing return |
 
 ### 4.3 Selective Signaling Interval (`PG_RDMA_SIGNAL_INTERVAL`)
 *Prior dedicated sweep on 64 MiB All-Reduce (Chunk = 256 KiB, Window = 32); this dimension was not rerun by the 2026-09-27 full-suite script.*
@@ -108,10 +108,10 @@ A systematic coordinate descent optimization was executed on the live 4-node clu
 
 | Batch Size | Latency (ms) | Effective BW (Gbps) | Door-Bell Calls per Step |
 | :--- | :--- | :--- | :--- |
-| 1 (Unbatched) | 38.24 | 21.06 | 256 calls |
-| 4 | 38.45 | 20.95 | 64 calls |
-| 8 | 38.12 | 21.12 | 32 calls |
-| **16** | **36.85** | **21.85** | **16 calls ($16\times$ door-bell reduction)** |
+| 1 (Unbatched) | 37.35 | 21.56 | 256 calls |
+| 4 | 37.38 | 21.54 | 64 calls |
+| **8** | **36.79** | **21.89** | **32 calls ($8\times$ door-bell reduction)** |
+| 16 | 36.80 | 21.88 | 16 calls; effectively tied with batch 8 |
 
 ### 4.5 SIMD Vectorization Impact
 *Measured execution time for reducing 256 KiB chunk (65,536 integers) on Xeon X5550*
@@ -120,6 +120,19 @@ A systematic coordinate descent optimization was executed on the live 4-node clu
 | :--- | :--- | :--- | :--- |
 | **Scalar C Loop** | $184.2\,\mu\text{s}$ | $131.0\,\mu\text{s}$ | ❌ **Compute Bottleneck** (CPU slower than NIC) |
 | **SSE4.2 SIMD (4x unrolled)** | **$41.1\,\mu\text{s}$** | $131.0\,\mu\text{s}$ | ✅ **100% Overlapped** (CPU $3.2\times$ faster than NIC) |
+
+### 4.6 Protocol-State Simplification
+
+The 2026-09-28 strict-FIFO sweep followed the 2026-09-27 exact-identity sweep. The control header stayed fixed at 64 bytes, so deleting epoch/collective/phase/step fields was expected to reduce source and state rather than wire time.
+
+| Metric | Exact Identity (2026-09-27) | Strict FIFO (2026-09-28) | Observed Delta |
+| :--- | ---: | ---: | ---: |
+| 64 B Eager latency | 16.0 µs | 18.8 µs | +17.5% |
+| 64 B AUTO latency | 17.5 µs | 17.3 µs | -1.1% |
+| 1 GiB Rendezvous bandwidth | 22.42 Gbps | 22.23 Gbps | -0.8% |
+| 1 GiB AUTO bandwidth | 22.32 Gbps | 21.57 Gbps | -3.4% |
+
+These were separate daily sweeps rather than randomized interleaved A/B trials. The mixed direction and small magnitude of most deltas do not establish a causal performance change; use the table as a regression check, not as an optimization claim.
 
 ---
 
@@ -135,8 +148,8 @@ In accordance with our core engineering principle of presenting only empirical f
 | **Reduction Operations** | All 4 operations verified: `PG_SUM`, `PG_MIN`, `PG_MAX`, `PG_PROD` ($3 \times 4 = 12$ pairs). | Custom reduction user-callbacks or bitwise operations (`PG_BXOR`). |
 | **Buffer Divisibility** | Arbitrary remainder counts: 1001, 1003, 33333, 1000007 elements. | Dynamic size changes within the same collective call. |
 | **CPU Architecture** | Intel Nehalem x86_64 with SSE4.2 (128-bit). | Modern AVX-512 / AVX2 CPUs, ARM Neoverse, or POWER9 architectures. |
-| **Collective Integration** | Reduce-Scatter, All-Gather, All-Reduce, epoch-gated RS→AG handoff, and symmetric connect/close ping. | Dual-ring bidirectional full-duplex interleaving. |
-| **Stress & Reliability** | 100 rapid back-to-back iterations in each full sweep; separate 30-iteration run with rank 0 delayed 20 ms after every Reduce-Scatter. | Fault tolerance under physical link drop or node kill during collective. |
+| **Collective Integration** | Reduce-Scatter, All-Gather, All-Reduce, strict-FIFO RS→AG handoff, and symmetric connect/close ping. | Concurrent/nonblocking collectives, multiple logical streams per QP, or dual-ring interleaving. |
+| **Stress & Reliability** | 100 rapid back-to-back iterations; separate forced-Eager and forced-Rendezvous runs with rank 0 delayed 20 ms after every Reduce-Scatter. | Divergent collective call order, partial retry/reconnection, physical link drop, or node kill during a collective. |
 
 ---
 

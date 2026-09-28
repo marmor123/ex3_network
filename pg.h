@@ -70,10 +70,9 @@ extern struct pg_args g_pg_args;
 /**
  * @brief Initializes the RDMA process group and establishes the communication ring.
  *
- * Performs edge-ordered TCP bootstrapping, opens InfiniBand Verbs device contexts,
- * creates RC Queue Pairs (to_next, from_prev) with inline probing, allocates Protection
- * Domain and shared Completion Queue, transitions QPs to RTS, primes the unified receive
- * buffer pool, and verifies hardware connectivity with a ring ping-pong.
+ * Establishes and verifies the RC ring. The process group is single-threaded and
+ * blocking: every rank must call collectives in the same order, without overlap,
+ * skipped calls, or retry on an existing connection.
  *
  * @param servername Hostname or server identifier of the process group coordinator.
  * @param pg_handle  Output pointer to receive the opaque process group handle.
@@ -131,9 +130,9 @@ int pg_all_gather(void *sendbuf, void *recvbuf, int count,
  *
  * Reduces @p count elements from @p sendbuf using operation @p op, and places the
  * full reduced result into @p recvbuf on all ranks. Reduce-Scatter and All-Gather
- * hand off without a global barrier: every transfer is identified by collective
- * epoch, phase, step, segment, and micro-chunk, so early traffic remains pending
- * until its exact phase becomes active.
+ * hand off without a global barrier. Correctness relies on blocking collectives
+ * being called in the same order by every rank; per-QP FIFO ordering and segment
+ * tags keep early traffic pending until the local phase advances.
  * @p sendbuf and @p recvbuf must refer to disjoint ranges. In the default
  * WORKBUFFER=inplace build, @p sendbuf is mutable scratch and is modified;
  * WORKBUFFER=safe preserves it.
