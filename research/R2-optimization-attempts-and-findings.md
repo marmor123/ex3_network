@@ -4,6 +4,8 @@
 **Hardware Cluster**: `mlx-stud-01..04` (4 Physical Compute Nodes, Intel Xeon X5550, Mellanox ConnectX IB DDR 20 Gbps)  
 **Author**: Dvir Marmor  
 
+This is a historical experiment log, not the current interface contract. In particular, the barrier requirement concluded in section 3.6 is superseded by [ADR-0009](../docs/adr/0009-strict-fifo-phase-handoff.md). Production queue regression coverage now lives in `tests/test_pending_queue.c`; the obsolete standalone eight-buffer queue mock was removed.
+
 ---
 
 ## 1. Overview & Verification Methodology
@@ -93,7 +95,7 @@ This document records the exact results of this engineering process:
   - Dedicated eager send header buffers (`eager_send_hdr_buf`) duplicated verbs memory registrations already handled by `ctrl_send_buf`.
 - **Implementation**:
   1. *Strict 64 KiB Buffer Sizing*: Defined `PG_EAGER_BUF_SIZE = PG_EAGER_THRESHOLD` (64 KiB), reducing pinned receive memory from 16.78 MiB to 4.19 MiB (**75% memory footprint reduction**).
-  2. *Direct Zero-Copy CPU Receive*: Dispatched the registered receive slot buffer pointer directly into `out_event->eager_buf`, enabling SSE4.2 SIMD reduction or copy directly from the slot. Deferred slot reposting until after `pg_step_process_chunk` completes (safe because `PG_EAGER_WINDOW = 8` < `PG_EAGER_POOL_DEPTH = 32`).
+  2. *Direct Zero-Copy CPU Receive*: Dispatched the registered receive slot buffer pointer directly into `out_event->eager_buf`, enabling SSE4.2 SIMD reduction or copy directly from the slot. Deferred slot reposting until after consumption, so the NIC cannot overwrite the active payload. The default send window is 8 and the unified receive pool depth is `PG_CTRL_POOL_DEPTH = 32`.
   3. *Pre-Allocated Pending Bounce Buffers*: Pre-allocated 32 pool entries per direction during context initialization, eliminating runtime `malloc()` on the fast path.
   4. *Unified Control / Header Pool*: Unified eager send headers into `ctrl_send_buf`, eliminating redundant MR registrations.
 - **Empirical Impact**:
@@ -150,8 +152,8 @@ The following 6 changes were implemented, tested on the physical cluster, found 
   - Merging them into a single helper obscured these distinctions and caused state transition stalls.
 - **Lesson Learned**: Deep module boundaries should encapsulate state transitions rather than prematurely combining separate execution paths that have subtly different preconditions.
 
-### 3.6 Revert 6: Eager Barrier Bypass in `pg_all_reduce`
+### 3.6 Revert 6: Eager Barrier Bypass in `pg_all_reduce` (Historical; Superseded)
 - **Theoretical Rationale**: In isolated single-iteration benchmarks, bypassing the intermediate `pg_barrier` between Reduce-Scatter and All-Gather for eager transfers lowered small-message latency down to $15.7\,\mu\text{s}$.
 - **Empirical Failure**: During the 100 rapid back-to-back iterations stress test without application-level barriers, faster ranks lapped slower ranks. Rank 0 entered iteration 7 while Rank 2 was still receiving All-Gather packets for iteration 6, producing data corruption (`got 5, expected 10`).
-- **Microarchitectural Root Cause**: Without the intermediate barrier, there is no global barrier separating phases in uncoordinated caller loops. Ring steps from adjacent collective iterations interleaved destructively in shared staging/receive slots.
-- **Lesson Learned**: Phase barriers between Reduce-Scatter and All-Gather must remain unconditional to guarantee strict phase isolation and deterministic race-freedom across back-to-back collective loops.
+- **Historical Diagnosis**: The then-current implementation did not safely isolate early traffic and shared staging/receive-buffer use after the barrier was bypassed. That failure demonstrated a flaw in that implementation, not a universal requirement for phase barriers.
+- **Current Conclusion**: The unconditional-barrier recommendation is superseded. The current implementation uses the explicit Collective Buffer Contract, one Ordered Transfer Stream per RC QP, head-only FIFO matching, and deferred eager-slot reposting. Local completion advances the Phase Handoff; merely receiving next-phase traffic does not. See [ADR-0009](../docs/adr/0009-strict-fifo-phase-handoff.md) for the supported contract and subsequent cluster verification.

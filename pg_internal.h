@@ -43,8 +43,7 @@
 #endif
 
 /* Eager Protocol Constants (ADR-0003) */
-#define PG_EAGER_THRESHOLD      (64 * 1024)  /* 64 KiB optimal crossover */
-#define PG_EAGER_POOL_DEPTH     32           /* 32 pre-posted buffers per QP */
+#define PG_EAGER_THRESHOLD      (64 * 1024)  /* Conservative receive-memory bound */
 #define PG_EAGER_WINDOW         8            /* In-flight send flow control window */
 #define PG_EAGER_BUF_SIZE       PG_EAGER_THRESHOLD /* Sized strictly to threshold (64 KiB) for 75% memory footprint reduction */
 
@@ -55,26 +54,11 @@
 #define PG_RDMA_WINDOW           32            /* 32 in-flight micro-chunks */
 #define PG_RDMA_SIGNAL_INTERVAL  8             /* Signal every 8 WRs (2 MiB pipeline step) */
 
-/* Multi-WR Linked-List Batching & Streaming Store Thresholds */
+/* Multi-WR Linked-List Batching */
 #ifndef PG_DEFAULT_BATCH_SIZE
 #define PG_DEFAULT_BATCH_SIZE    8             /* 8 chained WRs per ibv_post_send */
 #endif
 #define PG_MAX_BATCH_SIZE        16            /* Max bounded WR batch depth (Strategy 1) */
-
-/* Benchmark Harness Constants */
-#ifndef PG_BENCH_MIN_BYTES
-#define PG_BENCH_MIN_BYTES       (64ULL * 1024ULL * 1024ULL)   /* 64 MiB */
-#endif
-#ifndef PG_BENCH_MAX_BYTES
-#if (PG_ACTIVE_MODE == PG_MODE_TYPE_EAGER)
-#define PG_BENCH_MAX_BYTES       (16ULL * 1024ULL * 1024ULL)   /* 16 MiB max for Eager */
-#else
-#define PG_BENCH_MAX_BYTES       (1024ULL * 1024ULL * 1024ULL) /* 1 GiB max for Rendezvous */
-#endif
-#endif
-#ifndef PG_BENCH_ITER
-#define PG_BENCH_ITER            5
-#endif
 
 /* QP Directions (index into per-direction arrays) */
 #define PG_QP_DIR_TO_NEXT       0
@@ -221,7 +205,6 @@ struct pg_context {
     uint16_t local_lid;
     enum ibv_mtu active_mtu;
     uint32_t max_inline_data[2];                   /* [0]=to_next, [1]=from_prev */
-    uint32_t sq_depth[2];                          /* [0]=to_next, [1]=from_prev */
 
 #define PG_EAGER_SLOT_SIZE      (PG_CTRL_MSG_LEN + PG_EAGER_BUF_SIZE)
 
@@ -363,18 +346,7 @@ static inline int pg_repost_recv_slot(struct pg_context *ctx, int qp_dir, int sl
     return ibv_post_recv(target_qp, &wr, &bad_wr);
 }
 
-#define pg_repost_ctrl_recv_slot(ctx, dir, slot)  pg_repost_recv_slot(ctx, dir, slot)
-#define pg_repost_eager_recv_slot(ctx, dir, slot) pg_repost_recv_slot(ctx, dir, slot)
 #define pg_recv_slot_msg(ctx, dir, slot)          ((struct pg_ctrl_msg *)ctx->recv_slot_buf[dir][slot])
-#define pg_recv_slot_payload(ctx, dir, slot)      ((void *)((char *)ctx->recv_slot_buf[dir][slot] + PG_CTRL_MSG_LEN))
-
-/* ========================================================================= */
-/* === MODULE 4: PROGRESS ENGINE & CQ DISPATCH (ADR-0001, CONTEXT.md)   === */
-/* Encapsulates CQ polling, wr_id decoding, automatic receive buffer        */
-/* replenishment, and pending FIFO message queue matching.                   */
-/* Implemented privately in pg.c.                                            */
-/* ========================================================================= */
-
 
 /* ============================================================================
  * Ring Step Transfer Engine (Pipelined Micro-Chunk Transfer)
@@ -385,7 +357,6 @@ static inline int pg_get_datatype_shift(DATATYPE datatype) {
 }
 
 enum pg_chunk_action {
-    PG_CHUNK_ACTION_NONE = 0,
     PG_CHUNK_ACTION_REDUCE,
     PG_CHUNK_ACTION_MEMCPY
 };

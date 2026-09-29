@@ -134,6 +134,8 @@ The 2026-09-28 strict-FIFO sweep followed the 2026-09-27 exact-identity sweep. T
 
 These were separate daily sweeps rather than randomized interleaved A/B trials. The mixed direction and small magnitude of most deltas do not establish a causal performance change; use the table as a regression check, not as an optimization claim.
 
+The 2026-09-29 obsolete-state cleanup removed 65 further net lines from the core implementation/header and passed strict builds, production-queue sanitizer checks, and delayed two-/four-rank hardware regressions. Its short harness smoke sweeps included the artificial 20 ms phase delay and are not performance measurements. The tables above remain the 2026-09-28 results; see [ADR-0009](adr/0009-strict-fifo-phase-handoff.md#obsolete-state-cleanup-2026-09-29) for the cleanup's scope and verification coverage.
+
 ---
 
 ## 5. Strict Tested vs. Not-Tested Boundary Matrix

@@ -443,7 +443,7 @@ int pg_rdma_init_resources(struct pg_context *ctx) {
             return PG_ERR_RDMA;
         }
 
-        /* Read back actual runtime max_inline_data and sq_depth */
+        /* Read back the actual runtime inline-send limit. */
         struct ibv_qp_attr qp_attr;
         struct ibv_qp_init_attr qp_init_attr;
         if (ibv_query_qp(*qp_ptr, &qp_attr, IBV_QP_CAP, &qp_init_attr)) {
@@ -452,7 +452,6 @@ int pg_rdma_init_resources(struct pg_context *ctx) {
             return PG_ERR_RDMA;
         }
         ctx->max_inline_data[dir] = qp_init_attr.cap.max_inline_data;
-        ctx->sq_depth[dir] = qp_init_attr.cap.max_send_wr;
 
         /* Transition QP to INIT */
         struct ibv_qp_attr attr = {
@@ -928,13 +927,6 @@ static inline int pg_progress_recv_matches(const struct pg_context *ctx,
            pg_ctrl_msg_matches(&ev->msg, msg_type, seg_idx);
 }
 
-/* Push unhandled or future-step message into pending queue */
-static inline int pg_progress_push_pending(struct pg_context *ctx, int qp_dir,
-                                           const struct pg_ctrl_msg *msg,
-                                           const void *slot_buf) {
-    return pg_pending_push(ctx, qp_dir, msg, slot_buf);
-}
-
 /* Non-blocking single CQ poll and event decoder with auto receive slot replenishment */
 static inline int pg_progress_poll(struct pg_context *ctx, struct pg_progress_event *out_event) {
     if (!ctx || !out_event) return PG_ERR_INVAL;
@@ -1008,7 +1000,7 @@ static inline int pg_progress_poll(struct pg_context *ctx, struct pg_progress_ev
 static inline int pg_progress_buffer_unexpected(struct pg_context *ctx,
                                                 const struct pg_progress_event *ev) {
     if (ctx && ev && ev->type == PG_WR_TYPE_RECV_CTRL) {
-        int rc = pg_progress_push_pending(ctx, ev->qp_dir, &ev->msg, ev->eager_buf);
+        int rc = pg_pending_push(ctx, ev->qp_dir, &ev->msg, ev->eager_buf);
         if (ev->msg.type == PG_CTRL_MSG_EAGER_PAYLOAD && ev->slot != (uint32_t)-1) {
             if (pg_repost_recv_slot(ctx, ev->qp_dir, (int)ev->slot)) {
                 return PG_ERR_RDMA;
@@ -1016,53 +1008,6 @@ static inline int pg_progress_buffer_unexpected(struct pg_context *ctx,
         }
         return rc;
     }
-    return PG_SUCCESS;
-}
-
-/* Concurrently wait for a local send completion and a matching incoming control message */
-static inline int pg_progress_wait_send_recv(struct pg_context *ctx,
-                                             int send_qp_dir, int send_wr_type,
-                                             int recv_qp_dir, uint16_t recv_msg_type, uint32_t seg_idx,
-                                             double timeout_sec,
-                                             struct pg_progress_event *out_recv_event) {
-    if (out_recv_event) memset(out_recv_event, 0, sizeof(*out_recv_event));
-    int send_done = 0;
-    int recv_done = 0;
-
-    if (pg_progress_pop_pending(ctx, recv_qp_dir, (int)recv_msg_type, seg_idx,
-                                out_recv_event)) {
-        recv_done = 1;
-    }
-
-    struct timespec start, now;
-    clock_gettime(CLOCK_MONOTONIC, &start);
-
-    struct pg_progress_event ev;
-    while (!send_done || !recv_done) {
-        int rc = pg_progress_poll(ctx, &ev);
-        if (rc < 0) return rc;
-        if (rc == 1) {
-            if (!send_done && ev.type == send_wr_type && (send_qp_dir < 0 || ev.qp_dir == send_qp_dir)) {
-                send_done = 1;
-            } else if (!recv_done && pg_progress_recv_matches(
-                           ctx, &ev, recv_qp_dir, recv_msg_type, seg_idx)) {
-                if (out_recv_event) *out_recv_event = ev;
-                recv_done = 1;
-            } else {
-                int brc = pg_progress_buffer_unexpected(ctx, &ev);
-                if (brc != PG_SUCCESS) return brc;
-            }
-        }
-
-        clock_gettime(CLOCK_MONOTONIC, &now);
-        double elapsed = (now.tv_sec - start.tv_sec) + (now.tv_nsec - start.tv_nsec) / 1e9;
-        if (elapsed >= timeout_sec) {
-            fprintf(stderr, "[pg_progress] Error: Timed out waiting for send_type %d / recv_msg %u\n",
-                    send_wr_type, recv_msg_type);
-            return PG_ERR_TIMEOUT;
-        }
-    }
-
     return PG_SUCCESS;
 }
 
@@ -1230,15 +1175,38 @@ static int pg_rdma_ring_ping(struct pg_context *ctx) {
         return rc;
     }
 
-    struct pg_progress_event ev = {0};
-    rc = pg_progress_wait_send_recv(ctx, PG_QP_DIR_TO_NEXT, PG_WR_TYPE_SEND_CTRL,
-                                    PG_QP_DIR_FROM_PREV, PG_CTRL_MSG_PING, (uint32_t)-1,
-                                    PG_CTRL_POLL_TIMEOUT_SEC, &ev);
-    if (rc != PG_SUCCESS) return rc;
+    struct pg_progress_event received = {0}, ev;
+    int send_done = 0;
+    int recv_done = pg_progress_pop_pending(ctx, PG_QP_DIR_FROM_PREV,
+                                            PG_CTRL_MSG_PING, UINT32_MAX, &received);
+    struct timespec start, now;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    while (!send_done || !recv_done) {
+        rc = pg_progress_poll(ctx, &ev);
+        if (rc < 0) return rc;
+        if (rc == 1) {
+            if (!send_done && ev.type == PG_WR_TYPE_SEND_CTRL && ev.qp_dir == PG_QP_DIR_TO_NEXT) {
+                send_done = 1;
+            } else if (!recv_done && pg_progress_recv_matches(
+                           ctx, &ev, PG_QP_DIR_FROM_PREV, PG_CTRL_MSG_PING, UINT32_MAX)) {
+                received = ev;
+                recv_done = 1;
+            } else {
+                rc = pg_progress_buffer_unexpected(ctx, &ev);
+                if (rc != PG_SUCCESS) return rc;
+            }
+        }
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        double elapsed = (now.tv_sec - start.tv_sec) + (now.tv_nsec - start.tv_nsec) / 1e9;
+        if (elapsed >= PG_CTRL_POLL_TIMEOUT_SEC) {
+            fprintf(stderr, "[pg_rdma] Rank %d timed out waiting for ring ping\n", ctx->rank);
+            return PG_ERR_TIMEOUT;
+        }
+    }
 
-    if (ev.msg.sender_rank != (uint16_t)ctx->prev_rank) {
+    if (received.msg.sender_rank != (uint16_t)ctx->prev_rank) {
         fprintf(stderr, "[pg_rdma] Rank %d received ping from unexpected sender %u (expected %d)\n",
-                ctx->rank, ev.msg.sender_rank, ctx->prev_rank);
+                ctx->rank, received.msg.sender_rank, ctx->prev_rank);
         return PG_ERR_RDMA;
     }
 
@@ -1371,7 +1339,7 @@ static inline void pg_step_process_chunk(const struct pg_ring_step_desc *desc,
     if (__builtin_expect(desc->chunk_action == PG_CHUNK_ACTION_REDUCE, 1)) {
         int micro_elems = (int)(micro_len >> desc->elem_shift);
         pg_reduce_buffer(dest, src, micro_elems, desc->datatype, desc->op);
-    } else if (desc->chunk_action == PG_CHUNK_ACTION_MEMCPY) {
+    } else {
         memcpy(dest, src, micro_len);
     }
 }
@@ -1441,11 +1409,9 @@ static int pg_ring_step_transfer_eager(struct pg_context *ctx, const struct pg_r
             uint32_t micro_len = peager.msg.payload.rdv.length;
             size_t offset = (size_t)k * chunk_size;
 
-            if (desc->chunk_action != PG_CHUNK_ACTION_NONE) {
-                void *dest = (char *)desc->cb_dest + offset;
-                const void *src = peager.eager_buf + PG_CTRL_MSG_LEN;
-                pg_step_process_chunk(desc, dest, src, micro_len);
-            }
+            void *dest = (char *)desc->cb_dest + offset;
+            const void *src = peager.eager_buf + PG_CTRL_MSG_LEN;
+            pg_step_process_chunk(desc, dest, src, micro_len);
 
             eager_recv_micros++;
             if (eager_recv_micros == num_recv_micros) {
@@ -1512,11 +1478,9 @@ static int pg_ring_step_transfer_eager(struct pg_context *ctx, const struct pg_r
                             uint32_t micro_len = ev.msg.payload.rdv.length;
                             size_t offset = (size_t)k * chunk_size;
 
-                            if (desc->chunk_action != PG_CHUNK_ACTION_NONE) {
-                                void *dest = (char *)desc->cb_dest + offset;
-                                const void *src = ev.eager_buf + PG_CTRL_MSG_LEN;
-                                pg_step_process_chunk(desc, dest, src, micro_len);
-                            }
+                            void *dest = (char *)desc->cb_dest + offset;
+                            const void *src = ev.eager_buf + PG_CTRL_MSG_LEN;
+                            pg_step_process_chunk(desc, dest, src, micro_len);
 
                             /* Return consumed receive buffer slot back to NIC Receive Queue after direct compute/copy */
                             if (ev.slot != (uint32_t)-1) {
@@ -1652,7 +1616,7 @@ static int pg_ring_step_transfer_rdv(struct pg_context *ctx, const struct pg_rin
                 size_t micro_len = desc->recv_bytes - offset;
                 if (micro_len > chunk_size) micro_len = chunk_size;
 
-                if (desc->chunk_action != PG_CHUNK_ACTION_NONE && desc->cb_dest != desc->recv_target_addr) {
+                if (desc->cb_dest != desc->recv_target_addr) {
                     void *dest = (char *)desc->cb_dest + offset;
                     const void *src = (char *)desc->recv_target_addr + offset;
                     pg_step_process_chunk(desc, dest, src, micro_len);
@@ -1782,7 +1746,7 @@ static int pg_ring_step_transfer_rdv(struct pg_context *ctx, const struct pg_rin
                             size_t micro_len = desc->recv_bytes - offset;
                             if (micro_len > chunk_size) micro_len = chunk_size;
 
-                            if (desc->chunk_action != PG_CHUNK_ACTION_NONE && desc->cb_dest != desc->recv_target_addr) {
+                            if (desc->cb_dest != desc->recv_target_addr) {
                                 void *dest = (char *)desc->cb_dest + offset;
                                 const void *src = (char *)desc->recv_target_addr + offset;
                                 pg_step_process_chunk(desc, dest, src, micro_len);

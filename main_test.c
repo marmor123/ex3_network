@@ -6,6 +6,21 @@
 #include <time.h>
 #include <malloc.h>
 
+/* Benchmark defaults belong to the harness, not the collective library. */
+#ifndef PG_BENCH_MIN_BYTES
+#define PG_BENCH_MIN_BYTES       (64ULL * 1024ULL * 1024ULL)   /* 64 MiB */
+#endif
+#ifndef PG_BENCH_MAX_BYTES
+#if (PG_ACTIVE_MODE == PG_MODE_TYPE_EAGER)
+#define PG_BENCH_MAX_BYTES       (16ULL * 1024ULL * 1024ULL)   /* Eager sweep limit */
+#else
+#define PG_BENCH_MAX_BYTES       (1024ULL * 1024ULL * 1024ULL) /* 1 GiB */
+#endif
+#endif
+#ifndef PG_BENCH_ITER
+#define PG_BENCH_ITER            5
+#endif
+
 static void print_usage(const char *prog_name) {
     fprintf(stderr, "Usage: %s -myindex <01..NN> -list <host1> <host2> [host3 ...]\n", prog_name);
     fprintf(stderr, "Example: %s -myindex 03 -list mlxstud01 mlxstud02 mlxstud03 mlxstud04\n", prog_name);
