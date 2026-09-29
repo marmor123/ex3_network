@@ -308,9 +308,9 @@ void pg_rdma_cleanup(struct pg_context *ctx) {
     /* 5. Free dynamically allocated eager buffers in pending queues */
     for (int dir = 0; dir < 2; dir++) {
         for (int k = 0; k < PG_PENDING_QUEUE_MAX; k++) {
-            if (ctx->pending_q[dir].pool[k].eager_buf) {
-                free(ctx->pending_q[dir].pool[k].eager_buf);
-                ctx->pending_q[dir].pool[k].eager_buf = NULL;
+            if (ctx->pending_q[dir].entries[k].eager_buf) {
+                free(ctx->pending_q[dir].entries[k].eager_buf);
+                ctx->pending_q[dir].entries[k].eager_buf = NULL;
             }
         }
     }
@@ -394,10 +394,10 @@ int pg_rdma_init_resources(struct pg_context *ctx) {
             return PG_ERR_RDMA;
         }
 
-        /* Pre-allocate pending queue eager bounce buffers to eliminate fast-path runtime malloc */
+        /* Preallocate eager buffers for short pending bursts; deeper queues grow lazily. */
         for (int k = 0; k < PG_CTRL_POOL_DEPTH; k++) {
-            ctx->pending_q[dir].pool[k].eager_buf = (char *)malloc(PG_EAGER_SLOT_SIZE);
-            if (!ctx->pending_q[dir].pool[k].eager_buf) {
+            ctx->pending_q[dir].entries[k].eager_buf = (char *)malloc(PG_EAGER_SLOT_SIZE);
+            if (!ctx->pending_q[dir].entries[k].eager_buf) {
                 fprintf(stderr, "[pg_rdma] Error: Could not pre-allocate pending eager buffer for dir %d slot %d\n", dir, k);
                 pg_rdma_cleanup(ctx);
                 return PG_ERR_NOMEM;

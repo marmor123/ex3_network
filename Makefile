@@ -35,7 +35,13 @@ $(TARGET): $(OBJS)
 %.o: %.c $(HEADERS)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-clean:
-	rm -f $(OBJS) $(TARGET)
+tests/test_pending_queue.out: tests/test_pending_queue.c $(HEADERS)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $<
 
-.PHONY: all clean
+check: tests/test_pending_queue.out
+	./tests/test_pending_queue.out
+
+clean:
+	rm -f $(OBJS) $(TARGET) tests/test_pending_queue.out
+
+.PHONY: all check clean

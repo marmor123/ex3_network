@@ -271,6 +271,9 @@ make MODE=eager      # Pure Eager Send/Recv
 
 # Compile with Safe Work Buffer (Preserves sendbuf without mutation)
 make WORKBUFFER=safe
+
+# Check pending FIFO ordering, wraparound, and buffer reuse without RDMA hardware
+make check
 ```
 
 All-Reduce uses a strict-FIFO, barrier-free phase handoff. The library contains no dedicated barrier interface or control messages. This deliberately supports one blocking collective stream per RC QP: all ranks must call collectives in the same order, without overlap or retry. Connection and teardown use a symmetric neighbor ping; the benchmark harness uses a one-element public All-Gather before timed samples.

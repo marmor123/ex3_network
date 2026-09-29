@@ -27,6 +27,7 @@ We needed a low-overhead, deterministic completion routing mechanism that distin
 - Encapsulated within `pg_progress_poll`, `pg_progress_wait_send_recv`, and the ring-step transfer engines.
 - Unexpected or future-step control messages are automatically diverted into an internal FIFO queue (`pending_q`) via `pg_progress_buffer_unexpected` rather than leaking queue maintenance to callers.
 - Pending receives are consumed only from the head of each per-QP FIFO. A newly polled receive cannot bypass an older pending message from the same RC QP.
+- The queue stores entries directly at its circular head/tail positions. It needs no index array, occupancy flags, or free-slot scan; enqueue and dequeue bookkeeping are O(1). Draining resets both indices to reuse the initially allocated eager buffers for short bursts.
 - **Dynamic Pointer Indirection**: In `struct pg_pending_entry` and `struct pg_progress_event`, eager message payloads are referenced via dynamic pointers backed by a single 64-byte cacheline-aligned context buffer (`ctx->eager_rx_buf`) rather than embedding 262 KB arrays in each struct.
 - **Strict DMA Memory Barrier**: `pg_progress_poll` issues an explicit compiler memory barrier (`asm volatile("" ::: "memory");`) immediately upon detecting a non-zero completion count from `ibv_poll_cq`, preventing compiler reordering of memory loads before DMA completion validation.
 

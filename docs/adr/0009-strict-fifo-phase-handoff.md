@@ -11,7 +11,7 @@ All-Reduce hands off directly from Reduce-Scatter to All-Gather without a global
 - Each RC QP carries one blocking logical collective stream for its lifetime.
 - All ranks call collectives in the same order. Concurrent, overlapping, skipped, retried, or partially restarted collectives are unsupported.
 - Data-path control messages are selected by message type and segment tag. Micro-index and byte length validate progress and payload shape.
-- Each per-QP pending queue is a strict FIFO: only its head may be consumed, and a live receive cannot bypass an older queued receive from the same QP.
+- Each per-QP pending queue is a strict FIFO: only its head may be consumed, and a live receive cannot bypass an older queued receive from the same QP. Entries occupy the circular array directly, without a separate index ring or per-entry occupancy flag.
 - Phase and step transitions are local consequences of completing all expected transfers. Message arrival never advances collective state.
 - An RTS receives a CTS, remote address, and rkey only after its segment becomes the receiver's active transfer.
 - The 64-byte control header remains fixed, so removing identity fields reduces state and source code rather than wire traffic.
@@ -32,3 +32,5 @@ The process-group interface is intentionally single-threaded and blocking. Corre
 Compared with exact transfer identity, `pg.c` and `pg_internal.h` lose 104 net lines while `pg.h` adds no interface surface. Divergent collective order now causes head-of-line blocking or, when type/segment/length coincide, can select semantically wrong traffic; such divergence is outside the supported contract. Diagnostics also cannot name a remote epoch or phase.
 
 On 2026-09-28, four-rank eager and rendezvous builds both passed 100 rapid back-to-back All-Reduce iterations with rank 0 delayed 20 ms after every Reduce-Scatter. The complete benchmark matrix also passed: Rendezvous peaked at 22.23 Gbps and AUTO at 21.57 Gbps for 1 GiB. Those results were respectively 0.8% and 3.4% below the previous day's non-interleaved sweep; the fixed-size header means this simplification is not claimed as a performance optimization.
+
+On 2026-09-29, the direct circular-storage cleanup passed `make check` under the normal strict-warning build and AddressSanitizer/UndefinedBehaviorSanitizer. The tests cover head-only matching, repeated tags, full-queue rejection, wraparound while nonempty, payload ownership, and buffer reuse. Four-rank forced-Eager and forced-Rendezvous runs also passed correctness checks through 4 MiB and 100 back-to-back iterations of 1,000,007 integers with the same 20 ms phase delay. This follow-up did not repeat the full performance sweep; timings with the injected delay are correctness instrumentation.

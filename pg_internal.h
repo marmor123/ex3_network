@@ -167,19 +167,17 @@ struct pg_tcp_qp_info {
     uint16_t reserved;
 };
 
-/* Pending control message queues (FIFO per QP direction with Pool Indirection) */
+/* Pending control messages stored directly in a circular FIFO per QP direction. */
 #define PG_PENDING_QUEUE_MAX    256
 
 struct pg_pending_entry {
     struct pg_ctrl_msg msg;
     char *eager_buf;
     uint32_t eager_len;
-    int in_use;
 };
 
 struct pg_pending_queue {
-    struct pg_pending_entry pool[PG_PENDING_QUEUE_MAX];
-    int ring[PG_PENDING_QUEUE_MAX];
+    struct pg_pending_entry entries[PG_PENDING_QUEUE_MAX];
     int head;
     int tail;
     int count;
@@ -273,37 +271,23 @@ static inline int pg_pending_push(struct pg_context *ctx, int qp_dir,
         return PG_ERR_RDMA;
     }
 
-    int slot = -1;
-    for (int k = 0; k < PG_PENDING_QUEUE_MAX; k++) {
-        if (!q->pool[k].in_use) {
-            slot = k;
-            break;
-        }
-    }
-    if (slot < 0) return PG_ERR_RDMA;
-
-    q->pool[slot].in_use = 1;
-    q->pool[slot].msg = *msg;
-    q->pool[slot].eager_len = 0;
+    struct pg_pending_entry *entry = &q->entries[q->tail];
+    entry->eager_len = 0;
     if (msg->type == PG_CTRL_MSG_EAGER_PAYLOAD && slot_buf) {
+        if (msg->payload.rdv.length > PG_EAGER_BUF_SIZE) return PG_ERR_RDMA;
         uint32_t elen = msg->payload.rdv.length + PG_CTRL_MSG_LEN;
-        if (elen > (PG_EAGER_BUF_SIZE + PG_CTRL_MSG_LEN)) {
-            q->pool[slot].in_use = 0;
-            return PG_ERR_RDMA;
-        }
-        if (!q->pool[slot].eager_buf) {
-            q->pool[slot].eager_buf = (char *)malloc(PG_EAGER_SLOT_SIZE);
-            if (!q->pool[slot].eager_buf) {
+        if (!entry->eager_buf) {
+            entry->eager_buf = (char *)malloc(PG_EAGER_SLOT_SIZE);
+            if (!entry->eager_buf) {
                 fprintf(stderr, "[pg] Fatal: OOM allocating eager buffer in pending queue\n");
-                q->pool[slot].in_use = 0;
                 return PG_ERR_NOMEM;
             }
         }
-        memcpy(q->pool[slot].eager_buf, slot_buf, elen);
-        q->pool[slot].eager_len = elen;
+        memcpy(entry->eager_buf, slot_buf, elen);
+        entry->eager_len = elen;
     }
 
-    q->ring[q->tail] = slot;
+    entry->msg = *msg;
     q->tail = (q->tail + 1) % PG_PENDING_QUEUE_MAX;
     q->count++;
     return PG_SUCCESS;
@@ -318,8 +302,7 @@ static inline int pg_pending_pop_matching(struct pg_context *ctx, int qp_dir, in
     struct pg_pending_queue *q = &ctx->pending_q[qp_dir];
     if (q->count == 0) return 0;
 
-    int slot = q->ring[q->head];
-    struct pg_pending_entry *entry = &q->pool[slot];
+    struct pg_pending_entry *entry = &q->entries[q->head];
     struct pg_ctrl_msg *m = &entry->msg;
     if (!pg_ctrl_msg_matches(m, type, seg_idx)) return 0;
 
@@ -328,9 +311,10 @@ static inline int pg_pending_pop_matching(struct pg_context *ctx, int qp_dir, in
     if (out_slot_buf && entry->eager_len > 0 && entry->eager_buf) {
         memcpy(out_slot_buf, entry->eager_buf, entry->eager_len);
     }
-    entry->in_use = 0;
     q->head = (q->head + 1) % PG_PENDING_QUEUE_MAX;
     q->count--;
+    /* Reuse the preallocated eager buffers after draining a short burst. */
+    if (q->count == 0) q->head = q->tail = 0;
     return 1;
 }
 
