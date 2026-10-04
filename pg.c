@@ -1418,20 +1418,20 @@ static int pg_ring_step_transfer_eager(struct pg_context *ctx, const struct pg_r
     struct timespec start, now;
     clock_gettime(CLOCK_MONOTONIC, &start);
 
-    while (eager_completed_micros < num_send_micros || eager_recv_micros < num_recv_micros) {
-        /* 1. Pop any pending eager payloads for this recv_tag */
-        struct pg_progress_event peager;
-        while (eager_recv_micros < num_recv_micros && pg_progress_pop_pending(
-                   ctx, PG_QP_DIR_FROM_PREV, PG_CTRL_MSG_EAGER_PAYLOAD,
-                   desc->recv_tag, &peager)) {
-            int vrc = pg_eager_process_chunk(&peager, desc, eager_recv_micros,
-                                             num_recv_micros, chunk_size);
-            if (vrc != PG_SUCCESS) return vrc;
-            eager_recv_micros++;
-            clock_gettime(CLOCK_MONOTONIC, &start);
-        }
+    /* Drain early chunks once; FIFO ordering keeps later current chunks on the live path. */
+    struct pg_progress_event peager;
+    while (eager_recv_micros < num_recv_micros && pg_progress_pop_pending(
+               ctx, PG_QP_DIR_FROM_PREV, PG_CTRL_MSG_EAGER_PAYLOAD,
+               desc->recv_tag, &peager)) {
+        int vrc = pg_eager_process_chunk(&peager, desc, eager_recv_micros,
+                                         num_recv_micros, chunk_size);
+        if (vrc != PG_SUCCESS) return vrc;
+        eager_recv_micros++;
+        clock_gettime(CLOCK_MONOTONIC, &start);
+    }
 
-        /* 2. Post eager sends within flow control window */
+    while (eager_completed_micros < num_send_micros || eager_recv_micros < num_recv_micros) {
+        /* Post eager sends within flow control window */
         while (eager_posted_micros < num_send_micros &&
                (eager_posted_micros - eager_completed_micros) < ctx->eager_window) {
             uint32_t k = eager_posted_micros;
@@ -1459,7 +1459,7 @@ static int pg_ring_step_transfer_eager(struct pg_context *ctx, const struct pg_r
 
         if (eager_completed_micros == num_send_micros && eager_recv_micros == num_recv_micros) break;
 
-        /* 3. Poll CQ completions */
+        /* Poll CQ completions */
         struct pg_progress_event ev;
         int rc = pg_progress_poll(ctx, &ev);
         if (rc < 0) return rc;

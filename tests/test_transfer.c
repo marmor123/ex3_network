@@ -210,6 +210,7 @@ static void test_future_eager(void) {
     const struct completion events[] = {
         {PG_WR_TYPE_RECV_CTRL, 1, PG_CTRL_MSG_EAGER_PAYLOAD, 0, 4, PG_CTRL_MSG_LEN + 4},
         {PG_WR_TYPE_RECV_CTRL, 1, PG_CTRL_MSG_EAGER_PAYLOAD, 0, 4, PG_CTRL_MSG_LEN + 4},
+        {PG_WR_TYPE_EAGER_SEND, 0, 0, 0, 0, 0},
         {PG_WR_TYPE_EAGER_SEND, 0, 0, 0, 0, 0}
     };
     reset_test(events, sizeof(events) / sizeof(events[0]));
@@ -222,14 +223,14 @@ static void test_future_eager(void) {
     CHECK(pg_ring_step_transfer_eager(&test_ctx, &desc) == PG_SUCCESS);
     CHECK(inbound == 2);
     CHECK(test_ctx.pending_q[PG_QP_DIR_FROM_PREV].count == 1);
-    struct pg_progress_event future;
-    CHECK(pg_progress_pop_pending(&test_ctx, PG_QP_DIR_FROM_PREV,
-                                  PG_CTRL_MSG_EAGER_PAYLOAD, 0, &future));
-    int future_value;
-    memcpy(&future_value, future.eager_buf + PG_CTRL_MSG_LEN, sizeof(future_value));
-    CHECK(future_value == 2 && future.slot == UINT32_MAX);
+    /* The next transfer must consume its early payload before polling its send completion. */
+    inbound = 0;
+    CHECK(pg_ring_step_transfer_eager(&test_ctx, &desc) == PG_SUCCESS);
+    CHECK(inbound == 2);
+    CHECK(test_ctx.pending_q[PG_QP_DIR_FROM_PREV].count == 0);
+    CHECK(script_pos == script_count);
     CHECK(reposts == 2);
-    puts("Transfer: next-call eager payload stays pending after receive completion.");
+    puts("Transfer: next-call eager payload stays pending and is consumed on entry.");
 }
 
 static void test_eager_window(void) {
