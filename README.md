@@ -272,9 +272,22 @@ make MODE=eager      # Pure Eager Send/Recv
 # Compile with Safe Work Buffer (Preserves sendbuf without mutation)
 make WORKBUFFER=safe
 
-# Check pending FIFO ordering, wraparound, and buffer reuse without RDMA hardware
+# Check pending FIFO and production transfer/progress engines without RDMA hardware
 make check
+
+# Build the hardware regression for repeated collectives with changing buffers
+make tests/test_collective_stream.out
 ```
+
+`make check` also covers early traffic with repeated tags, delayed control completions,
+partial reduction chunks, receive repost errors, actual received lengths, and size limits.
+The hardware stream test takes a zero-based rank followed by the ordered host list;
+launch it on every rank, for example `./tests/test_collective_stream.out 0 mlx-stud-03 mlx-stud-04`.
+
+`PG_PIPELINE_CHUNK` overrides must be positive multiples of 8 bytes and fit a 32-bit
+length; invalid values retain the default. `PG_EAGER_WINDOW` is capped at the 32
+send-header slots. Multi-rank segment byte lengths must fit `uint32_t`, and All-Gather's
+total element count must fit `int`; oversized requests return `PG_ERR_INVAL`.
 
 All-Reduce uses a strict-FIFO, barrier-free phase handoff. The library contains no dedicated barrier interface or control messages. This deliberately supports one blocking collective stream per RC QP: all ranks must call collectives in the same order, without overlap or retry. Connection and teardown use a symmetric neighbor ping; the benchmark harness uses a one-element public All-Gather before timed samples.
 

@@ -14,6 +14,7 @@ All-Reduce hands off directly from Reduce-Scatter to All-Gather without a global
 - Each per-QP pending queue is a strict FIFO: only its head may be consumed, and a live receive cannot bypass an older queued receive from the same QP. Entries occupy the circular array directly, without a separate index ring or per-entry occupancy flag.
 - Phase and step transitions are local consequences of completing all expected transfers. Message arrival never advances collective state.
 - An RTS receives a CTS, remote address, and rkey only after its segment becomes the receiver's active transfer.
+- Each Ring Step Transfer accepts at most one RTS. A subsequent RTS with the same tag stays pending, including while the active transfer waits for its CTS send completion. After an eager receive finishes, further payloads also stay pending until the next transfer.
 - The 64-byte control header remains fixed, so removing identity fields reduces state and source code rather than wire traffic.
 - Connection and teardown use a symmetric neighbor ping. The benchmark harness aligns timed samples with a one-element public All-Gather outside the timed region.
 
@@ -40,3 +41,35 @@ On 2026-09-29, the direct circular-storage cleanup passed `make check` under the
 A subsequent cleanup removed unused receive aliases, the separate eager-pool constant, write-only SQ-depth state, a pending-push forwarding wrapper, and the never-selected no-op chunk action. The general send/receive waiter was folded into its sole caller, the ring ping. Benchmark defaults moved to `main_test.c`; `pg.h` stayed unchanged. This removed 65 net lines from `pg.c` and `pg_internal.h`, without changing the wire format or the Ordered Transfer Stream contract. The obsolete eight-buffer queue mock was deleted; `make check` exercises the production queue instead.
 
 Verification passed for all six combinations of `MODE=auto|eager|rendezvous` and `WORKBUFFER=inplace|safe`, including strict-warning builds and `make check`. The production queue test also passed AddressSanitizer/UndefinedBehaviorSanitizer with leak detection. Hardware regressions passed on four ranks for Eager/inplace, Rendezvous/inplace, and AUTO/safe, and on two ranks for AUTO/inplace. Each hardware run checked collective results through 4 MiB, all 12 datatype/operation pairs, remainder counts, alias rules, and 100 All-Reduce iterations of 1,000,007 integers with rank 0 delayed 20 ms after Reduce-Scatter, followed by a 64 B–256 KiB harness smoke sweep and normal close. No new performance claim is made: the full timing matrix was not rerun, and these instrumented timings must not replace the 2026-09-28 measurements.
+
+### Repeated-Tag Transfer Completion (2026-10-04)
+
+An active rendezvous transfer now accepts one RTS, keeping the next transfer's RTS
+pending even when its segment tag repeats and local control completion is delayed.
+The eager engine likewise queues payloads arriving after its receive has finished.
+Pending/live rendezvous processing shares RTS and DATA_DONE helpers; eager
+validation and chunk processing share one helper. The subsequent simplification
+removed another 51 lines from `pg.c` while retaining rendezvous progress scheduling.
+
+`make check` now runs `tests/test_transfer.c` against the production implementation
+with deterministic verbs. Regressions cover both completion-order cases above,
+pending/live processing and partial reduction tails, invalid chunk tuning, eager
+header credits, receive repost failures, actual completion lengths, aggregate count
+overflow, and segment byte limits. Both queue and transfer tests passed strict
+warning builds and AddressSanitizer/UndefinedBehaviorSanitizer with leak detection.
+
+Final hardware verification passed all six protocol/work-buffer combinations on
+four ranks. Two-rank runs also passed Rendezvous/inplace, Eager/inplace with
+`PG_EAGER_WINDOW=33` (capped at 32), Rendezvous/safe with `PG_RDMA_WINDOW=1` and
+`PG_RDMA_SIGNAL_INTERVAL=32`, and AUTO/inplace with invalid `PG_PIPELINE_CHUNK=5`
+(ignored). Each configuration ran the existing correctness suite through 4 MiB,
+all 12 datatype/operation pairs, remainder and alias checks, 100 delayed phase-handoff
+All-Reduces, and a 64 B–256 KiB benchmark smoke sweep. The additional
+`tests/test_collective_stream.c` passed 200 All-Gathers with alternating output
+buffers/counts and small All-Reduces, followed by normal close. Alternating
+before/after four-rank inplace benchmarks broadly matched baseline timings through
+256 MiB for AUTO/rendezvous and 32 MiB for forced Eager. A scheduling rewrite was
+reverted after early timings worsened. The pre-cleanup forced-Eager binary overflowed
+its pending queue at 64 MiB, limiting that comparison; this remains unresolved.
+No multi-gigabyte allocation test was run; size limits are exercised without large
+allocations by the deterministic tests.

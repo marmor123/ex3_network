@@ -88,6 +88,7 @@ int connect_process_group(char *servername, void **pg_handle);
  * Supports arbitrary (non-divisible) buffer counts via MPI-style (Q+1)/Q remainder
  * distribution. Employs pipelined micro-chunks (adaptive 64 KiB / 256 KiB) to overlap
  * network data transfer with SSE4.2 SIMD compute kernels.
+ * Each segment in a multi-rank collective must fit a 32-bit byte length.
  * @p sendbuf and @p recvbuf must refer to disjoint ranges. In the default
  * WORKBUFFER=inplace build, @p sendbuf is mutable scratch and is modified;
  * WORKBUFFER=safe preserves it.
@@ -111,6 +112,8 @@ int pg_reduce_scatter(void *sendbuf, void *recvbuf, int count,
  * rank finishes with the full concatenated result (count * size elements) in @p recvbuf.
  * Utilizes zero-copy direct RDMA Writes into remote target buffers for Rendezvous mode,
  * or 2-SGE scatter-gather sends for sub-threshold Eager mode.
+ * The total element count (count * size) must fit int; each contribution in a
+ * multi-rank collective must fit a 32-bit byte length.
  * The two ranges must be disjoint unless @p sendbuf points exactly at this rank's
  * owned slice inside @p recvbuf. Other full or partial overlap is invalid.
  *
@@ -133,6 +136,7 @@ int pg_all_gather(void *sendbuf, void *recvbuf, int count,
  * hand off without a global barrier. Correctness relies on blocking collectives
  * being called in the same order by every rank; per-QP FIFO ordering and segment
  * tags keep early traffic pending until the local phase advances.
+ * Each segment in a multi-rank collective must fit a 32-bit byte length.
  * @p sendbuf and @p recvbuf must refer to disjoint ranges. In the default
  * WORKBUFFER=inplace build, @p sendbuf is mutable scratch and is modified;
  * WORKBUFFER=safe preserves it.

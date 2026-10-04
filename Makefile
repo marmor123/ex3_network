@@ -38,10 +38,17 @@ $(TARGET): $(OBJS)
 tests/test_pending_queue.out: tests/test_pending_queue.c $(HEADERS)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $<
 
-check: tests/test_pending_queue.out
+tests/test_transfer.out: tests/test_transfer.c pg.c $(HEADERS)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $< $(LDLIBS)
+
+tests/test_collective_stream.out: tests/test_collective_stream.c pg.c $(HEADERS)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $< pg.c $(LDLIBS)
+
+check: tests/test_pending_queue.out tests/test_transfer.out
 	./tests/test_pending_queue.out
+	./tests/test_transfer.out
 
 clean:
-	rm -f $(OBJS) $(TARGET) tests/test_pending_queue.out
+	rm -f $(OBJS) $(TARGET) tests/test_pending_queue.out tests/test_transfer.out tests/test_collective_stream.out
 
 .PHONY: all check clean

@@ -22,6 +22,7 @@ We needed a low-overhead, deterministic completion routing mechanism that distin
 ### 2. Receive Slot Replenishment (Repost-After-Consume)
 - A fixed receive pool of depth `PG_CTRL_POOL_DEPTH = 32` is pre-posted on each QP at initialization.
 - For a control-only receive, the progress engine copies the header into the event and immediately reposts the receive slot.
+- The completion's actual byte length is checked before reading the header or exposing an eager payload. Control-only receives must contain one complete header; eager receives must also contain exactly the declared payload bytes.
 - For an eager receive, the event borrows the registered slot until its payload is consumed or copied into the pending queue. Only then is the slot reposted; reposting earlier would allow the NIC to overwrite data still in use.
 
 ### 3. Progress Engine Polling, Dispatch & Automatic Buffering
