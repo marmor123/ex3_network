@@ -33,7 +33,7 @@ static unsigned char test_rx[PG_EAGER_SLOT_SIZE] __attribute__((aligned(64)));
 static const struct completion *script;
 static size_t script_count, script_pos;
 static int queue_future_rts, cts_posts;
-static int queue_controls, done_posts;
+static int done_posts;
 static uint32_t done_micros[32];
 static int eager_posts;
 static int repost_error;
@@ -105,8 +105,7 @@ static int test_poll_cq(struct ibv_cq *cq, int count, struct ibv_wc *wc) {
         int payload = 2;
         memcpy(test_rx + PG_CTRL_MSG_LEN, &payload, sizeof(payload));
     }
-    if ((queue_controls && event->type == PG_WR_TYPE_RECV_CTRL) ||
-        (queue_future_rts && event->msg_type == PG_CTRL_MSG_RTS && cts_posts > 0)) {
+    if (queue_future_rts && event->msg_type == PG_CTRL_MSG_RTS && cts_posts > 0) {
         CHECK(pg_pending_push(&test_ctx, event->dir, msg, NULL) == PG_SUCCESS);
         return 0;
     }
@@ -136,7 +135,7 @@ static void reset_test(const struct completion *events, size_t count) {
     script_count = count;
     script_pos = 0;
     queue_future_rts = cts_posts = 0;
-    queue_controls = done_posts = 0;
+    done_posts = 0;
     eager_posts = 0;
     first_eager_header = NULL;
     repost_error = 0;
@@ -346,8 +345,8 @@ static void test_segment_limit(void) {
 
 static void test_rdv_micro_progress(void) {
     const struct completion events[] = {
-        {PG_WR_TYPE_SEND_CTRL, 0, 0, 0, 0, 0},
         {PG_WR_TYPE_RECV_CTRL, 1, PG_CTRL_MSG_RTS, 0, 12, PG_CTRL_MSG_LEN},
+        {PG_WR_TYPE_SEND_CTRL, 0, 0, 0, 0, 0},
         {PG_WR_TYPE_RECV_CTRL, 0, PG_CTRL_MSG_CTS, 0, 12, PG_CTRL_MSG_LEN},
         {PG_WR_TYPE_RDMA_WRITE, 0, 0, 0, 0, 0},
         {PG_WR_TYPE_SEND_CTRL, 1, 0, 0, 0, 0},
@@ -358,9 +357,14 @@ static void test_rdv_micro_progress(void) {
         {PG_WR_TYPE_RECV_CTRL, 1, PG_CTRL_MSG_DATA_DONE, 2, 12, PG_CTRL_MSG_LEN},
         {PG_WR_TYPE_SEND_CTRL, 0, 0, 0, 0, 0}
     };
-    for (int pending = 0; pending < 2; pending++) {
-        reset_test(events, sizeof(events) / sizeof(events[0]));
-        queue_controls = pending;
+    for (int pending_rts = 0; pending_rts < 2; pending_rts++) {
+        reset_test(events + pending_rts,
+                   sizeof(events) / sizeof(events[0]) - pending_rts);
+        if (pending_rts) {
+            struct pg_ctrl_msg rts;
+            pg_init_transfer_msg(&rts, &test_ctx, PG_CTRL_MSG_RTS, 0, 0, 12);
+            CHECK(pg_pending_push(&test_ctx, PG_QP_DIR_FROM_PREV, &rts, NULL) == PG_SUCCESS);
+        }
         test_ctx.pipeline_chunk = 8;
         test_ctx.rdma_signal_interval = 1;
         CHECK(setenv("PG_PIPELINE_CHUNK", "8", 1) == 0);
@@ -378,7 +382,7 @@ static void test_rdv_micro_progress(void) {
         CHECK(test_ctx.pending_q[0].count == 0 && test_ctx.pending_q[1].count == 0);
         CHECK(unsetenv("PG_PIPELINE_CHUNK") == 0);
     }
-    puts("Transfer: pending/live rendezvous paths reduce partial tails and notify each completion once.");
+    puts("Transfer: pending/live RTS paths reduce partial tails and notify each completion once.");
 }
 
 int main(void) {

@@ -1457,8 +1457,6 @@ static int pg_ring_step_transfer_eager(struct pg_context *ctx, const struct pg_r
             clock_gettime(CLOCK_MONOTONIC, &start);
         }
 
-        if (eager_completed_micros == num_send_micros && eager_recv_micros == num_recv_micros) break;
-
         /* Poll CQ completions */
         struct pg_progress_event ev;
         int rc = pg_progress_poll(ctx, &ev);
@@ -1607,41 +1605,18 @@ static int pg_ring_step_transfer_rdv(struct pg_context *ctx, const struct pg_rin
     struct timespec start, now;
     clock_gettime(CLOCK_MONOTONIC, &start);
 
+    /* Only RTS can precede this transfer's handshake; later replies use the live path. */
+    struct pg_progress_event pmsg;
+    if (!rts_received && num_recv_micros > 0 && pg_progress_pop_pending(
+            ctx, PG_QP_DIR_FROM_PREV, PG_CTRL_MSG_RTS,
+            desc->recv_tag, &pmsg)) {
+        int rc = pg_rdv_reply_cts(ctx, desc, &pmsg.msg);
+        if (rc != PG_SUCCESS) return rc;
+        rts_received = 1;
+        clock_gettime(CLOCK_MONOTONIC, &start);
+    }
+
     while (!send_done || !recv_done) {
-        /* Check pending RTS, DATA_DONE, and CTS before posting more writes. */
-        struct pg_progress_event pmsg;
-        if (!rts_received && num_recv_micros > 0 && pg_progress_pop_pending(
-                ctx, PG_QP_DIR_FROM_PREV, PG_CTRL_MSG_RTS,
-                desc->recv_tag, &pmsg)) {
-            int rc = pg_rdv_reply_cts(ctx, desc, &pmsg.msg);
-            if (rc != PG_SUCCESS) return rc;
-            rts_received = 1;
-            clock_gettime(CLOCK_MONOTONIC, &start);
-        }
-
-        while (!recv_done && pg_progress_pop_pending(
-                   ctx, PG_QP_DIR_FROM_PREV, PG_CTRL_MSG_DATA_DONE,
-                   desc->recv_tag, &pmsg)) {
-            int rc = pg_rdv_process_data_done(desc, &pmsg.msg, chunk_size,
-                                              num_recv_micros, &data_done_recv_micros);
-            if (rc != PG_SUCCESS) return rc;
-            if (data_done_recv_micros == num_recv_micros && send_ctrl_completed_from_prev >= 1) {
-                recv_done = 1;
-            }
-            clock_gettime(CLOCK_MONOTONIC, &start);
-        }
-
-        if (!cts_received && pg_progress_pop_pending(
-                ctx, PG_QP_DIR_TO_NEXT, PG_CTRL_MSG_CTS,
-                desc->send_tag, &pmsg)) {
-            if (pmsg.msg.payload.rdv.length != desc->send_bytes ||
-                pmsg.msg.payload.rdv.remote_addr == 0) return PG_ERR_RDMA;
-            remote_addr = pmsg.msg.payload.rdv.remote_addr;
-            remote_rkey = pmsg.msg.payload.rdv.rkey;
-            cts_received = 1;
-            clock_gettime(CLOCK_MONOTONIC, &start);
-        }
-
         /* Post batched RDMA Writes within window */
         while (cts_received && rdma_posted_micros < num_send_micros &&
                (rdma_posted_micros - rdma_completed_micros) < ctx->rdma_window) {
