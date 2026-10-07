@@ -1,0 +1,2082 @@
+#define _GNU_SOURCE
+#include "pg.h"
+#include "pg_internal.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <errno.h>
+#include <limits.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <netdb.h>
+#include <arpa/inet.h>
+#include <time.h>
+#include <poll.h>
+#include <sys/mman.h>
+
+/* Global process group arguments initialized from CLI */
+struct pg_args g_pg_args = {0};
+
+/* ========================================================================= */
+/* === MODULE 1: TCP BOOTSTRAP & CLI TOPOLOGY                           === */
+/* ========================================================================= */
+
+/* Exact-length stream read helper handling EINTR and short reads */
+static int pg_tcp_read_full(int fd, void *buf, size_t len) {
+    size_t got = 0;
+    while (got < len) {
+        ssize_t n = read(fd, (char *)buf + got, len - got);
+        if (n > 0) {
+            got += (size_t)n;
+        } else if (n < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        } else {
+            /* Unexpected EOF before reading requested length */
+            return -1;
+        }
+    }
+    return 0;
+}
+
+/* Exact-length stream write helper handling EINTR and short writes */
+static int pg_tcp_write_full(int fd, const void *buf, size_t len) {
+    size_t sent = 0;
+    while (sent < len) {
+        ssize_t n = write(fd, (const char *)buf + sent, len - sent);
+        if (n > 0) {
+            sent += (size_t)n;
+        } else if (n < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        } else {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+/* Network byte-order conversions for struct pg_tcp_qp_info */
+static void pg_tcp_qp_info_to_net(const struct pg_tcp_qp_info *host, struct pg_tcp_qp_info *net) {
+    net->qpn = htonl(host->qpn);
+    net->psn = htonl(host->psn);
+    net->lid = htons(host->lid);
+    net->reserved = htons(host->reserved);
+}
+
+static void pg_tcp_qp_info_to_host(const struct pg_tcp_qp_info *net, struct pg_tcp_qp_info *host) {
+    host->qpn = ntohl(net->qpn);
+    host->psn = ntohl(net->psn);
+    host->lid = ntohs(net->lid);
+    host->reserved = ntohs(net->reserved);
+}
+
+/* Set send/receive timeouts on an active socket */
+static int pg_tcp_set_sock_timeouts(int fd, int timeout_sec) {
+    struct timeval tv;
+    tv.tv_sec = timeout_sec;
+    tv.tv_usec = 0;
+    if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0) {
+        return -1;
+    }
+    if (setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv)) < 0) {
+        return -1;
+    }
+    return 0;
+}
+
+/* Create, bind, and listen on a TCP server socket with SO_REUSEADDR */
+static int pg_tcp_create_listener(int port) {
+    struct addrinfo hints;
+    struct addrinfo *res = NULL, *t = NULL;
+    char port_str[16];
+    int sockfd = -1;
+    int opt = 1;
+
+    snprintf(port_str, sizeof(port_str), "%d", port);
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_flags = AI_PASSIVE;
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+
+    int rc = getaddrinfo(NULL, port_str, &hints, &res);
+    if (rc != 0) {
+        fprintf(stderr, "[pg_tcp] Error getaddrinfo for port %d: %s\n", port, gai_strerror(rc));
+        return -1;
+    }
+
+    for (t = res; t != NULL; t = t->ai_next) {
+        sockfd = socket(t->ai_family, t->ai_socktype, t->ai_protocol);
+        if (sockfd < 0) continue;
+
+        if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
+            close(sockfd);
+            sockfd = -1;
+            continue;
+        }
+
+        if (bind(sockfd, t->ai_addr, t->ai_addrlen) == 0) {
+            break;
+        }
+
+        close(sockfd);
+        sockfd = -1;
+    }
+
+    freeaddrinfo(res);
+
+    if (sockfd < 0) {
+        fprintf(stderr, "[pg_tcp] Error: Could not bind listener to port %d\n", port);
+        return -1;
+    }
+
+    if (listen(sockfd, 16) < 0) {
+        perror("[pg_tcp] Error: listen failed");
+        close(sockfd);
+        return -1;
+    }
+
+    return sockfd;
+}
+
+/* Connect to target host:port with retry loop and deadline */
+static int pg_tcp_connect_retry(const char *hostname, int port, int timeout_sec, int retry_ms) {
+    struct addrinfo hints;
+    struct addrinfo *res = NULL, *t = NULL;
+    char port_str[16];
+    struct timespec start, now;
+    int sockfd = -1;
+
+    snprintf(port_str, sizeof(port_str), "%d", port);
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+
+    clock_gettime(CLOCK_MONOTONIC, &start);
+
+    while (1) {
+        int rc = getaddrinfo(hostname, port_str, &hints, &res);
+        if (rc == 0) {
+            for (t = res; t != NULL; t = t->ai_next) {
+                sockfd = socket(t->ai_family, t->ai_socktype, t->ai_protocol);
+                if (sockfd < 0) continue;
+
+                if (pg_tcp_set_sock_timeouts(sockfd, PG_TCP_SOCK_TIMEOUT_SEC) < 0) {
+                    close(sockfd);
+                    sockfd = -1;
+                    continue;
+                }
+
+                if (connect(sockfd, t->ai_addr, t->ai_addrlen) == 0) {
+                    /* Connected successfully */
+                    break;
+                }
+
+                close(sockfd);
+                sockfd = -1;
+            }
+            freeaddrinfo(res);
+            res = NULL;
+        }
+
+        if (sockfd >= 0) {
+            return sockfd;
+        }
+
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        double elapsed = (now.tv_sec - start.tv_sec) + (now.tv_nsec - start.tv_nsec) / 1e9;
+        if (elapsed >= (double)timeout_sec) {
+            fprintf(stderr, "[pg_tcp] Error: Connection to %s:%d timed out after %.1f seconds\n",
+                    hostname, port, elapsed);
+            return -1;
+        }
+
+        struct timespec ts;
+        ts.tv_sec = retry_ms / 1000;
+        ts.tv_nsec = (retry_ms % 1000) * 1000000L;
+        nanosleep(&ts, NULL);
+    }
+}
+
+/* Accept incoming connection on listener with deadline */
+static int pg_tcp_accept_timeout(int listener_fd, int timeout_sec) {
+    struct pollfd pfd;
+    pfd.fd = listener_fd;
+    pfd.events = POLLIN;
+    pfd.revents = 0;
+
+    int prc = poll(&pfd, 1, timeout_sec * 1000);
+    if (prc <= 0) {
+        if (prc == 0) {
+            fprintf(stderr, "[pg_tcp] Error: Accept timed out after %d seconds\n", timeout_sec);
+        } else {
+            perror("[pg_tcp] Error: poll on listener failed");
+        }
+        return -1;
+    }
+
+    int connfd = accept(listener_fd, NULL, NULL);
+    if (connfd < 0) {
+        perror("[pg_tcp] Error: accept failed");
+        return -1;
+    }
+
+    if (pg_tcp_set_sock_timeouts(connfd, PG_TCP_SOCK_TIMEOUT_SEC) < 0) {
+        perror("[pg_tcp] Warning: set socket timeouts failed on accepted connection");
+    }
+
+    return connfd;
+}
+
+/* ========================================================================= */
+/* === MODULE 2: VERBS HARDWARE & QP LIFECYCLE                          === */
+/* ========================================================================= */
+
+/* Cleanup InfiniBand resources in reverse order */
+void pg_rdma_cleanup(struct pg_context *ctx) {
+    if (!ctx) return;
+
+    /* 1. Destroy Queue Pairs first so no in-flight or posted WRs reference MRs */
+    if (ctx->qp_to_next) {
+        ibv_destroy_qp(ctx->qp_to_next);
+        ctx->qp_to_next = NULL;
+    }
+    if (ctx->qp_from_prev) {
+        ibv_destroy_qp(ctx->qp_from_prev);
+        ctx->qp_from_prev = NULL;
+    }
+
+    /* 2. Destroy CQ after QPs are destroyed */
+    if (ctx->cq) {
+        ibv_destroy_cq(ctx->cq);
+        ctx->cq = NULL;
+    }
+
+    /* 3. Deregister all application MRs in the lazy cache (ADR-0002) */
+    for (int i = 0; i < ctx->mr_cache_count; i++) {
+        if (ctx->mr_cache[i].mr) {
+            ibv_dereg_mr(ctx->mr_cache[i].mr);
+            ctx->mr_cache[i].mr = NULL;
+        }
+    }
+    ctx->mr_cache_count = 0;
+
+    /* 4. Clean up internal staging and working buffers */
+    if (ctx->staging_mr) {
+        ibv_dereg_mr(ctx->staging_mr);
+        ctx->staging_mr = NULL;
+    }
+    if (ctx->staging_buf) {
+        free(ctx->staging_buf);
+        ctx->staging_buf = NULL;
+    }
+    ctx->staging_capacity = 0;
+
+    if (ctx->work_mr) {
+        ibv_dereg_mr(ctx->work_mr);
+        ctx->work_mr = NULL;
+    }
+    if (ctx->work_buf) {
+        free(ctx->work_buf);
+        ctx->work_buf = NULL;
+    }
+    ctx->work_capacity = 0;
+    for (int dir = 0; dir < 2; dir++) {
+        if (ctx->recv_slot_mr[dir]) {
+            ibv_dereg_mr(ctx->recv_slot_mr[dir]);
+            ctx->recv_slot_mr[dir] = NULL;
+        }
+        if (ctx->recv_slot_raw_mem[dir]) {
+            free(ctx->recv_slot_raw_mem[dir]);
+            ctx->recv_slot_raw_mem[dir] = NULL;
+        }
+        if (ctx->ctrl_send_mr[dir]) {
+            ibv_dereg_mr(ctx->ctrl_send_mr[dir]);
+            ctx->ctrl_send_mr[dir] = NULL;
+        }
+    }
+    if (ctx->pd) {
+        ibv_dealloc_pd(ctx->pd);
+        ctx->pd = NULL;
+    }
+    if (ctx->ib_ctx) {
+        ibv_close_device(ctx->ib_ctx);
+        ctx->ib_ctx = NULL;
+    }
+
+    /* 5. Free dynamically allocated eager buffers in pending queues */
+    for (int dir = 0; dir < 2; dir++) {
+        for (int k = 0; k < PG_PENDING_QUEUE_MAX; k++) {
+            if (ctx->pending_q[dir].entries[k].eager_buf) {
+                free(ctx->pending_q[dir].entries[k].eager_buf);
+                ctx->pending_q[dir].entries[k].eager_buf = NULL;
+            }
+        }
+    }
+}
+
+/* Open first IB device, query capabilities, allocate PD, CQ, QPs, and pre-post receive pool */
+int pg_rdma_init_resources(struct pg_context *ctx) {
+    if (!ctx) return PG_ERR_INVAL;
+
+    struct ibv_device **dev_list = ibv_get_device_list(NULL);
+    if (!dev_list || !dev_list[0]) {
+        fprintf(stderr, "[pg_rdma] Error: No InfiniBand devices found\n");
+        if (dev_list) ibv_free_device_list(dev_list);
+        return PG_ERR_RDMA;
+    }
+
+    ctx->ib_ctx = ibv_open_device(dev_list[0]);
+    ibv_free_device_list(dev_list);
+    if (!ctx->ib_ctx) {
+        fprintf(stderr, "[pg_rdma] Error: Could not open InfiniBand device\n");
+        return PG_ERR_RDMA;
+    }
+
+    /* Query port attributes for LID and active MTU */
+    struct ibv_port_attr port_attr;
+    if (ibv_query_port(ctx->ib_ctx, PG_IB_PORT, &port_attr)) {
+        fprintf(stderr, "[pg_rdma] Error: Could not query IB port %d\n", PG_IB_PORT);
+        pg_rdma_cleanup(ctx);
+        return PG_ERR_RDMA;
+    }
+    ctx->local_lid = port_attr.lid;
+    ctx->active_mtu = port_attr.active_mtu;
+
+    /* Query device attributes for max_qp_wr */
+    struct ibv_device_attr dev_attr;
+    if (ibv_query_device(ctx->ib_ctx, &dev_attr)) {
+        fprintf(stderr, "[pg_rdma] Error: Could not query device attributes\n");
+        pg_rdma_cleanup(ctx);
+        return PG_ERR_RDMA;
+    }
+
+    uint32_t max_send_wr = 256;
+    uint32_t max_recv_wr = PG_CTRL_POOL_DEPTH;
+    if (max_send_wr > (uint32_t)dev_attr.max_qp_wr) max_send_wr = dev_attr.max_qp_wr;
+    if (max_recv_wr > (uint32_t)dev_attr.max_qp_wr) max_recv_wr = dev_attr.max_qp_wr;
+
+    /* Allocate Protection Domain */
+    ctx->pd = ibv_alloc_pd(ctx->ib_ctx);
+    if (!ctx->pd) {
+        fprintf(stderr, "[pg_rdma] Error: Could not allocate Protection Domain\n");
+        pg_rdma_cleanup(ctx);
+        return PG_ERR_RDMA;
+    }
+
+    /* Register unified receive and send buffers */
+    for (int dir = 0; dir < 2; dir++) {
+        size_t total_recv_bytes = (size_t)PG_CTRL_POOL_DEPTH * (size_t)PG_EAGER_SLOT_SIZE;
+        ctx->recv_slot_raw_mem[dir] = malloc(total_recv_bytes);
+        if (!ctx->recv_slot_raw_mem[dir]) {
+            fprintf(stderr, "[pg_rdma] Error: Could not allocate unified receive memory for dir %d\n", dir);
+            pg_rdma_cleanup(ctx);
+            return PG_ERR_NOMEM;
+        }
+        for (int slot = 0; slot < PG_CTRL_POOL_DEPTH; slot++) {
+            ctx->recv_slot_buf[dir][slot] = (char *)ctx->recv_slot_raw_mem[dir] + (size_t)slot * (size_t)PG_EAGER_SLOT_SIZE;
+        }
+        ctx->recv_slot_mr[dir] = ibv_reg_mr(ctx->pd, ctx->recv_slot_raw_mem[dir], total_recv_bytes,
+                                            IBV_ACCESS_LOCAL_WRITE);
+        if (!ctx->recv_slot_mr[dir]) {
+            fprintf(stderr, "[pg_rdma] Error: Could not register unified receive MR for dir %d\n", dir);
+            pg_rdma_cleanup(ctx);
+            return PG_ERR_RDMA;
+        }
+
+        ctx->ctrl_send_mr[dir] = ibv_reg_mr(ctx->pd, ctx->ctrl_send_buf[dir],
+                                           sizeof(ctx->ctrl_send_buf[dir]),
+                                           IBV_ACCESS_LOCAL_WRITE);
+        if (!ctx->ctrl_send_mr[dir]) {
+            fprintf(stderr, "[pg_rdma] Error: Could not register control send MR for dir %d\n", dir);
+            pg_rdma_cleanup(ctx);
+            return PG_ERR_RDMA;
+        }
+
+        /* Preallocate eager buffers for short pending bursts; deeper queues grow lazily. */
+        for (int k = 0; k < PG_CTRL_POOL_DEPTH; k++) {
+            ctx->pending_q[dir].entries[k].eager_buf = (char *)malloc(PG_EAGER_SLOT_SIZE);
+            if (!ctx->pending_q[dir].entries[k].eager_buf) {
+                fprintf(stderr, "[pg_rdma] Error: Could not pre-allocate pending eager buffer for dir %d slot %d\n", dir, k);
+                pg_rdma_cleanup(ctx);
+                return PG_ERR_NOMEM;
+            }
+        }
+    }
+
+    /* Create shared CQ for both QPs */
+    int cq_depth = (int)((max_send_wr + max_recv_wr) * 2);
+    ctx->cq = ibv_create_cq(ctx->ib_ctx, cq_depth, NULL, NULL, 0);
+    if (!ctx->cq) {
+        fprintf(stderr, "[pg_rdma] Error: Could not create shared CQ of depth %d\n", cq_depth);
+        pg_rdma_cleanup(ctx);
+        return PG_ERR_RDMA;
+    }
+
+    /* Create qp_to_next (dir 0) and qp_from_prev (dir 1) with inline stepping */
+    for (int dir = 0; dir < 2; dir++) {
+        struct ibv_qp **qp_ptr = (dir == PG_QP_DIR_TO_NEXT) ? &ctx->qp_to_next : &ctx->qp_from_prev;
+        int try_inline;
+
+        for (try_inline = PG_MAX_INLINE_DECLARE;; try_inline -= 64) {
+            struct ibv_qp_init_attr init_attr = {
+                .send_cq = ctx->cq,
+                .recv_cq = ctx->cq,
+                .cap = {
+                    .max_send_wr = max_send_wr,
+                    .max_recv_wr = max_recv_wr,
+                    .max_send_sge = 2,
+                    .max_recv_sge = 1,
+                    .max_inline_data = (uint32_t)(try_inline > 0 ? try_inline : 0)
+                },
+                .qp_type = IBV_QPT_RC
+            };
+
+            *qp_ptr = ibv_create_qp(ctx->pd, &init_attr);
+            if (*qp_ptr || try_inline <= 0) break;
+        }
+
+        if (!*qp_ptr) {
+            fprintf(stderr, "[pg_rdma] Error: Could not create RC QP for dir %d: %s\n", dir, strerror(errno));
+            pg_rdma_cleanup(ctx);
+            return PG_ERR_RDMA;
+        }
+
+        /* Read back the actual runtime inline-send limit. */
+        struct ibv_qp_attr qp_attr;
+        struct ibv_qp_init_attr qp_init_attr;
+        if (ibv_query_qp(*qp_ptr, &qp_attr, IBV_QP_CAP, &qp_init_attr)) {
+            fprintf(stderr, "[pg_rdma] Error: Could not query QP attributes for dir %d\n", dir);
+            pg_rdma_cleanup(ctx);
+            return PG_ERR_RDMA;
+        }
+        ctx->max_inline_data[dir] = qp_init_attr.cap.max_inline_data;
+
+        /* Transition QP to INIT */
+        struct ibv_qp_attr attr = {
+            .qp_state = IBV_QPS_INIT,
+            .pkey_index = 0,
+            .port_num = PG_IB_PORT,
+            .qp_access_flags = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ
+        };
+        if (ibv_modify_qp(*qp_ptr, &attr,
+                IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS)) {
+            fprintf(stderr, "[pg_rdma] Error: Failed to transition QP %d to INIT\n", dir);
+            pg_rdma_cleanup(ctx);
+            return PG_ERR_RDMA;
+        }
+
+        /* Pre-post 32 unified single-SGE receive WRs (header + eager payload buffer) */
+        for (int slot = 0; slot < PG_CTRL_POOL_DEPTH; slot++) {
+            if (pg_repost_recv_slot(ctx, dir, slot)) {
+                fprintf(stderr, "[pg_rdma] Error: Failed to pre-post recv slot %d on QP %d\n", slot, dir);
+                pg_rdma_cleanup(ctx);
+                return PG_ERR_RDMA;
+            }
+        }
+    }
+
+    /* Populate local QP metadata for TCP bootstrap */
+    srand48((long)(time(NULL) ^ (ctx->rank << 16)));
+    ctx->local_to_next.qpn = ctx->qp_to_next->qp_num;
+    ctx->local_to_next.psn = (uint32_t)(lrand48() & 0xFFFFFF);
+    ctx->local_to_next.lid = ctx->local_lid;
+    ctx->local_to_next.reserved = 0;
+
+    ctx->local_from_prev.qpn = ctx->qp_from_prev->qp_num;
+    ctx->local_from_prev.psn = (uint32_t)(lrand48() & 0xFFFFFF);
+    ctx->local_from_prev.lid = ctx->local_lid;
+    ctx->local_from_prev.reserved = 0;
+
+    return PG_SUCCESS;
+}
+
+/* Post one 2-SGE eager payload SEND message (ADR-0003) */
+int pg_post_eager_send(struct pg_context *ctx, int qp_dir, const struct pg_ctrl_msg *hdr,
+                       void *payload_addr, uint32_t payload_len, uint32_t lkey, int signaled, uint32_t slot) {
+    if (!ctx || !hdr || (qp_dir != PG_QP_DIR_TO_NEXT && qp_dir != PG_QP_DIR_FROM_PREV)) {
+        return PG_ERR_INVAL;
+    }
+
+    struct ibv_qp *target_qp = (qp_dir == PG_QP_DIR_TO_NEXT) ? ctx->qp_to_next : ctx->qp_from_prev;
+    uint32_t s = slot % PG_CTRL_POOL_DEPTH;
+
+    /* Copy header into dedicated slot in registered unified ctrl_send_buf */
+    memcpy(ctx->ctrl_send_buf[qp_dir][s], hdr, sizeof(*hdr));
+
+    struct ibv_sge sges[2];
+    sges[0].addr   = (uintptr_t)ctx->ctrl_send_buf[qp_dir][s];
+    sges[0].length = sizeof(*hdr);
+    sges[0].lkey   = ctx->ctrl_send_mr[qp_dir]->lkey;
+
+    sges[1].addr   = (uintptr_t)payload_addr;
+    sges[1].length = payload_len;
+    sges[1].lkey   = lkey;
+
+    struct ibv_send_wr wr = {
+        .wr_id      = pg_make_wr_slot(qp_dir, PG_WR_TYPE_EAGER_SEND, s),
+        .opcode     = IBV_WR_SEND,
+        .send_flags = signaled ? IBV_SEND_SIGNALED : 0,
+        .sg_list    = sges,
+        .num_sge    = (payload_len > 0) ? 2 : 1,
+        .next       = NULL
+    };
+
+    if ((sizeof(*hdr) + (size_t)payload_len) <= ctx->max_inline_data[qp_dir]) {
+        wr.send_flags |= IBV_SEND_INLINE;
+    }
+
+    struct ibv_send_wr *bad_wr = NULL;
+    if (ibv_post_send(target_qp, &wr, &bad_wr)) {
+        perror("[pg_rdma] Error: ibv_post_send failed for eager SEND");
+        return PG_ERR_RDMA;
+    }
+
+    return PG_SUCCESS;
+}
+
+/* Transition QP to RTR then RTS using remote connection metadata */
+int pg_rdma_connect_qp(struct ibv_qp *qp, const struct pg_tcp_qp_info *remote,
+                       uint32_t my_psn, enum ibv_mtu active_mtu) {
+    if (!qp || !remote) return PG_ERR_INVAL;
+
+    /* 1. Transition to RTR */
+    struct ibv_qp_attr attr = {
+        .qp_state           = IBV_QPS_RTR,
+        .path_mtu           = active_mtu,
+        .dest_qp_num        = remote->qpn,
+        .rq_psn             = remote->psn,
+        .max_dest_rd_atomic = 1,
+        .min_rnr_timer      = 12,
+        .ah_attr            = {
+            .is_global      = 0,
+            .dlid           = remote->lid,
+            .sl             = 0,
+            .src_path_bits  = 0,
+            .port_num       = PG_IB_PORT
+        }
+    };
+
+    int flags = IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU |
+                IBV_QP_DEST_QPN | IBV_QP_RQ_PSN |
+                IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER;
+
+    if (ibv_modify_qp(qp, &attr, flags)) {
+        fprintf(stderr, "[pg_rdma] Error: Failed to modify QP to RTR (dest_qpn=%u, dlid=%u)\n",
+                remote->qpn, remote->lid);
+        return PG_ERR_RDMA;
+    }
+
+    /* 2. Transition to RTS */
+    memset(&attr, 0, sizeof(attr));
+    attr.qp_state       = IBV_QPS_RTS;
+    attr.timeout        = PG_IB_QP_TIMEOUT;
+    attr.retry_cnt      = PG_IB_QP_RETRY_CNT;
+    attr.rnr_retry      = PG_IB_QP_RNR_RETRY;
+    attr.sq_psn         = my_psn;
+    attr.max_rd_atomic  = 1;
+
+    flags = IBV_QP_STATE | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT |
+            IBV_QP_RNR_RETRY | IBV_QP_SQ_PSN | IBV_QP_MAX_QP_RD_ATOMIC;
+
+    if (ibv_modify_qp(qp, &attr, flags)) {
+        fprintf(stderr, "[pg_rdma] Error: Failed to modify QP to RTS\n");
+        return PG_ERR_RDMA;
+    }
+
+    return PG_SUCCESS;
+}
+
+/* Post one signaled control SEND message */
+int pg_post_ctrl_send(struct pg_context *ctx, int qp_dir, const struct pg_ctrl_msg *msg) {
+    if (!ctx || !msg || (qp_dir != PG_QP_DIR_TO_NEXT && qp_dir != PG_QP_DIR_FROM_PREV)) {
+        return PG_ERR_INVAL;
+    }
+
+    struct ibv_qp *target_qp = (qp_dir == PG_QP_DIR_TO_NEXT) ? ctx->qp_to_next : ctx->qp_from_prev;
+    struct ibv_sge sge = {
+        .addr   = (uintptr_t)msg,
+        .length = sizeof(*msg),
+        .lkey   = 0
+    };
+    struct ibv_send_wr wr = {
+        .wr_id      = pg_make_wr(qp_dir, PG_WR_TYPE_SEND_CTRL),
+        .opcode     = IBV_WR_SEND,
+        .send_flags = IBV_SEND_SIGNALED,
+        .sg_list    = &sge,
+        .num_sge    = 1,
+        .next       = NULL
+    };
+    struct ibv_send_wr *bad_wr = NULL;
+
+    if (ctx->max_inline_data[qp_dir] >= (uint32_t)sizeof(*msg)) {
+        wr.send_flags |= IBV_SEND_INLINE;
+    } else {
+        uint32_t s = (ctx->ctrl_send_slot[qp_dir]++) % PG_CTRL_POOL_DEPTH;
+        memcpy(ctx->ctrl_send_buf[qp_dir][s], msg, sizeof(*msg));
+        sge.addr = (uintptr_t)ctx->ctrl_send_buf[qp_dir][s];
+        sge.lkey = ctx->ctrl_send_mr[qp_dir]->lkey;
+    }
+
+    if (ibv_post_send(target_qp, &wr, &bad_wr)) {
+        perror("[pg_rdma] Error: ibv_post_send failed for control SEND");
+        return PG_ERR_RDMA;
+    }
+
+    return PG_SUCCESS;
+}
+
+/* ========================================================================= */
+/* === MODULE 3: MEMORY REGISTRATION & STAGING CACHE                    === */
+/* ========================================================================= */
+
+/* Lazy MR Cache registration helper (ADR-0002) */
+struct ibv_mr *pg_get_or_reg_mr(struct pg_context *ctx, void *addr, size_t length, int access_flags) {
+    if (!ctx || !addr || length == 0) return NULL;
+
+    /* Check if exact (addr, length) or containing MR with sufficient access_flags is already cached */
+    for (int i = 0; i < ctx->mr_cache_count; i++) {
+        uintptr_t cached_start = (uintptr_t)ctx->mr_cache[i].addr;
+        uintptr_t cached_end = cached_start + ctx->mr_cache[i].length;
+        uintptr_t req_start = (uintptr_t)addr;
+        uintptr_t req_end = req_start + length;
+
+        if (req_start >= cached_start && req_end <= cached_end) {
+            if ((ctx->mr_cache[i].access_flags & access_flags) == access_flags) {
+                return ctx->mr_cache[i].mr;
+            }
+        }
+    }
+
+    if (ctx->mr_cache_count >= PG_MR_CACHE_MAX) {
+        fprintf(stderr, "[pg_rdma] Error: MR cache full (max %d entries)\n", PG_MR_CACHE_MAX);
+        return NULL;
+    }
+
+    struct ibv_mr *mr = ibv_reg_mr(ctx->pd, addr, length, access_flags);
+    if (!mr) {
+        perror("[pg_rdma] Error: ibv_reg_mr failed");
+        return NULL;
+    }
+
+    int idx = ctx->mr_cache_count++;
+    ctx->mr_cache[idx].addr = addr;
+    ctx->mr_cache[idx].length = length;
+    ctx->mr_cache[idx].access_flags = access_flags;
+    ctx->mr_cache[idx].mr = mr;
+
+    return mr;
+}
+
+/* Ensure internal staging and safe-mode work buffers are allocated and registered (ADR-0002) */
+int pg_ensure_internal_buffers(struct pg_context *ctx, size_t count_bytes, size_t segment_bytes) {
+    if (!ctx) return PG_ERR_INVAL;
+
+    /* 1. Staging buffer: needs at least segment_bytes */
+    if (ctx->staging_capacity < segment_bytes) {
+        if (ctx->staging_mr) {
+            ibv_dereg_mr(ctx->staging_mr);
+            ctx->staging_mr = NULL;
+        }
+        if (ctx->staging_buf) {
+            free(ctx->staging_buf);
+            ctx->staging_buf = NULL;
+        }
+
+        size_t align = (segment_bytes >= PG_HUGEPAGE_ALIGN_BYTES) ? PG_HUGEPAGE_ALIGN_BYTES : PG_CACHELINE_ALIGN_BYTES;
+        if (posix_memalign((void **)&ctx->staging_buf, align, segment_bytes) != 0 || !ctx->staging_buf) {
+            ctx->staging_capacity = 0;
+            return PG_ERR_NOMEM;
+        }
+#ifdef MADV_HUGEPAGE
+        if (segment_bytes >= PG_HUGEPAGE_ALIGN_BYTES) {
+            madvise(ctx->staging_buf, segment_bytes, MADV_HUGEPAGE);
+        }
+#endif
+        ctx->staging_capacity = segment_bytes;
+
+        ctx->staging_mr = ibv_reg_mr(ctx->pd, ctx->staging_buf, ctx->staging_capacity,
+                                     IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
+        if (!ctx->staging_mr) {
+            perror("[pg_rdma] Error: ibv_reg_mr failed for staging buffer");
+            free(ctx->staging_buf);
+            ctx->staging_buf = NULL;
+            ctx->staging_capacity = 0;
+            return PG_ERR_RDMA;
+        }
+    }
+
+#ifndef PG_WORKBUFFER_INPLACE
+    /* 2. Work buffer: needs at least count_bytes in safe mode */
+    if (ctx->work_capacity < count_bytes) {
+        if (ctx->work_mr) {
+            ibv_dereg_mr(ctx->work_mr);
+            ctx->work_mr = NULL;
+        }
+        if (ctx->work_buf) {
+            free(ctx->work_buf);
+            ctx->work_buf = NULL;
+        }
+
+        size_t align = (count_bytes >= PG_HUGEPAGE_ALIGN_BYTES) ? PG_HUGEPAGE_ALIGN_BYTES : PG_CACHELINE_ALIGN_BYTES;
+        if (posix_memalign((void **)&ctx->work_buf, align, count_bytes) != 0 || !ctx->work_buf) {
+            ctx->work_capacity = 0;
+            return PG_ERR_NOMEM;
+        }
+#ifdef MADV_HUGEPAGE
+        if (count_bytes >= PG_HUGEPAGE_ALIGN_BYTES) {
+            madvise(ctx->work_buf, count_bytes, MADV_HUGEPAGE);
+        }
+#endif
+        ctx->work_capacity = count_bytes;
+
+        ctx->work_mr = ibv_reg_mr(ctx->pd, ctx->work_buf, ctx->work_capacity,
+                                  IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
+        if (!ctx->work_mr) {
+            perror("[pg_rdma] Error: ibv_reg_mr failed for work buffer");
+            free(ctx->work_buf);
+            ctx->work_buf = NULL;
+            ctx->work_capacity = 0;
+            return PG_ERR_RDMA;
+        }
+    }
+#else
+    (void)count_bytes;
+#endif
+
+    return PG_SUCCESS;
+}
+
+/* Initialize Runtime Hyperparameters from Environment with compile-time defaults */
+void pg_init_tuning_params(struct pg_context *ctx) {
+    if (!ctx) return;
+
+    ctx->pipeline_chunk = PG_PIPELINE_CHUNK;
+    const char *chunk_env = getenv("PG_PIPELINE_CHUNK");
+    if (chunk_env && *chunk_env) {
+        char *end;
+        errno = 0;
+        unsigned long val = strtoul(chunk_env, &end, 10);
+        /* Every supported datatype fits in a whole 8-byte chunk boundary. */
+        if (!errno && chunk_env[0] != '-' && *end == '\0' &&
+            val >= sizeof(double) && val <= UINT32_MAX && val % sizeof(double) == 0) {
+            ctx->pipeline_chunk = (size_t)val;
+        } else {
+            fprintf(stderr, "[pg] Ignoring invalid PG_PIPELINE_CHUNK=%s\n", chunk_env);
+        }
+    }
+
+    ctx->rdma_window = PG_RDMA_WINDOW;
+    const char *win_env = getenv("PG_RDMA_WINDOW");
+    if (win_env && *win_env) {
+        unsigned long val = strtoul(win_env, NULL, 10);
+        if (val > 0) ctx->rdma_window = (uint32_t)val;
+    }
+
+    ctx->rdma_signal_interval = PG_RDMA_SIGNAL_INTERVAL;
+    const char *sig_env = getenv("PG_RDMA_SIGNAL_INTERVAL");
+    if (sig_env && *sig_env) {
+        unsigned long val = strtoul(sig_env, NULL, 10);
+        if (val > 0) ctx->rdma_signal_interval = (uint32_t)val;
+    }
+    if (ctx->rdma_signal_interval > ctx->rdma_window) {
+        ctx->rdma_signal_interval = ctx->rdma_window;
+    }
+
+    ctx->batch_size = PG_DEFAULT_BATCH_SIZE;
+    const char *batch_env = getenv("PG_BATCH_SIZE");
+    if (batch_env && *batch_env) {
+        unsigned long val = strtoul(batch_env, NULL, 10);
+        if (val > 0) ctx->batch_size = (uint32_t)val;
+    }
+
+    ctx->eager_threshold = PG_EAGER_THRESHOLD;
+    const char *eager_env = getenv("PG_EAGER_THRESHOLD");
+    if (eager_env && *eager_env) {
+        size_t val = (size_t)strtoul(eager_env, NULL, 10);
+        if (val > 0) ctx->eager_threshold = val;
+    }
+
+    ctx->eager_window = PG_EAGER_WINDOW;
+    const char *ewin_env = getenv("PG_EAGER_WINDOW");
+    if (ewin_env && *ewin_env) {
+        char *end;
+        errno = 0;
+        unsigned long val = strtoul(ewin_env, &end, 10);
+        if (!errno && ewin_env[0] != '-' && *end == '\0' && val > 0) {
+            ctx->eager_window = (uint32_t)(val > PG_CTRL_POOL_DEPTH ? PG_CTRL_POOL_DEPTH : val);
+        } else {
+            fprintf(stderr, "[pg] Ignoring invalid PG_EAGER_WINDOW=%s\n", ewin_env);
+        }
+    }
+
+}
+
+/* ========================================================================= */
+/* === MODULE 5: SSE4.2 VECTOR REDUCTION COMPUTE KERNELS                === */
+/* ========================================================================= */
+
+/* Macro helpers for 4x unrolled SSE4.2 SIMD vector reduction */
+#define PG_LOAD_SI128(p) _mm_loadu_si128((const __m128i *)(p))
+#define PG_STORE_SI128(p, v) _mm_storeu_si128((__m128i *)(p), (v))
+
+#define PG_REDUCE_LOOP_4X(vtype, load_fn, store_fn, vec_op, scalar_op, step) do { \
+    for (; i + ((step) * 4) <= count; i += ((step) * 4)) { \
+        vtype vd0 = load_fn(d + i); \
+        vtype vd1 = load_fn(d + i + (step)); \
+        vtype vd2 = load_fn(d + i + (step) * 2); \
+        vtype vd3 = load_fn(d + i + (step) * 3); \
+        vtype vs0 = load_fn(s + i); \
+        vtype vs1 = load_fn(s + i + (step)); \
+        vtype vs2 = load_fn(s + i + (step) * 2); \
+        vtype vs3 = load_fn(s + i + (step) * 3); \
+        store_fn(d + i, vec_op(vd0, vs0)); \
+        store_fn(d + i + (step), vec_op(vd1, vs1)); \
+        store_fn(d + i + (step) * 2, vec_op(vd2, vs2)); \
+        store_fn(d + i + (step) * 3, vec_op(vd3, vs3)); \
+    } \
+    for (; i + (step) <= count; i += (step)) { \
+        vtype vd = load_fn(d + i); \
+        vtype vs = load_fn(s + i); \
+        store_fn(d + i, vec_op(vd, vs)); \
+    } \
+    for (; i < count; i++) { scalar_op; } \
+} while(0)
+
+#define PG_REDUCE_OP_CASES(vtype, load_fn, store_fn, add_vec, min_vec, max_vec, mul_vec, step) do { \
+    int i = 0; \
+    if (op == PG_SUM) { \
+        PG_REDUCE_LOOP_4X(vtype, load_fn, store_fn, add_vec, d[i] += s[i], step); \
+    } else if (op == PG_MIN) { \
+        PG_REDUCE_LOOP_4X(vtype, load_fn, store_fn, min_vec, if (s[i] < d[i]) d[i] = s[i], step); \
+    } else if (op == PG_MAX) { \
+        PG_REDUCE_LOOP_4X(vtype, load_fn, store_fn, max_vec, if (s[i] > d[i]) d[i] = s[i], step); \
+    } else if (op == PG_PROD) { \
+        PG_REDUCE_LOOP_4X(vtype, load_fn, store_fn, mul_vec, d[i] *= s[i], step); \
+    } \
+} while(0)
+
+/* Vectorized CPU reduction engine with SSE4.2 and 4x loop unrolling */
+void pg_reduce_buffer(void *dest, const void *src, int count,
+                      DATATYPE datatype, OPERATION op) {
+    if (count <= 0 || !dest || !src) return;
+
+    switch (datatype) {
+        case PG_INT: {
+            int32_t *d = (int32_t *)dest;
+            const int32_t *s = (const int32_t *)src;
+            PG_REDUCE_OP_CASES(__m128i,
+                               PG_LOAD_SI128, PG_STORE_SI128,
+                               _mm_add_epi32, _mm_min_epi32, _mm_max_epi32, _mm_mullo_epi32, 4);
+            break;
+        }
+
+        case PG_FLOAT: {
+            float *d = (float *)dest;
+            const float *s = (const float *)src;
+            PG_REDUCE_OP_CASES(__m128,
+                               _mm_loadu_ps, _mm_storeu_ps,
+                               _mm_add_ps, _mm_min_ps, _mm_max_ps, _mm_mul_ps, 4);
+            break;
+        }
+
+        case PG_DOUBLE: {
+            double *d = (double *)dest;
+            const double *s = (const double *)src;
+            PG_REDUCE_OP_CASES(__m128d,
+                               _mm_loadu_pd, _mm_storeu_pd,
+                               _mm_add_pd, _mm_min_pd, _mm_max_pd, _mm_mul_pd, 2);
+            break;
+        }
+
+        default:
+            break;
+    }
+}
+
+/* ========================================================================= */
+/* === MODULE 4: PROGRESS ENGINE & CQ DISPATCH (ADR-0001, CONTEXT.md)   === */
+/* Encapsulates CQ polling, wr_id decoding, automatic receive buffer        */
+/* replenishment, and pending FIFO message queue matching.                   */
+/* ========================================================================= */
+
+struct pg_progress_event {
+    int type;                               /* PG_WR_TYPE_RECV_CTRL, PG_WR_TYPE_RDMA_WRITE, PG_WR_TYPE_SEND_CTRL, PG_WR_TYPE_EAGER_SEND */
+    int qp_dir;                             /* PG_QP_DIR_TO_NEXT (0) or PG_QP_DIR_FROM_PREV (1) */
+    uint32_t slot;                          /* Slot index or micro-chunk sequence index */
+    struct pg_ctrl_msg msg;                 /* Message content (for PG_WR_TYPE_RECV_CTRL) */
+    char *eager_buf;                        /* Pointer to eager payload if type is EAGER_PAYLOAD */
+    uint32_t eager_len;                     /* Length of eager payload */
+};
+
+/* Pop matching message from internal FIFO pending queue */
+static inline int pg_progress_pop_pending(struct pg_context *ctx, int qp_dir, int msg_type,
+                                          uint32_t seg_idx,
+                                          struct pg_progress_event *out_event) {
+    if (!ctx || qp_dir < 0 || qp_dir >= 2 || !out_event) return 0;
+    struct pg_ctrl_msg msg;
+    uint32_t eager_len = 0;
+    void *target_buf = (msg_type == PG_CTRL_MSG_EAGER_PAYLOAD) ? ctx->eager_rx_buf : NULL;
+    if (pg_pending_pop_matching(ctx, qp_dir, msg_type, seg_idx,
+                                &msg, target_buf, &eager_len)) {
+        out_event->type = PG_WR_TYPE_RECV_CTRL;
+        out_event->qp_dir = qp_dir;
+        out_event->slot = (uint32_t)-1;
+        out_event->msg = msg;
+        out_event->eager_buf = (msg.type == PG_CTRL_MSG_EAGER_PAYLOAD) ? ctx->eager_rx_buf : NULL;
+        out_event->eager_len = eager_len;
+        return 1;
+    }
+    return 0;
+}
+
+/* A live receive may match only when no older message is pending on its RC QP. */
+static inline int pg_progress_recv_matches(const struct pg_context *ctx,
+                                           const struct pg_progress_event *ev,
+                                           int qp_dir, int msg_type,
+                                           uint32_t seg_idx) {
+    return ev->type == PG_WR_TYPE_RECV_CTRL && ev->qp_dir == qp_dir &&
+           ctx->pending_q[qp_dir].count == 0 &&
+           pg_ctrl_msg_matches(&ev->msg, msg_type, seg_idx);
+}
+
+/* Non-blocking single CQ poll and event decoder with auto receive slot replenishment */
+static inline int pg_progress_poll(struct pg_context *ctx, struct pg_progress_event *out_event) {
+    if (!ctx || !out_event) return PG_ERR_INVAL;
+
+    struct ibv_wc wc;
+    int ne = ibv_poll_cq(ctx->cq, 1, &wc);
+    if (ne < 0) {
+        fprintf(stderr, "[pg_progress] Error: ibv_poll_cq failed with code %d\n", ne);
+        return PG_ERR_RDMA;
+    }
+    if (ne == 0) {
+        return 0; /* No completion ready */
+    }
+
+    /* Compiler memory barrier ensuring strict DMA completion visibility before reading wc/payload */
+    asm volatile("" ::: "memory");
+
+    if (wc.status != IBV_WC_SUCCESS) {
+        fprintf(stderr, "[pg_progress] Error: CQ completion error %s (%d) on wr_id 0x%lx\n",
+                ibv_wc_status_str(wc.status), wc.status, (unsigned long)wc.wr_id);
+        return PG_ERR_RDMA;
+    }
+
+    out_event->type = pg_wr_type(wc.wr_id);
+    out_event->qp_dir = pg_wr_qp(wc.wr_id);
+    out_event->slot = pg_wr_slot(wc.wr_id);
+    out_event->eager_buf = NULL;
+    out_event->eager_len = 0;
+
+    if (out_event->type == PG_WR_TYPE_RECV_CTRL) {
+        if (wc.byte_len < PG_CTRL_MSG_LEN) {
+            fprintf(stderr, "[pg_progress] Error: Truncated control header (%u bytes)\n", wc.byte_len);
+            return PG_ERR_RDMA;
+        }
+        int dir = out_event->qp_dir;
+        int slot = (int)out_event->slot;
+        struct pg_ctrl_msg *rhdr = pg_recv_slot_msg(ctx, dir, slot);
+
+        if (rhdr->tag != PG_CTRL_TAG) {
+            fprintf(stderr, "[pg_progress] Error: Invalid tag 0x%08x on qp_dir %d slot %d\n",
+                    rhdr->tag, dir, slot);
+            return PG_ERR_RDMA;
+        }
+
+        out_event->msg = *rhdr;
+        if (rhdr->type == PG_CTRL_MSG_EAGER_PAYLOAD) {
+            if (rhdr->payload.rdv.length > PG_EAGER_BUF_SIZE) {
+                fprintf(stderr, "[pg_progress] Error: Eager payload length %u exceeds %u bytes\n",
+                        rhdr->payload.rdv.length, (unsigned)PG_EAGER_BUF_SIZE);
+                return PG_ERR_RDMA;
+            }
+            uint32_t elen = rhdr->payload.rdv.length + PG_CTRL_MSG_LEN;
+            if (wc.byte_len != elen) {
+                fprintf(stderr, "[pg_progress] Error: Eager receive length %u != %u bytes\n",
+                        wc.byte_len, elen);
+                return PG_ERR_RDMA;
+            }
+            /*
+             * Direct Zero-Copy CPU Receive Path (Phase 2):
+             * Point eager_buf directly to the registered receive slot buffer instead of copying
+             * 64 KiB into a temporary scratchpad. Reposting is deferred until after the consumer
+             * executes vector reduction or memcpy directly from the receive slot, eliminating
+             * redundant memory passes and cache line pollution on the critical path.
+             */
+            out_event->eager_buf = ctx->recv_slot_buf[dir][slot];
+            out_event->eager_len = wc.byte_len;
+        } else {
+            if (wc.byte_len != PG_CTRL_MSG_LEN) return PG_ERR_RDMA;
+            /* Automatically repost the consumed control receive buffer slot */
+            if (pg_repost_recv_slot(ctx, dir, slot)) {
+                perror("[pg_progress] Error: Failed to repost receive buffer slot");
+                return PG_ERR_RDMA;
+            }
+        }
+    }
+
+    return 1;
+}
+
+/* Automatically buffer unexpected incoming receive messages into pending queue */
+static inline int pg_progress_buffer_unexpected(struct pg_context *ctx,
+                                                const struct pg_progress_event *ev) {
+    if (ctx && ev && ev->type == PG_WR_TYPE_RECV_CTRL) {
+        int rc = pg_pending_push(ctx, ev->qp_dir, &ev->msg, ev->eager_buf);
+        if (ev->msg.type == PG_CTRL_MSG_EAGER_PAYLOAD && ev->slot != (uint32_t)-1) {
+            if (pg_repost_recv_slot(ctx, ev->qp_dir, (int)ev->slot)) {
+                return PG_ERR_RDMA;
+            }
+        }
+        return rc;
+    }
+    return PG_SUCCESS;
+}
+
+/* ========================================================================= */
+/* === PROCESS GROUP LIFECYCLE                                          === */
+/* ========================================================================= */
+
+/* Edge-ordered ring-only TCP bootstrap exchanging real QP metadata */
+int pg_tcp_bootstrap(struct pg_context *ctx) {
+    if (!ctx) return PG_ERR_INVAL;
+
+    int listen_port = PG_TCP_BASE_PORT + ctx->rank;
+    int listener_fd = pg_tcp_create_listener(listen_port);
+    if (listener_fd < 0) {
+        fprintf(stderr, "[pg_tcp] Rank %d failed to bind listener port %d\n", ctx->rank, listen_port);
+        return PG_ERR_TCP;
+    }
+
+    int rc = PG_SUCCESS;
+
+    /* Loop over all edges in deterministic ring order: edge e connects e -> (e+1)%size */
+    for (int edge = 0; edge < ctx->size; edge++) {
+        int sender_rank = edge;
+        int receiver_rank = (edge + 1) % ctx->size;
+
+        if (ctx->rank == sender_rank) {
+            /* Client side for edge sender_rank -> receiver_rank */
+            int target_port = PG_TCP_BASE_PORT + receiver_rank;
+            const char *target_host = ctx->host_list[receiver_rank];
+
+            int connfd = pg_tcp_connect_retry(target_host, target_port,
+                                             PG_TCP_TIMEOUT_SEC, PG_TCP_RETRY_MS);
+            if (connfd < 0) {
+                fprintf(stderr, "[pg_tcp] Rank %d failed to connect to receiver rank %d (%s:%d)\n",
+                        ctx->rank, receiver_rank, target_host, target_port);
+                rc = PG_ERR_TIMEOUT;
+                break;
+            }
+
+            /* 1. Send local_to_next QP metadata */
+            struct pg_tcp_qp_info net_info;
+            pg_tcp_qp_info_to_net(&ctx->local_to_next, &net_info);
+            if (pg_tcp_write_full(connfd, &net_info, sizeof(net_info)) != 0) {
+                fprintf(stderr, "[pg_tcp] Rank %d failed to send QP metadata on edge %d->%d\n",
+                        ctx->rank, sender_rank, receiver_rank);
+                close(connfd);
+                rc = PG_ERR_TCP;
+                break;
+            }
+
+            /* 2. Read receiver's remote_to_next QP metadata */
+            if (pg_tcp_read_full(connfd, &net_info, sizeof(net_info)) != 0) {
+                fprintf(stderr, "[pg_tcp] Rank %d failed to read QP metadata on edge %d->%d\n",
+                        ctx->rank, sender_rank, receiver_rank);
+                close(connfd);
+                rc = PG_ERR_TCP;
+                break;
+            }
+            pg_tcp_qp_info_to_host(&net_info, &ctx->remote_to_next);
+
+            /* Transition local qp_to_next to RTR and RTS using receiver's metadata */
+            rc = pg_rdma_connect_qp(ctx->qp_to_next, &ctx->remote_to_next,
+                                   ctx->local_to_next.psn, ctx->active_mtu);
+            if (rc != PG_SUCCESS) {
+                fprintf(stderr, "[pg_rdma] Rank %d failed to connect qp_to_next on edge %d->%d\n",
+                        ctx->rank, sender_rank, receiver_rank);
+                close(connfd);
+                break;
+            }
+
+            /* 3. Send ready tag */
+            uint32_t ready_tag_net = htonl(PG_TCP_READY_TAG);
+            if (pg_tcp_write_full(connfd, &ready_tag_net, sizeof(ready_tag_net)) != 0) {
+                fprintf(stderr, "[pg_tcp] Rank %d failed to send ready tag on edge %d->%d\n",
+                        ctx->rank, sender_rank, receiver_rank);
+                close(connfd);
+                rc = PG_ERR_TCP;
+                break;
+            }
+
+            close(connfd);
+
+        } else if (ctx->rank == receiver_rank) {
+            /* Server side for edge sender_rank -> receiver_rank */
+            int connfd = pg_tcp_accept_timeout(listener_fd, PG_TCP_TIMEOUT_SEC);
+            if (connfd < 0) {
+                fprintf(stderr, "[pg_tcp] Rank %d failed to accept connection from sender rank %d\n",
+                        ctx->rank, sender_rank);
+                rc = PG_ERR_TIMEOUT;
+                break;
+            }
+
+            /* 1. Read sender's remote_from_prev QP metadata */
+            struct pg_tcp_qp_info net_info;
+            if (pg_tcp_read_full(connfd, &net_info, sizeof(net_info)) != 0) {
+                fprintf(stderr, "[pg_tcp] Rank %d failed to read sender QP metadata on edge %d->%d\n",
+                        ctx->rank, sender_rank, receiver_rank);
+                close(connfd);
+                rc = PG_ERR_TCP;
+                break;
+            }
+            pg_tcp_qp_info_to_host(&net_info, &ctx->remote_from_prev);
+
+            /* Transition local qp_from_prev to RTR and RTS using sender's metadata */
+            rc = pg_rdma_connect_qp(ctx->qp_from_prev, &ctx->remote_from_prev,
+                                   ctx->local_from_prev.psn, ctx->active_mtu);
+            if (rc != PG_SUCCESS) {
+                fprintf(stderr, "[pg_rdma] Rank %d failed to connect qp_from_prev on edge %d->%d\n",
+                        ctx->rank, sender_rank, receiver_rank);
+                close(connfd);
+                break;
+            }
+
+            /* 2. Send local_from_prev QP metadata */
+            pg_tcp_qp_info_to_net(&ctx->local_from_prev, &net_info);
+            if (pg_tcp_write_full(connfd, &net_info, sizeof(net_info)) != 0) {
+                fprintf(stderr, "[pg_tcp] Rank %d failed to send reply QP metadata on edge %d->%d\n",
+                        ctx->rank, sender_rank, receiver_rank);
+                close(connfd);
+                rc = PG_ERR_TCP;
+                break;
+            }
+
+            /* 3. Read and verify ready tag */
+            uint32_t ready_tag_net = 0;
+            if (pg_tcp_read_full(connfd, &ready_tag_net, sizeof(ready_tag_net)) != 0) {
+                fprintf(stderr, "[pg_tcp] Rank %d failed to read ready tag on edge %d->%d\n",
+                        ctx->rank, sender_rank, receiver_rank);
+                close(connfd);
+                rc = PG_ERR_TCP;
+                break;
+            }
+
+            uint32_t ready_tag = ntohl(ready_tag_net);
+            if (ready_tag != PG_TCP_READY_TAG) {
+                fprintf(stderr, "[pg_tcp] Rank %d received invalid ready tag 0x%08x (expected 0x%08x)\n",
+                        ctx->rank, ready_tag, PG_TCP_READY_TAG);
+                close(connfd);
+                rc = PG_ERR_TCP;
+                break;
+            }
+
+            close(connfd);
+        }
+    }
+
+    close(listener_fd);
+    return rc;
+}
+
+/* Symmetric RDMA control ring ping verification */
+static int pg_rdma_ring_ping(struct pg_context *ctx) {
+    if (!ctx) return PG_ERR_INVAL;
+
+    struct pg_ctrl_msg send_msg;
+    memset(&send_msg, 0, sizeof(send_msg));
+    send_msg.tag = PG_CTRL_TAG;
+    send_msg.type = PG_CTRL_MSG_PING;
+    send_msg.sender_rank = (uint16_t)ctx->rank;
+
+    int rc = pg_post_ctrl_send(ctx, PG_QP_DIR_TO_NEXT, &send_msg);
+    if (rc != PG_SUCCESS) {
+        fprintf(stderr, "[pg_rdma] Rank %d failed to post control ping send to next rank %d\n",
+                ctx->rank, ctx->next_rank);
+        return rc;
+    }
+
+    struct pg_progress_event received = {0}, ev;
+    int send_done = 0;
+    int recv_done = pg_progress_pop_pending(ctx, PG_QP_DIR_FROM_PREV,
+                                            PG_CTRL_MSG_PING, UINT32_MAX, &received);
+    struct timespec start, now;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    while (!send_done || !recv_done) {
+        rc = pg_progress_poll(ctx, &ev);
+        if (rc < 0) return rc;
+        if (rc == 1) {
+            if (!send_done && ev.type == PG_WR_TYPE_SEND_CTRL && ev.qp_dir == PG_QP_DIR_TO_NEXT) {
+                send_done = 1;
+            } else if (!recv_done && pg_progress_recv_matches(
+                           ctx, &ev, PG_QP_DIR_FROM_PREV, PG_CTRL_MSG_PING, UINT32_MAX)) {
+                received = ev;
+                recv_done = 1;
+            } else {
+                rc = pg_progress_buffer_unexpected(ctx, &ev);
+                if (rc != PG_SUCCESS) return rc;
+            }
+        }
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        double elapsed = (now.tv_sec - start.tv_sec) + (now.tv_nsec - start.tv_nsec) / 1e9;
+        if (elapsed >= PG_CTRL_POLL_TIMEOUT_SEC) {
+            fprintf(stderr, "[pg_rdma] Rank %d timed out waiting for ring ping\n", ctx->rank);
+            return PG_ERR_TIMEOUT;
+        }
+    }
+
+    if (received.msg.sender_rank != (uint16_t)ctx->prev_rank) {
+        fprintf(stderr, "[pg_rdma] Rank %d received ping from unexpected sender %u (expected %d)\n",
+                ctx->rank, received.msg.sender_rank, ctx->prev_rank);
+        return PG_ERR_RDMA;
+    }
+
+    return PG_SUCCESS;
+}
+
+int connect_process_group(char *servername, void **pg_handle) {
+    if (!servername || !pg_handle) {
+        fprintf(stderr, "[pg] Error: Invalid NULL argument to connect_process_group\n");
+        return PG_ERR_INVAL;
+    }
+
+    if (g_pg_args.size < 2) {
+        fprintf(stderr, "[pg] Error: Process group size (%d) must be at least 2\n", g_pg_args.size);
+        return PG_ERR_INVAL;
+    }
+
+    if (g_pg_args.rank < 0 || g_pg_args.rank >= g_pg_args.size) {
+        fprintf(stderr, "[pg] Error: Local rank %d out of bounds [0, %d)\n",
+                g_pg_args.rank, g_pg_args.size);
+        return PG_ERR_INVAL;
+    }
+
+    /* Validate servername is non-empty */
+    if (strlen(servername) == 0) {
+        fprintf(stderr, "[pg] Error: servername must be non-empty\n");
+        return PG_ERR_INVAL;
+    }
+
+    struct pg_context *ctx = (struct pg_context *)calloc(1, sizeof(struct pg_context));
+    if (!ctx) {
+        perror("[pg] Error allocating pg_context");
+        return PG_ERR_NOMEM;
+    }
+
+    ctx->rank = g_pg_args.rank;
+    ctx->size = g_pg_args.size;
+    ctx->prev_rank = (ctx->rank - 1 + ctx->size) % ctx->size;
+    ctx->next_rank = (ctx->rank + 1) % ctx->size;
+
+    snprintf(ctx->servername, sizeof(ctx->servername), "%s", servername);
+
+    for (int i = 0; i < ctx->size; i++) {
+        snprintf(ctx->host_list[i], sizeof(ctx->host_list[i]), "%s", g_pg_args.hosts[i]);
+    }
+
+    /* Initialize runtime tuning hyperparameters from environment or defaults (V10) */
+    pg_init_tuning_params(ctx);
+
+    /* 1. Allocate RDMA resources (PD, CQ, QPs in INIT state, pre-posted recvs) */
+    int rc = pg_rdma_init_resources(ctx);
+    if (rc != PG_SUCCESS) {
+        fprintf(stderr, "[pg] Error: RDMA resource initialization failed with code %d\n", rc);
+        pg_rdma_cleanup(ctx);
+        free(ctx);
+        *pg_handle = NULL;
+        return rc;
+    }
+
+    /* 2. Run TCP bootstrap: exchange real QP metadata and transition QPs to RTR and RTS */
+    rc = pg_tcp_bootstrap(ctx);
+    if (rc != PG_SUCCESS) {
+        fprintf(stderr, "[pg] Error: TCP bootstrap and QP transition failed with code %d\n", rc);
+        pg_rdma_cleanup(ctx);
+        free(ctx);
+        *pg_handle = NULL;
+        return rc;
+    }
+
+    /* 3. Exchange a symmetric neighbor ping to verify every ring edge. */
+    rc = pg_rdma_ring_ping(ctx);
+    if (rc != PG_SUCCESS) {
+        fprintf(stderr, "[pg] Error: RDMA control ring ping failed with code %d\n", rc);
+        pg_rdma_cleanup(ctx);
+        free(ctx);
+        *pg_handle = NULL;
+        return rc;
+    }
+
+    *pg_handle = (void *)ctx;
+    return PG_SUCCESS;
+}
+
+int pg_close(void *pg_handle) {
+    if (!pg_handle) {
+        return PG_SUCCESS;
+    }
+
+    struct pg_context *ctx = (struct pg_context *)pg_handle;
+    int rc = pg_rdma_ring_ping(ctx);
+
+    pg_rdma_cleanup(ctx);
+    free(ctx);
+    return rc;
+}
+
+int pg_get_rank(void *pg_handle) {
+    if (!pg_handle) return -1;
+    return ((struct pg_context *)pg_handle)->rank;
+}
+
+int pg_get_size(void *pg_handle) {
+    if (!pg_handle) return -1;
+    return ((struct pg_context *)pg_handle)->size;
+}
+
+int pg_get_prev_rank(void *pg_handle) {
+    if (!pg_handle) return -1;
+    return ((struct pg_context *)pg_handle)->prev_rank;
+}
+
+int pg_get_next_rank(void *pg_handle) {
+    if (!pg_handle) return -1;
+    return ((struct pg_context *)pg_handle)->next_rank;
+}
+
+const char *pg_get_hostname(void *pg_handle, int rank) {
+    if (!pg_handle) return NULL;
+struct pg_context *ctx = (struct pg_context *)pg_handle;
+    if (rank < 0 || rank >= ctx->size) return NULL;
+    return ctx->host_list[rank];
+}
+
+/* ========================================================================= */
+/* === MODULE 6: RING STEP TRANSFER & COLLECTIVES ORCHESTRATION         === */
+/* ========================================================================= */
+
+static inline void pg_step_process_chunk(const struct pg_ring_step_desc *desc,
+                                         void *dest, const void *src, size_t micro_len) {
+    if (__builtin_expect(desc->chunk_action == PG_CHUNK_ACTION_REDUCE, 1)) {
+        int micro_elems = (int)(micro_len >> desc->elem_shift);
+        pg_reduce_buffer(dest, src, micro_elems, desc->datatype, desc->op);
+    } else {
+        memcpy(dest, src, micro_len);
+    }
+}
+
+static inline void pg_init_transfer_msg(struct pg_ctrl_msg *msg,
+                                        const struct pg_context *ctx,
+                                        uint16_t type,
+                                        uint32_t seg_idx,
+                                        uint32_t micro_idx,
+                                        uint32_t length) {
+    memset(msg, 0, sizeof(*msg));
+    msg->tag = PG_CTRL_TAG;
+    msg->type = type;
+    msg->sender_rank = (uint16_t)ctx->rank;
+    msg->payload.rdv.seg_idx = seg_idx;
+    msg->payload.rdv.micro_idx = micro_idx;
+    msg->payload.rdv.length = length;
+}
+
+static inline int pg_eager_process_chunk(const struct pg_progress_event *ev,
+                                         const struct pg_ring_step_desc *desc,
+                                         uint32_t expected_micro,
+                                         uint32_t num_recv_micros,
+                                         size_t chunk_size) {
+    if (expected_micro >= num_recv_micros) return PG_ERR_RDMA;
+
+    size_t offset = (size_t)expected_micro * chunk_size;
+    size_t expected_len = desc->recv_bytes - offset;
+    if (expected_len > chunk_size) expected_len = chunk_size;
+
+    if (ev->msg.payload.rdv.micro_idx != expected_micro ||
+        ev->msg.payload.rdv.length != expected_len ||
+        ev->eager_len < PG_CTRL_MSG_LEN + expected_len) {
+        return PG_ERR_RDMA;
+    }
+    pg_step_process_chunk(desc, (char *)desc->cb_dest + offset,
+                          ev->eager_buf + PG_CTRL_MSG_LEN, expected_len);
+    return PG_SUCCESS;
+}
+
+/* Eager Payload Ring Step Transfer Engine */
+static int pg_ring_step_transfer_eager(struct pg_context *ctx, const struct pg_ring_step_desc *desc) {
+    size_t chunk_size = ctx->pipeline_chunk < PG_EAGER_BUF_SIZE ? ctx->pipeline_chunk : PG_EAGER_BUF_SIZE;
+    uint32_t num_send_micros = (uint32_t)((desc->send_bytes + chunk_size - 1) / chunk_size);
+    uint32_t num_recv_micros = (uint32_t)((desc->recv_bytes + chunk_size - 1) / chunk_size);
+
+    uint32_t eager_posted_micros = 0;
+    uint32_t eager_completed_micros = 0;
+    uint32_t eager_recv_micros = 0;
+
+    struct timespec start, now;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+
+    /* Drain early chunks once; FIFO ordering keeps later current chunks on the live path. */
+    struct pg_progress_event peager;
+    while (eager_recv_micros < num_recv_micros && pg_progress_pop_pending(
+               ctx, PG_QP_DIR_FROM_PREV, PG_CTRL_MSG_EAGER_PAYLOAD,
+               desc->recv_tag, &peager)) {
+        int vrc = pg_eager_process_chunk(&peager, desc, eager_recv_micros,
+                                         num_recv_micros, chunk_size);
+        if (vrc != PG_SUCCESS) return vrc;
+        eager_recv_micros++;
+        clock_gettime(CLOCK_MONOTONIC, &start);
+    }
+
+    while (eager_completed_micros < num_send_micros || eager_recv_micros < num_recv_micros) {
+        /* Post eager sends within flow control window */
+        while (eager_posted_micros < num_send_micros &&
+               (eager_posted_micros - eager_completed_micros) < ctx->eager_window) {
+            uint32_t k = eager_posted_micros;
+            size_t offset = (size_t)k * chunk_size;
+            size_t micro_len = desc->send_bytes - offset;
+            if (micro_len > chunk_size) micro_len = chunk_size;
+
+            void *local_src = (char *)desc->send_buf + offset;
+
+            struct pg_ctrl_msg ehdr;
+            pg_init_transfer_msg(&ehdr, ctx, PG_CTRL_MSG_EAGER_PAYLOAD,
+                                 desc->send_tag, k, (uint32_t)micro_len);
+
+            uint32_t slot = (uint32_t)(desc->step_idx * num_send_micros + k);
+            int rc = pg_post_eager_send(ctx, PG_QP_DIR_TO_NEXT, &ehdr, local_src,
+                                        (uint32_t)micro_len, desc->send_lkey, 1,
+                                        slot);
+            if (rc != PG_SUCCESS) {
+                fprintf(stderr, "[pg_transfer] Rank %d failed to post eager SEND for micro %u\n", ctx->rank, k);
+                return rc;
+            }
+            eager_posted_micros++;
+            clock_gettime(CLOCK_MONOTONIC, &start);
+        }
+
+        /* Poll CQ completions */
+        struct pg_progress_event ev;
+        int rc = pg_progress_poll(ctx, &ev);
+        if (rc < 0) return rc;
+        if (rc == 1) {
+            clock_gettime(CLOCK_MONOTONIC, &start);
+            switch (ev.type) {
+                case PG_WR_TYPE_EAGER_SEND: {
+                    if (ev.qp_dir == PG_QP_DIR_TO_NEXT) {
+                        eager_completed_micros++;
+                    }
+                    break;
+                }
+
+                case PG_WR_TYPE_RECV_CTRL: {
+                    if (eager_recv_micros < num_recv_micros && pg_progress_recv_matches(
+                            ctx, &ev, PG_QP_DIR_FROM_PREV,
+                            PG_CTRL_MSG_EAGER_PAYLOAD, desc->recv_tag)) {
+                        int vrc = pg_eager_process_chunk(
+                            &ev, desc, eager_recv_micros,
+                            num_recv_micros, chunk_size);
+                        if (vrc != PG_SUCCESS) return vrc;
+                        /* The polled eager event owns this slot until consumption. */
+                        if (pg_repost_recv_slot(ctx, ev.qp_dir, (int)ev.slot)) {
+                            return PG_ERR_RDMA;
+                        }
+
+                        eager_recv_micros++;
+                    } else {
+                        int brc = pg_progress_buffer_unexpected(ctx, &ev);
+                        if (brc != PG_SUCCESS) return brc;
+                    }
+                    break;
+                }
+
+                default: {
+                    int brc = pg_progress_buffer_unexpected(ctx, &ev);
+                    if (brc != PG_SUCCESS) return brc;
+                    break;
+                }
+            }
+        }
+
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        double elapsed = (now.tv_sec - start.tv_sec) + (now.tv_nsec - start.tv_nsec) / 1e9;
+        if (elapsed >= (double)PG_CTRL_POLL_TIMEOUT_SEC) {
+            fprintf(stderr, "[pg_transfer] Rank %d eager timed out on step %u: "
+                            "send_completed=%u/%u, recv_completed=%u/%u\n",
+                    ctx->rank, desc->step_idx, eager_completed_micros, num_send_micros,
+                    eager_recv_micros, num_recv_micros);
+            return PG_ERR_TIMEOUT;
+        }
+    }
+
+    return PG_SUCCESS;
+}
+
+static inline int pg_rdv_reply_cts(struct pg_context *ctx,
+                                  const struct pg_ring_step_desc *desc,
+                                  const struct pg_ctrl_msg *rts) {
+    if (rts->payload.rdv.length != desc->recv_bytes) return PG_ERR_RDMA;
+    struct pg_ctrl_msg cts;
+    pg_init_transfer_msg(&cts, ctx, PG_CTRL_MSG_CTS,
+                         desc->recv_tag, 0, (uint32_t)desc->recv_bytes);
+    cts.payload.rdv.remote_addr = (uint64_t)(uintptr_t)desc->recv_target_addr;
+    cts.payload.rdv.rkey = desc->recv_rkey;
+    int rc = pg_post_ctrl_send(ctx, PG_QP_DIR_FROM_PREV, &cts);
+    if (rc != PG_SUCCESS) {
+        fprintf(stderr, "[pg_transfer] Rank %d failed to send CTS\n", ctx->rank);
+    }
+    return rc;
+}
+
+static inline int pg_rdv_process_data_done(const struct pg_ring_step_desc *desc,
+                                          const struct pg_ctrl_msg *msg,
+                                          size_t chunk_size, uint32_t num_recv_micros,
+                                          uint32_t *completed_micros) {
+    uint32_t target_micros = msg->payload.rdv.micro_idx;
+    if (msg->payload.rdv.length != desc->recv_bytes || target_micros > num_recv_micros) {
+        return PG_ERR_RDMA;
+    }
+    while (*completed_micros < target_micros) {
+        size_t offset = (size_t)*completed_micros * chunk_size;
+        size_t micro_len = desc->recv_bytes - offset;
+        if (micro_len > chunk_size) micro_len = chunk_size;
+        if (desc->cb_dest != desc->recv_target_addr) {
+            void *dest = (char *)desc->cb_dest + offset;
+            const void *src = (char *)desc->recv_target_addr + offset;
+            pg_step_process_chunk(desc, dest, src, micro_len);
+        }
+        (*completed_micros)++;
+    }
+    return PG_SUCCESS;
+}
+
+/* Rendezvous Multi-WR Pipelined Ring Step Transfer Engine */
+static int pg_ring_step_transfer_rdv(struct pg_context *ctx, const struct pg_ring_step_desc *desc) {
+    if (desc->send_bytes > UINT32_MAX || desc->recv_bytes > UINT32_MAX) return PG_ERR_INVAL;
+    size_t chunk_size = ctx->pipeline_chunk;
+    size_t max_seg_bytes = desc->total_bytes ?
+        ((desc->total_bytes + ctx->size - 1) / ctx->size) :
+        (desc->send_bytes > desc->recv_bytes ? desc->send_bytes : desc->recv_bytes);
+    /*
+     * Adaptive Micro-Chunk Granularity:
+     * For transfers < 256 MiB total tensor (segment size < 64 MiB in 4-node ring),
+     * 64 KiB chunks accelerate initial pipeline filling and eliminate pipeline startup/drain
+     * bubbles, boosting effective bandwidth by +1.6 to +2.8 Gbps on 4 MiB - 64 MiB transfers.
+     * For large transfers >= 256 MiB up to 1 GiB, 256 KiB chunks minimize work request
+     * descriptor posting overhead to saturate the 20 Gbps link rate (achieving 22.23 Gbps).
+     */
+    if (max_seg_bytes < PG_ADAPTIVE_CHUNK_THRESHOLD && !getenv("PG_PIPELINE_CHUNK")) {
+        chunk_size = PG_SMALL_PIPELINE_CHUNK;
+    }
+
+    uint32_t num_send_micros = (uint32_t)((desc->send_bytes + chunk_size - 1) / chunk_size);
+    uint32_t num_recv_micros = (uint32_t)((desc->recv_bytes + chunk_size - 1) / chunk_size);
+
+    int send_done = (num_send_micros == 0);
+    int recv_done = (num_recv_micros == 0);
+    int cts_received = 0;
+    int rts_received = 0;
+    uint64_t remote_addr = 0;
+    uint32_t remote_rkey = 0;
+
+    uint32_t rdma_posted_micros = 0;
+    uint32_t rdma_completed_micros = 0;
+    uint32_t data_done_sent_count = 0;
+    uint32_t data_done_recv_micros = 0;
+    uint32_t send_ctrl_completed_to_next = 0;
+    uint32_t send_ctrl_completed_from_prev = 0;
+
+    /* Post RTS to next rank on qp_to_next if we have data to send */
+    if (num_send_micros > 0) {
+        struct pg_ctrl_msg rts_msg;
+        pg_init_transfer_msg(&rts_msg, ctx, PG_CTRL_MSG_RTS,
+                             desc->send_tag, 0,
+                             (uint32_t)desc->send_bytes);
+
+        int rc = pg_post_ctrl_send(ctx, PG_QP_DIR_TO_NEXT, &rts_msg);
+        if (rc != PG_SUCCESS) {
+            fprintf(stderr, "[pg_transfer] Rank %d failed to send RTS for step %u\n", ctx->rank, desc->step_idx);
+            return rc;
+        }
+    }
+
+    struct timespec start, now;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+
+    /* Only RTS can precede this transfer's handshake; later replies use the live path. */
+    struct pg_progress_event pmsg;
+    if (!rts_received && num_recv_micros > 0 && pg_progress_pop_pending(
+            ctx, PG_QP_DIR_FROM_PREV, PG_CTRL_MSG_RTS,
+            desc->recv_tag, &pmsg)) {
+        int rc = pg_rdv_reply_cts(ctx, desc, &pmsg.msg);
+        if (rc != PG_SUCCESS) return rc;
+        rts_received = 1;
+        clock_gettime(CLOCK_MONOTONIC, &start);
+    }
+
+    while (!send_done || !recv_done) {
+        /* Post batched RDMA Writes within window */
+        while (cts_received && rdma_posted_micros < num_send_micros &&
+               (rdma_posted_micros - rdma_completed_micros) < ctx->rdma_window) {
+            uint32_t in_flight = rdma_posted_micros - rdma_completed_micros;
+            uint32_t win_avail = ctx->rdma_window - in_flight;
+            uint32_t remaining = num_send_micros - rdma_posted_micros;
+            uint32_t to_post = win_avail < remaining ? win_avail : remaining;
+            if (to_post > ctx->batch_size) to_post = ctx->batch_size;
+            if (to_post > PG_MAX_BATCH_SIZE) to_post = PG_MAX_BATCH_SIZE;
+            if (to_post == 0) break;
+
+            struct ibv_sge sges[PG_MAX_BATCH_SIZE];
+            struct ibv_send_wr wrs[PG_MAX_BATCH_SIZE];
+
+            for (uint32_t b = 0; b < to_post; b++) {
+                uint32_t k = rdma_posted_micros + b;
+                size_t offset = (size_t)k * chunk_size;
+                size_t micro_len = desc->send_bytes - offset;
+                if (micro_len > chunk_size) micro_len = chunk_size;
+
+                void *local_src = (char *)desc->send_buf + offset;
+                uint32_t eff_sig_interval = ctx->rdma_signal_interval;
+                if (eff_sig_interval > ctx->rdma_window) {
+                    eff_sig_interval = ctx->rdma_window;
+                }
+                if (eff_sig_interval == 0) eff_sig_interval = 1;
+                int is_signaled = ((k + 1) % eff_sig_interval == 0 || (k + 1) == num_send_micros);
+
+                struct ibv_send_wr *next_wr = (b + 1 < to_post) ? &wrs[b + 1] : NULL;
+                pg_assemble_rdma_write_wr(&wrs[b], &sges[b], k, (uintptr_t)local_src, (uint32_t)micro_len,
+                                          desc->send_lkey, remote_addr + offset, remote_rkey,
+                                          is_signaled, next_wr);
+            }
+
+            struct ibv_send_wr *bad_wr = NULL;
+            if (__builtin_expect(ibv_post_send(ctx->qp_to_next, &wrs[0], &bad_wr) != 0, 0)) {
+                perror("[pg_transfer] Error: ibv_post_send failed for batched RDMA Write");
+                return PG_ERR_RDMA;
+            }
+            rdma_posted_micros += to_post;
+            clock_gettime(CLOCK_MONOTONIC, &start);
+        }
+
+        if (send_done && recv_done) break;
+
+        /* Poll fresh CQ events. */
+        struct pg_progress_event ev;
+        int rc = pg_progress_poll(ctx, &ev);
+        if (rc < 0) return rc;
+        if (rc == 1) {
+            clock_gettime(CLOCK_MONOTONIC, &start);
+            switch (ev.type) {
+                case PG_WR_TYPE_RECV_CTRL: {
+                    if (!rts_received && num_recv_micros > 0 && pg_progress_recv_matches(
+                            ctx, &ev, PG_QP_DIR_FROM_PREV,
+                            PG_CTRL_MSG_RTS, desc->recv_tag)) {
+                        rc = pg_rdv_reply_cts(ctx, desc, &ev.msg);
+                        if (rc != PG_SUCCESS) return rc;
+                        rts_received = 1;
+                    } else if (!cts_received && pg_progress_recv_matches(
+                                   ctx, &ev, PG_QP_DIR_TO_NEXT,
+                                   PG_CTRL_MSG_CTS, desc->send_tag)) {
+                        if (ev.msg.payload.rdv.length != desc->send_bytes ||
+                            ev.msg.payload.rdv.remote_addr == 0) return PG_ERR_RDMA;
+                        remote_addr = ev.msg.payload.rdv.remote_addr;
+                        remote_rkey = ev.msg.payload.rdv.rkey;
+                        cts_received = 1;
+                    } else if (!recv_done && pg_progress_recv_matches(
+                                   ctx, &ev, PG_QP_DIR_FROM_PREV,
+                                   PG_CTRL_MSG_DATA_DONE, desc->recv_tag)) {
+                        rc = pg_rdv_process_data_done(desc, &ev.msg, chunk_size,
+                                                       num_recv_micros, &data_done_recv_micros);
+                        if (rc != PG_SUCCESS) return rc;
+                        if (data_done_recv_micros == num_recv_micros && send_ctrl_completed_from_prev >= 1) {
+                            recv_done = 1;
+                        }
+                    } else {
+                        int brc = pg_progress_buffer_unexpected(ctx, &ev);
+                        if (brc != PG_SUCCESS) return brc;
+                    }
+                    break;
+                }
+
+                case PG_WR_TYPE_RDMA_WRITE: {
+                    if (ev.qp_dir == PG_QP_DIR_TO_NEXT) {
+                        uint32_t k = ev.slot;
+                        if (k + 1 > rdma_completed_micros) {
+                            rdma_completed_micros = k + 1;
+                            struct pg_ctrl_msg done_msg;
+                            pg_init_transfer_msg(&done_msg, ctx,
+                                                 PG_CTRL_MSG_DATA_DONE,
+                                                 desc->send_tag,
+                                                 rdma_completed_micros,
+                                                 (uint32_t)desc->send_bytes);
+
+                            rc = pg_post_ctrl_send(ctx, PG_QP_DIR_TO_NEXT, &done_msg);
+                            if (rc != PG_SUCCESS) {
+                                fprintf(stderr, "[pg_transfer] Rank %d failed to send DATA_DONE for micro %u\n", ctx->rank, rdma_completed_micros);
+                                return rc;
+                            }
+                            data_done_sent_count++;
+                        }
+                    }
+                    break;
+                }
+
+                case PG_WR_TYPE_SEND_CTRL: {
+                    if (ev.qp_dir == PG_QP_DIR_TO_NEXT) {
+                        send_ctrl_completed_to_next++;
+                        /*
+                         * Outbound send completes when all RDMA writes completed,
+                         * all micro-chunks were signaled with DATA_DONE, and all outbound
+                         * control sends (1 initial RTS + data_done_sent_count DATA_DONE) completed.
+                         */
+                        if (rdma_completed_micros == num_send_micros &&
+                            send_ctrl_completed_to_next >= (1 + data_done_sent_count)) {
+                            send_done = 1;
+                        }
+                    } else if (ev.qp_dir == PG_QP_DIR_FROM_PREV) {
+                        send_ctrl_completed_from_prev++;
+                        /*
+                         * Inbound receive completes when all micro-chunks were processed
+                         * and our 1 CTS reply send WR on qp_from_prev has completed.
+                         */
+                        if (data_done_recv_micros == num_recv_micros &&
+                            send_ctrl_completed_from_prev >= 1) {
+                            recv_done = 1;
+                        }
+                    }
+                    break;
+                }
+
+                default:
+                    break;
+            }
+        }
+
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        double elapsed = (now.tv_sec - start.tv_sec) + (now.tv_nsec - start.tv_nsec) / 1e9;
+        if (elapsed >= (double)PG_CTRL_POLL_TIMEOUT_SEC) {
+            fprintf(stderr, "[pg_transfer] Rank %d timed out on step %u:\n"
+                            "  send_done=%d (cts=%d, rdma_post=%u/%u, rdma_comp=%u/%u)\n"
+                            "  recv_done=%d (done_recv=%u/%u)\n",
+                    ctx->rank, desc->step_idx, send_done, cts_received, rdma_posted_micros, num_send_micros,
+                    rdma_completed_micros, num_send_micros,
+                    recv_done, data_done_recv_micros, num_recv_micros);
+            return PG_ERR_TIMEOUT;
+        }
+    }
+
+    return PG_SUCCESS;
+}
+
+/* Dispatch transfer step to Eager or Rendezvous engine (Transfer Seam #2 Encapsulation) */
+static inline int pg_ring_step_transfer(struct pg_context *ctx, const struct pg_ring_step_desc *desc) {
+    if (pg_is_eager(ctx, desc)) {
+        return pg_ring_step_transfer_eager(ctx, desc);
+    } else {
+        return pg_ring_step_transfer_rdv(ctx, desc);
+    }
+}
+
+/*
+ * Normalized Collective Parameter & Operation Validation (Strategy 5 Clean)
+ * Slices validation into register-passed static inlines (taking zero pointers to locals),
+ * eliminating boilerplate across entry points while guaranteeing zero stack spills.
+ */
+static inline int pg_validate_collective(const void *handle, const void *sendbuf, const void *recvbuf, int count, DATATYPE dt) {
+    if (__builtin_expect(!handle || !sendbuf || !recvbuf || count <= 0, 0)) {
+        return PG_ERR_INVAL;
+    }
+    if (__builtin_expect(dt != PG_INT && dt != PG_FLOAT && dt != PG_DOUBLE, 0)) {
+        return PG_ERR_UNSUPPORTED;
+    }
+    return PG_SUCCESS;
+}
+
+static inline int pg_ranges_overlap(const void *lhs, size_t lhs_bytes,
+                                    const void *rhs, size_t rhs_bytes) {
+    uintptr_t lhs_start = (uintptr_t)lhs;
+    uintptr_t rhs_start = (uintptr_t)rhs;
+
+    if (lhs_bytes == 0 || rhs_bytes == 0) return 0;
+    if (lhs_start <= rhs_start) return (rhs_start - lhs_start) < lhs_bytes;
+    return (lhs_start - rhs_start) < rhs_bytes;
+}
+
+static inline int pg_validate_op(OPERATION op) {
+    if (__builtin_expect(op != PG_SUM && op != PG_MIN && op != PG_MAX && op != PG_PROD, 0)) {
+        return PG_ERR_UNSUPPORTED;
+    }
+    return PG_SUCCESS;
+}
+
+/*
+ * Degenerate N=1 Single-Rank Bypass (Strategy 5 Extended)
+ * Consolidates duplicate single-rank short-circuit logic across all public collectives.
+ */
+static inline int pg_single_rank_bypass(struct pg_context *ctx, void *sendbuf, void *recvbuf, size_t bytes) {
+    if (__builtin_expect(ctx->size == 1, 0)) {
+        if (recvbuf != sendbuf) {
+            memcpy(recvbuf, sendbuf, bytes);
+        }
+        return 1;
+    }
+    return 0;
+}
+
+static inline void pg_test_delay_after_reduce_scatter(const struct pg_context *ctx) {
+#ifdef PG_TEST_HOOKS
+    const char *rank_env = getenv("PG_TEST_DELAY_RANK");
+    const char *usec_env = getenv("PG_TEST_DELAY_AFTER_RS_US");
+    if (rank_env && usec_env && atoi(rank_env) == ctx->rank) {
+        unsigned long usec = strtoul(usec_env, NULL, 10);
+        if (usec > 0) usleep((useconds_t)usec);
+    }
+#else
+    (void)ctx;
+#endif
+}
+
+static int pg_reduce_scatter_impl(void *sendbuf, void *recvbuf, int count,
+                                  DATATYPE datatype, OPERATION op,
+                                  struct pg_context *ctx) {
+
+    size_t elem_size = pg_get_datatype_size(datatype);
+    size_t total_bytes = (size_t)count * elem_size;
+
+    /* Maximum segment byte size across ranks */
+    int max_seg_elems = pg_get_seg_count(0, count, ctx->size);
+    size_t max_seg_bytes = (size_t)max_seg_elems * elem_size;
+    if (max_seg_bytes > UINT32_MAX) return PG_ERR_INVAL;
+
+    /* Ensure internal staging (and safe-mode work) buffers */
+    int rc = pg_ensure_internal_buffers(ctx, total_bytes, max_seg_bytes);
+    if (rc != PG_SUCCESS) return rc;
+
+    void *work_ptr = NULL;
+    struct ibv_mr *work_mr = NULL;
+
+#ifdef PG_WORKBUFFER_INPLACE
+    work_ptr = sendbuf;
+    work_mr = pg_get_or_reg_mr(ctx, sendbuf, total_bytes,
+                               IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
+    if (!work_mr) {
+        fprintf(stderr, "[pg_reduce_scatter] Rank %d failed to register inplace sendbuf MR\n", ctx->rank);
+        return PG_ERR_RDMA;
+    }
+#else
+    /* Safe mode: copy sendbuf into internal working buffer */
+    if (sendbuf != ctx->work_buf) {
+        memcpy(ctx->work_buf, sendbuf, total_bytes);
+    }
+    work_ptr = ctx->work_buf;
+    work_mr = ctx->work_mr;
+#endif
+
+    /* Execute size - 1 ring reduction steps */
+    for (int step = 0; step < ctx->size - 1; step++) {
+        int send_seg = (ctx->rank - step - 1 + ctx->size) % ctx->size;
+        int recv_seg = (ctx->rank - step - 2 + ctx->size) % ctx->size;
+
+        int send_seg_elems = pg_get_seg_count(send_seg, count, ctx->size);
+        size_t send_seg_bytes = (size_t)send_seg_elems * elem_size;
+        size_t send_seg_offset = pg_get_seg_offset_bytes(send_seg, count, ctx->size, elem_size);
+
+        int recv_seg_elems = pg_get_seg_count(recv_seg, count, ctx->size);
+        size_t recv_seg_bytes = (size_t)recv_seg_elems * elem_size;
+        size_t recv_seg_offset = pg_get_seg_offset_bytes(recv_seg, count, ctx->size, elem_size);
+
+        struct pg_ring_step_desc desc;
+        memset(&desc, 0, sizeof(desc));
+        desc.step_idx = (uint32_t)step;
+        desc.total_bytes = total_bytes;
+        desc.send_tag = (uint32_t)send_seg;
+        desc.send_buf = (char *)work_ptr + send_seg_offset;
+        desc.send_bytes = send_seg_bytes;
+        desc.send_lkey = work_mr->lkey;
+
+        desc.recv_tag = (uint32_t)recv_seg;
+        desc.recv_target_addr = ctx->staging_buf;
+        desc.recv_rkey = ctx->staging_mr->rkey;
+        desc.recv_bytes = recv_seg_bytes;
+
+        desc.chunk_action = PG_CHUNK_ACTION_REDUCE;
+        desc.datatype = datatype;
+        desc.op = op;
+        desc.elem_shift = pg_get_datatype_shift(datatype);
+        desc.cb_dest = (char *)work_ptr + recv_seg_offset;
+
+        rc = pg_ring_step_transfer(ctx, &desc);
+        if (rc != PG_SUCCESS) return rc;
+    }
+
+    /* Deliver locally owned segment to recvbuf */
+    int my_seg_elems = pg_get_seg_count(ctx->rank, count, ctx->size);
+    size_t my_seg_bytes = (size_t)my_seg_elems * elem_size;
+    size_t my_seg_offset = pg_get_seg_offset_bytes(ctx->rank, count, ctx->size, elem_size);
+    if (recvbuf != (char *)work_ptr + my_seg_offset) {
+        memmove(recvbuf, (char *)work_ptr + my_seg_offset, my_seg_bytes);
+    }
+
+    return PG_SUCCESS;
+}
+
+int pg_reduce_scatter(void *sendbuf, void *recvbuf, int count,
+                      DATATYPE datatype, OPERATION op,
+                      void *pg_handle) {
+    int vrc = pg_validate_collective(pg_handle, sendbuf, recvbuf, count, datatype);
+    if (vrc != PG_SUCCESS) return vrc;
+    vrc = pg_validate_op(op);
+    if (vrc != PG_SUCCESS) return vrc;
+    struct pg_context *ctx = (struct pg_context *)pg_handle;
+
+    size_t elem_size = pg_get_datatype_size(datatype);
+    size_t total_bytes = (size_t)count * elem_size;
+    size_t output_bytes = (size_t)pg_get_seg_count(ctx->rank, count, ctx->size) * elem_size;
+    if (pg_ranges_overlap(sendbuf, total_bytes, recvbuf, output_bytes)) {
+        return PG_ERR_INVAL;
+    }
+    if (pg_single_rank_bypass(ctx, sendbuf, recvbuf, total_bytes)) {
+        return PG_SUCCESS;
+    }
+
+    return pg_reduce_scatter_impl(sendbuf, recvbuf, count, datatype, op, ctx);
+}
+
+/* Ring All-Gather Generalized Engine (Zero-Copy RDMA Write into final recvbuf with Multi-WR Batching) */
+int pg_ring_all_gather_generalized(struct pg_context *ctx, void *recvbuf, int count,
+                                   DATATYPE datatype) {
+    if (!ctx || !recvbuf || count <= 0) return PG_ERR_INVAL;
+
+    if (ctx->size == 1) return PG_SUCCESS;
+
+    size_t elem_size = pg_get_datatype_size(datatype);
+    size_t total_bytes = (size_t)count * elem_size;
+    if ((size_t)pg_get_seg_count(0, count, ctx->size) * elem_size > UINT32_MAX) {
+        return PG_ERR_INVAL;
+    }
+
+    struct ibv_mr *recv_mr = pg_get_or_reg_mr(ctx, recvbuf, total_bytes,
+                                              IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
+    if (!recv_mr) {
+        fprintf(stderr, "[pg_all_gather] Rank %d failed to register recvbuf MR\n", ctx->rank);
+        return PG_ERR_RDMA;
+    }
+
+    /* Execute size - 1 ring gathering steps */
+    for (int step = 0; step < ctx->size - 1; step++) {
+        int send_origin = (ctx->rank - step + ctx->size) % ctx->size;
+        int recv_origin = (ctx->rank - step - 1 + ctx->size) % ctx->size;
+
+        int send_seg_elems = pg_get_seg_count(send_origin, count, ctx->size);
+        size_t send_seg_bytes = (size_t)send_seg_elems * elem_size;
+        size_t send_seg_offset = pg_get_seg_offset_bytes(send_origin, count, ctx->size, elem_size);
+
+        int recv_seg_elems = pg_get_seg_count(recv_origin, count, ctx->size);
+        size_t recv_seg_bytes = (size_t)recv_seg_elems * elem_size;
+        size_t recv_seg_offset = pg_get_seg_offset_bytes(recv_origin, count, ctx->size, elem_size);
+
+        struct pg_ring_step_desc desc;
+        memset(&desc, 0, sizeof(desc));
+        desc.step_idx = (uint32_t)step;
+        desc.total_bytes = total_bytes;
+        desc.send_tag = (uint32_t)send_origin;
+        desc.send_buf = (char *)recvbuf + send_seg_offset;
+        desc.send_bytes = send_seg_bytes;
+        desc.send_lkey = recv_mr->lkey;
+
+        desc.recv_tag = (uint32_t)recv_origin;
+        desc.recv_target_addr = (char *)recvbuf + recv_seg_offset;
+        desc.recv_rkey = recv_mr->rkey;
+        desc.recv_bytes = recv_seg_bytes;
+
+        /* Eager mode uses memcpy; Rendezvous mode does Zero-Copy RDMA Write directly into recvbuf */
+        desc.chunk_action = PG_CHUNK_ACTION_MEMCPY;
+        desc.cb_dest = (char *)recvbuf + recv_seg_offset;
+
+        int rc = pg_ring_step_transfer(ctx, &desc);
+        if (rc != PG_SUCCESS) return rc;
+    }
+
+    return PG_SUCCESS;
+}
+
+
+int pg_all_gather(void *sendbuf, void *recvbuf, int count,
+                  DATATYPE datatype,
+                  void *pg_handle) {
+    int vrc = pg_validate_collective(pg_handle, sendbuf, recvbuf, count, datatype);
+    if (vrc != PG_SUCCESS) return vrc;
+    struct pg_context *ctx = (struct pg_context *)pg_handle;
+    if (count > INT_MAX / ctx->size) return PG_ERR_INVAL;
+
+    size_t elem_size = pg_get_datatype_size(datatype);
+    size_t segment_bytes = (size_t)count * elem_size;
+    if (ctx->size > 1 && segment_bytes > UINT32_MAX) return PG_ERR_INVAL;
+    size_t total_bytes = segment_bytes * (size_t)ctx->size;
+    void *local_slice = (char *)recvbuf + (size_t)ctx->rank * segment_bytes;
+
+    if (sendbuf != local_slice &&
+        pg_ranges_overlap(sendbuf, segment_bytes, recvbuf, total_bytes)) {
+        return PG_ERR_INVAL;
+    }
+
+    if (pg_single_rank_bypass(ctx, sendbuf, recvbuf, segment_bytes)) {
+        return PG_SUCCESS;
+    }
+
+    /* Copy sendbuf into our owned slice within recvbuf (recvbuf[rank]) */
+    if (local_slice != sendbuf) {
+        memcpy(local_slice, sendbuf, segment_bytes);
+    }
+
+    /* Run ring zero-copy RDMA all-gather */
+    return pg_ring_all_gather_generalized(ctx, recvbuf, count * ctx->size,
+                                          datatype);
+}
+
+int pg_all_reduce(void *sendbuf, void *recvbuf, int count,
+                  DATATYPE datatype, OPERATION op,
+                  void *pg_handle) {
+    int vrc = pg_validate_collective(pg_handle, sendbuf, recvbuf, count, datatype);
+    if (vrc != PG_SUCCESS) return vrc;
+    vrc = pg_validate_op(op);
+    if (vrc != PG_SUCCESS) return vrc;
+    struct pg_context *ctx = (struct pg_context *)pg_handle;
+
+    size_t elem_size = pg_get_datatype_size(datatype);
+    size_t total_bytes = (size_t)count * elem_size;
+
+    if (pg_ranges_overlap(sendbuf, total_bytes, recvbuf, total_bytes)) {
+        return PG_ERR_INVAL;
+    }
+
+    if (pg_single_rank_bypass(ctx, sendbuf, recvbuf, total_bytes)) {
+        return PG_SUCCESS;
+    }
+
+    /* Offset for local owned slice within recvbuf */
+    size_t my_seg_offset = pg_get_seg_offset_bytes(ctx->rank, count, ctx->size, elem_size);
+
+    /* Phase 1: Reduce-Scatter into local owned slice recvbuf[rank] */
+    int rc = pg_reduce_scatter_impl(sendbuf, (char *)recvbuf + my_seg_offset,
+                                    count, datatype, op, ctx);
+    if (rc != PG_SUCCESS) {
+        fprintf(stderr, "[pg_all_reduce] Rank %d Reduce-Scatter phase failed with code %d\n",
+                ctx->rank, rc);
+        return rc;
+    }
+
+    pg_test_delay_after_reduce_scatter(ctx);
+
+    /* Phase 2: Direct All-Gather distributing reduced segments across ring */
+    rc = pg_ring_all_gather_generalized(ctx, recvbuf, count, datatype);
+    if (rc != PG_SUCCESS) {
+        fprintf(stderr, "[pg_all_reduce] Rank %d All-Gather phase failed with code %d\n",
+                ctx->rank, rc);
+        return rc;
+    }
+
+    return PG_SUCCESS;
+}
